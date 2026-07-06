@@ -9,7 +9,8 @@ const NAV: NavItem[] = [
   { href: "/", label: "Dashboard", icon: "📊", soon: true },
   { href: "/pr", label: "PR & Media", icon: "📰" },
   { href: "/people", label: "People Sentiment", icon: "💬" },
-  { href: "/seo", label: "SEO & Website", icon: "🔍" },
+  { href: "/website", label: "Website", icon: "🌐" },
+  { href: "/seo", label: "SEO", icon: "🔍" },
   { href: "/blog", label: "Blog & Content", icon: "✍️", soon: true },
   { href: "/competitors", label: "Competitor Intel", icon: "🎯", soon: true },
 ];

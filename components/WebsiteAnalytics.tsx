@@ -17,7 +17,7 @@ const ymd = (d: Date) => d.toISOString().slice(0, 10);
 
 const legendBottom = { legend: { position: "bottom" as const, labels: { font: { size: 10 } } } };
 
-export default function SeoWebsite({ initial }: { initial: WebMetrics }) {
+export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
   const [data, setData] = useState<WebMetrics>(initial);
   const [mode, setMode] = useState<"preset" | "custom">("preset");
   const [days, setDays] = useState<number>(initial.days || 30);
@@ -36,7 +36,7 @@ export default function SeoWebsite({ initial }: { initial: WebMetrics }) {
   const load = useCallback(async (qs: string, silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const res = await fetch(`/api/seo?${qs}`, { cache: "no-store" });
+      const res = await fetch(`/api/website?${qs}`, { cache: "no-store" });
       const json = (await res.json()) as WebMetrics;
       setData(json);
       setUpdatedAt(new Date().toLocaleTimeString());
@@ -109,8 +109,8 @@ export default function SeoWebsite({ initial }: { initial: WebMetrics }) {
     <>
       <div className="section-header">
         <div>
-          <div className="page-title">SEO &amp; Website</div>
-          <div className="page-sub">Live website traffic &amp; search performance — from PostHog · {data.label}</div>
+          <div className="page-title">Website</div>
+          <div className="page-sub">Live website traffic &amp; engagement — from PostHog · {data.label}</div>
         </div>
         <span className="bot-left" style={{ gap: 8 }}>
           {data.connected && <span className="pulse-dot" style={{ background: live ? C.green : C.sand }} />}
@@ -337,7 +337,7 @@ export default function SeoWebsite({ initial }: { initial: WebMetrics }) {
               </div>
 
               <div style={{ fontSize: 11, color: C.mid, marginTop: 12 }}>
-                Source: PostHog <code>$pageview</code> events · organic = sessions from search engines · keyword rankings &amp; backlinks (Semrush) can be added next.
+                Source: PostHog <code>$pageview</code> events · organic = sessions from search engines.
               </div>
 
               {/* AI data-driven insights */}

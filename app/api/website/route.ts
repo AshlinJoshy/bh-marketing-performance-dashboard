@@ -1,4 +1,4 @@
-// Live web-metrics endpoint the SEO tab polls for auto-refresh.
+// Live web-metrics endpoint the Website tab polls for auto-refresh.
 import { getWebMetrics } from "@/lib/posthog";
 
 export const dynamic = "force-dynamic";
