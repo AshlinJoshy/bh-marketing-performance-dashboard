@@ -293,3 +293,72 @@ export async function getSocialRuns(limit = 5): Promise<SocialRun[]> {
     return [];
   }
 }
+
+// ── Social Performance (benchmark) reads ────────────────────────
+import { mergePerfConfig } from "@/lib/perfTypes";
+import type { PerfConfig, PerfMetrics, PerfPost, PerfRun } from "@/lib/perfTypes";
+
+/** The editable benchmark config (brands + per-platform handles + actor ids). */
+export async function getPerfConfig(): Promise<PerfConfig> {
+  const db = readClient();
+  if (!db) return mergePerfConfig(null);
+  try {
+    const { data } = await db.from("social_config").select("payload").eq("id", 1).maybeSingle();
+    const benchmark = (data?.payload as { benchmark?: Partial<PerfConfig> } | null)?.benchmark ?? null;
+    return mergePerfConfig(benchmark);
+  } catch {
+    return mergePerfConfig(null);
+  }
+}
+
+/** Per-brand-per-platform benchmark snapshots (seed or live). */
+export async function getPerfMetrics(): Promise<PerfMetrics[]> {
+  const db = readClient();
+  if (!db) return [];
+  try {
+    const { data, error } = await db
+      .from("social_perf_metrics")
+      .select(
+        "brand,is_us,platform,followers,posts,reels,images,avg_likes,avg_comments,avg_plays,total_plays,engagement_rate,time_window,period_label,source,captured_at",
+      )
+      .order("total_plays", { ascending: false });
+    if (error || !data) return [];
+    return data as PerfMetrics[];
+  } catch {
+    return [];
+  }
+}
+
+/** Individual scraped posts (top-post cards), highest-reach first. */
+export async function getPerfPosts(limit = 400): Promise<PerfPost[]> {
+  const db = readClient();
+  if (!db) return [];
+  try {
+    const { data, error } = await db
+      .from("social_perf_posts")
+      .select("id,brand,is_us,platform,external_id,url,type,posted_at,likes,comments,shares,plays,caption")
+      .order("plays", { ascending: false, nullsFirst: false })
+      .limit(limit);
+    if (error || !data) return [];
+    return data as PerfPost[];
+  } catch {
+    return [];
+  }
+}
+
+/** Recent benchmark-run history for the status line. */
+export async function getPerfRuns(limit = 5): Promise<PerfRun[]> {
+  const db = readClient();
+  if (!db) return [];
+  try {
+    const { data, error } = await db
+      .from("social_perf_runs")
+      .select("ran_at,trigger,ok,time_window,brands,platforms,posts_found,metrics_written,error")
+      .order("ran_at", { ascending: false })
+      .limit(limit);
+    if (error || !data) return [];
+    return data as PerfRun[];
+  } catch {
+    return [];
+  }
+}
