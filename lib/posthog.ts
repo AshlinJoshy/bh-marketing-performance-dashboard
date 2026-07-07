@@ -104,7 +104,7 @@ async function getUserFlow(since: string, human: string, pageFilter?: string[]):
     `SELECT argMin(coalesce(properties.$referring_domain, ''), timestamp) AS ref, ` +
     `arrayMap(x -> x.2, arraySort(x -> x.1, groupArray((timestamp, lower(coalesce(nullif(properties.$pathname, ''), '/')))))) AS paths ` +
     `FROM events WHERE event = '$pageview' AND ${since}${human} AND properties.$session_id != '' GROUP BY properties.$session_id`;
-  const [rows, bdRows] = await Promise.all([
+  const [rows, bdRows, pageBdRows] = await Promise.all([
     hogql(
       `SELECT ${chan} AS channel, ${pageBucket("arrayElement(paths, 1)")} AS b1, ${pageBucket("arrayElement(paths, 2)")} AS b2, ${pageBucket("arrayElement(paths, 3)")} AS b3, count() AS sessions ` +
         `FROM (${innerSessions})${filterWhere} GROUP BY channel, b1, b2, b3 ORDER BY sessions DESC LIMIT 500`,
@@ -112,6 +112,13 @@ async function getUserFlow(since: string, human: string, pageFilter?: string[]):
     hogql(
       `SELECT ${chan} AS channel, if(ref = '' OR ref = '$direct', '(direct)', ref) AS domain, count() AS sessions ` +
         `FROM (${innerSessions})${filterWhere} GROUP BY channel, domain ORDER BY sessions DESC LIMIT 300`,
+    ),
+    // per-bucket page composition (host + path) so a page node can show exactly
+    // which real pages — across subdomains like survey./promo. — make it up.
+    hogql(
+      `SELECT ${pageBucket("path")} AS bucket, concat(host, path) AS page, count() AS views ` +
+        `FROM (SELECT lower(coalesce(nullif(properties.$pathname, ''), '/')) AS path, coalesce(properties.$host, '') AS host ` +
+        `FROM events WHERE event = '$pageview' AND ${since}${human}) GROUP BY bucket, page ORDER BY views DESC LIMIT 500`,
     ),
   ]);
   if (!rows || !rows.length) return { nodes: [], links: [], sessions: 0 };

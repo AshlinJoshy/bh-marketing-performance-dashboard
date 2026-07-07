@@ -113,7 +113,7 @@ export default function Sankey({ flow, captions }: { flow: FlowData; captions?: 
           {flow.nodes.map((n) => {
             const p = pos.get(n.id)!;
             const isFirst = n.col === 0;
-            const hasBreak = isFirst && (n.breakdown?.length ?? 0) > 0;
+            const hasBreak = (n.breakdown?.length ?? 0) > 0;
             const isOpen = openId === n.id;
             const labelX = isFirst ? p.x - 8 : p.x + NODE_W + 8;
             return (
@@ -166,29 +166,34 @@ export default function Sankey({ flow, captions }: { flow: FlowData; captions?: 
       ) : null}
 
       {/* click-to-open — full breakdown panel */}
-      {openNode?.breakdown?.length ? (
-        <div className="sankey-open">
-          <div className="sankey-open-head">
-            <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-              <span style={{ width: 11, height: 11, borderRadius: 3, background: nodeColor(openNode.label), display: "inline-block" }} />
-              {openNode.label} — {openNode.value} sessions · {openNode.breakdown.length} source{openNode.breakdown.length === 1 ? "" : "s"}
-            </span>
-            <button className="filter-btn" onClick={() => setOpenId(null)}>Close ✕</button>
+      {openNode?.breakdown?.length ? (() => {
+        const unit = openNode.col === 0 ? "source" : "page";
+        const metric = openNode.col === 0 ? "sessions" : "pageviews";
+        const denom = openNode.breakdown.reduce((a, b) => a + b.value, 0) || 1;
+        return (
+          <div className="sankey-open">
+            <div className="sankey-open-head">
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                <span style={{ width: 11, height: 11, borderRadius: 3, background: nodeColor(openNode.label), display: "inline-block" }} />
+                {openNode.label} — {openNode.breakdown.length} {unit}{openNode.breakdown.length === 1 ? "" : "s"} · by {metric}
+              </span>
+              <button className="filter-btn" onClick={() => setOpenId(null)}>Close ✕</button>
+            </div>
+            <div className="sankey-open-list">
+              {openNode.breakdown.map((b) => {
+                const pct = Math.round((b.value / denom) * 100);
+                return (
+                  <div key={b.label} className="sankey-open-row">
+                    <span className="sankey-open-name" title={b.label}>{b.label}</span>
+                    <span className="sankey-open-bar"><span style={{ width: `${Math.max(2, pct)}%`, background: nodeColor(openNode.label) }} /></span>
+                    <span className="sankey-open-val">{b.value}<span className="muted"> · {pct}%</span></span>
+                  </div>
+                );
+              })}
+            </div>
           </div>
-          <div className="sankey-open-list">
-            {openNode.breakdown.map((b) => {
-              const pct = openNode.value ? Math.round((b.value / openNode.value) * 100) : 0;
-              return (
-                <div key={b.label} className="sankey-open-row">
-                  <span className="sankey-open-name" title={b.label}>{b.label}</span>
-                  <span className="sankey-open-bar"><span style={{ width: `${Math.max(2, pct)}%`, background: nodeColor(openNode.label) }} /></span>
-                  <span className="sankey-open-val">{b.value}<span className="muted"> · {pct}%</span></span>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      ) : null}
+        );
+      })() : null}
     </div>
   );
 }
