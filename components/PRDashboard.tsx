@@ -437,7 +437,7 @@ export default function PRDashboard({
                 backgroundColor: outlets.map((o) => TIER_COLOR[o.tier]),
               }],
             }}
-            options={{ indexAxis: "y", plugins: { legend: { display: false } } }}
+            options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true }, y: { ticks: { autoSkip: false, font: { size: 10 } } } } }}
           />
         </ChartCard>
       </div>
@@ -484,7 +484,7 @@ export default function PRDashboard({
                     backgroundColor: sov.map((s) => (s.isUs ? C.coral : C.sand)),
                   }],
                 }}
-                options={{ indexAxis: "y", plugins: { legend: { display: false } } }}
+                options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true }, y: { ticks: { autoSkip: false, font: { size: 10 } } } } }}
               />
             </div>
           ) : (

@@ -267,7 +267,7 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
                         labels: data.sources.map((s) => s.source),
                         datasets: [{ label: "Sessions", data: data.sources.map((s) => s.sessions), backgroundColor: C.sage }],
                       }}
-                      options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } }}
+                      options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } }, y: { ticks: { autoSkip: false, font: { size: 10 } } } } }}
                     />
                   </div>
                 </div>
@@ -285,7 +285,7 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
                         labels: data.topPages.map((p) => p.path),
                         datasets: [{ label: "Pageviews", data: data.topPages.map((p) => p.views), backgroundColor: C.coral }],
                       }}
-                      options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } }}
+                      options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } }, y: { ticks: { autoSkip: false, font: { size: 10 } } } } }}
                     />
                   </div>
                 </div>
@@ -300,7 +300,7 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
                         labels: data.countries.map((c) => c.country),
                         datasets: [{ label: "Visitors", data: data.countries.map((c) => c.visitors), backgroundColor: C.blue }],
                       }}
-                      options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } }}
+                      options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } }, y: { ticks: { autoSkip: false, font: { size: 10 } } } } }}
                     />
                   </div>
                 </div>
