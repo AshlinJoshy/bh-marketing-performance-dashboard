@@ -83,8 +83,13 @@ function pageBucket(e: string): string {
 async function getUserFlow(since: string, human: string, pageFilter?: string[]): Promise<FlowData> {
   let filterWhere = "";
   if (pageFilter && pageFilter.length) {
-    const terms = pageFilter.map((t) => t.replace(/[^a-z0-9/_-]/gi, "").toLowerCase()).filter(Boolean);
-    if (terms.length) filterWhere = ` WHERE arrayExists(p -> ${terms.map((t) => `p LIKE '%${t}%'`).join(" OR ")}, paths)`;
+    // Accept a bare slug ("buy"), a path ("/en/buy"), or a full page URL pasted
+    // from the breakdown ("https://www.bhomes.com/betterhomes-mobile-app"): drop
+    // the protocol, keep host + path chars, and match against the host+path array.
+    const terms = pageFilter
+      .map((t) => t.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/[^a-z0-9/_.-]/g, ""))
+      .filter(Boolean);
+    if (terms.length) filterWhere = ` WHERE arrayExists(p -> ${terms.map((t) => `p LIKE '%${t}%'`).join(" OR ")}, fullpaths)`;
   }
   // Entry-source classification. Order matters (first match wins):
   //  • Direct — no referrer ('' or PostHog's '$direct' sentinel) or a self-referral (bhomes.com)
@@ -102,7 +107,8 @@ async function getUserFlow(since: string, human: string, pageFilter?: string[]):
   // one row per session: entry referrer + ordered page paths
   const innerSessions =
     `SELECT argMin(coalesce(properties.$referring_domain, ''), timestamp) AS ref, ` +
-    `arrayMap(x -> x.2, arraySort(x -> x.1, groupArray((timestamp, lower(coalesce(nullif(properties.$pathname, ''), '/')))))) AS paths ` +
+    `arrayMap(x -> x.2, arraySort(x -> x.1, groupArray((timestamp, lower(coalesce(nullif(properties.$pathname, ''), '/')))))) AS paths, ` +
+    `arrayMap(x -> x.2, arraySort(x -> x.1, groupArray((timestamp, lower(concat(coalesce(properties.$host, ''), coalesce(nullif(properties.$pathname, ''), '/'))))))) AS fullpaths ` +
     `FROM events WHERE event = '$pageview' AND ${since}${human} AND properties.$session_id != '' GROUP BY properties.$session_id`;
   const [rows, bdRows, pageBdRows] = await Promise.all([
     hogql(

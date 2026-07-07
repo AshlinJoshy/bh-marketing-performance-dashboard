@@ -318,7 +318,7 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
                 <div className="table-controls" style={{ marginTop: 8, marginBottom: 4 }}>
                   <input
                     className="search-box"
-                    placeholder="Focus on page(s) — e.g. buy, blog, area-guide (comma-separated)"
+                    placeholder="Focus on page(s) — keyword, path, or full URL, e.g. buy or www.bhomes.com/betterhomes-mobile-app (comma-separated)"
                     value={flowInput}
                     onChange={(e) => setFlowInput(e.target.value)}
                     onKeyDown={(e) => { if (e.key === "Enter") applyFlowFilter(); }}
