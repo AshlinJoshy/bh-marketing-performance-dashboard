@@ -37,7 +37,7 @@ async function hogql(sql: string): Promise<any[][] | null> {
   }
 }
 
-export interface FlowNode { id: string; label: string; col: number; value: number; kind: string }
+export interface FlowNode { id: string; label: string; col: number; value: number; kind: string; breakdown?: { label: string; value: number }[] }
 export interface FlowLink { source: string; target: string; value: number }
 export interface FlowData { nodes: FlowNode[]; links: FlowLink[]; sessions: number }
 
@@ -86,18 +86,34 @@ async function getUserFlow(since: string, human: string, pageFilter?: string[]):
     const terms = pageFilter.map((t) => t.replace(/[^a-z0-9/_-]/gi, "").toLowerCase()).filter(Boolean);
     if (terms.length) filterWhere = ` WHERE arrayExists(p -> ${terms.map((t) => `p LIKE '%${t}%'`).join(" OR ")}, paths)`;
   }
+  // Entry-source classification. Order matters (first match wins):
+  //  • Direct — no referrer ('' or PostHog's '$direct' sentinel) or a self-referral (bhomes.com)
+  //  • AI Assistant — ChatGPT/Perplexity/Claude/Gemini/Copilot (checked before Organic so gemini.google → AI)
+  //  • Organic Search — search engines
+  //  • Social — checked with an EXACT t.co match (avoids '%t.co%' catching chatgpt.com / trustpilot.com)
+  //  • Referral — anything else (a link on another site)
   const chan =
-    `multiIf(ref = '', 'Direct', ` +
-    `ref LIKE '%google.%' OR ref LIKE '%bing.%' OR ref LIKE '%yahoo.%' OR ref LIKE '%duckduckgo.%' OR ref LIKE '%ecosia.%', 'Organic Search', ` +
-    `ref LIKE '%facebook.%' OR ref LIKE '%instagram.%' OR ref LIKE '%linkedin.%' OR ref LIKE '%t.co%' OR ref LIKE '%youtube.%' OR ref LIKE '%tiktok.%', 'Social', ` +
+    `multiIf(` +
+    `ref = '' OR ref = '$direct' OR ref LIKE '%bhomes.com%', 'Direct', ` +
+    `ref LIKE '%chatgpt.%' OR ref LIKE '%openai.%' OR ref LIKE '%perplexity.%' OR ref LIKE '%claude.%' OR ref LIKE '%gemini.google%' OR ref LIKE '%copilot.%', 'AI Assistant', ` +
+    `ref LIKE '%google.%' OR ref LIKE '%bing.%' OR ref LIKE '%yahoo.%' OR ref LIKE '%duckduckgo.%' OR ref LIKE '%ecosia.%' OR ref LIKE '%yandex.%' OR ref LIKE '%baidu.%' OR ref LIKE '%brave.%', 'Organic Search', ` +
+    `ref LIKE '%facebook.%' OR ref LIKE '%instagram.%' OR ref LIKE '%linkedin.%' OR ref = 't.co' OR ref LIKE '%youtube.%' OR ref LIKE '%tiktok.%', 'Social', ` +
     `'Referral')`;
-  const rows = await hogql(
-    `SELECT ${chan} AS channel, ${pageBucket("arrayElement(paths, 1)")} AS b1, ${pageBucket("arrayElement(paths, 2)")} AS b2, ${pageBucket("arrayElement(paths, 3)")} AS b3, count() AS sessions FROM (` +
-      `SELECT argMin(coalesce(properties.$referring_domain, ''), timestamp) AS ref, ` +
-      `arrayMap(x -> x.2, arraySort(x -> x.1, groupArray((timestamp, lower(coalesce(nullif(properties.$pathname, ''), '/')))))) AS paths ` +
-      `FROM events WHERE event = '$pageview' AND ${since}${human} AND properties.$session_id != '' GROUP BY properties.$session_id` +
-      `)${filterWhere} GROUP BY channel, b1, b2, b3 ORDER BY sessions DESC LIMIT 500`,
-  );
+  // one row per session: entry referrer + ordered page paths
+  const innerSessions =
+    `SELECT argMin(coalesce(properties.$referring_domain, ''), timestamp) AS ref, ` +
+    `arrayMap(x -> x.2, arraySort(x -> x.1, groupArray((timestamp, lower(coalesce(nullif(properties.$pathname, ''), '/')))))) AS paths ` +
+    `FROM events WHERE event = '$pageview' AND ${since}${human} AND properties.$session_id != '' GROUP BY properties.$session_id`;
+  const [rows, bdRows] = await Promise.all([
+    hogql(
+      `SELECT ${chan} AS channel, ${pageBucket("arrayElement(paths, 1)")} AS b1, ${pageBucket("arrayElement(paths, 2)")} AS b2, ${pageBucket("arrayElement(paths, 3)")} AS b3, count() AS sessions ` +
+        `FROM (${innerSessions})${filterWhere} GROUP BY channel, b1, b2, b3 ORDER BY sessions DESC LIMIT 500`,
+    ),
+    hogql(
+      `SELECT ${chan} AS channel, if(ref = '' OR ref = '$direct', '(direct)', ref) AS domain, count() AS sessions ` +
+        `FROM (${innerSessions})${filterWhere} GROUP BY channel, domain ORDER BY sessions DESC LIMIT 300`,
+    ),
+  ]);
   if (!rows || !rows.length) return { nodes: [], links: [], sessions: 0 };
 
   const data = rows.map((r) => ({ channel: String(r[0] || "Referral"), b1: String(r[1] || ""), b2: String(r[2] || ""), b3: String(r[3] || ""), sessions: Number(r[4] || 0) }));
@@ -132,6 +148,23 @@ async function getUserFlow(since: string, human: string, pageFilter?: string[]):
     for (const [label, value] of [...m].sort((a, b) => b[1] - a[1])) nodes.push({ id: `${col}:${label}`, label, col, value, kind: col === 0 ? "source" : "page" });
   };
   mk(v0, 0); mk(v1, 1); mk(v2, 2); mk(v3, 3);
+
+  // per-source domain breakdown → attach to the entry-source (col 0) nodes so the
+  // UI can show "how many from each domain" on hover and expand it on click.
+  const byChannel = new Map<string, { label: string; value: number }[]>();
+  for (const r of bdRows ?? []) {
+    const ch = String(r[0] || "Referral");
+    const arr = byChannel.get(ch) ?? [];
+    arr.push({ label: String(r[1] || "(unknown)"), value: Number(r[2] || 0) });
+    byChannel.set(ch, arr);
+  }
+  const foldTop = (arr: { label: string; value: number }[]) => {
+    const sorted = [...arr].sort((a, b) => b.value - a.value);
+    if (sorted.length <= 12) return sorted;
+    const rest = sorted.slice(12).reduce((a, b) => a + b.value, 0);
+    return rest > 0 ? [...sorted.slice(0, 12), { label: `+${sorted.length - 12} more`, value: rest }] : sorted.slice(0, 12);
+  };
+  for (const n of nodes) if (n.col === 0) n.breakdown = foldTop(byChannel.get(n.label) ?? []);
 
   const links: FlowLink[] = [];
   for (const [k, v] of l01) { const [a, b] = k.split("|||"); links.push({ source: `0:${a}`, target: `1:${b}`, value: v }); }
@@ -184,7 +217,7 @@ export async function getWebMetrics(daysRaw = 30, fromRaw?: string, toRaw?: stri
     ),
     hogql(`SELECT toDate(timestamp) AS day, count() AS pageviews, count(DISTINCT person_id) AS visitors FROM events WHERE ${pv} AND ${since}${human} GROUP BY day ORDER BY day`),
     hogql(`SELECT properties.$pathname AS path, count() AS views FROM events WHERE ${pv} AND ${since}${human} AND properties.$pathname != '' GROUP BY path ORDER BY views DESC LIMIT 12`),
-    hogql(`SELECT coalesce(nullif(properties.$referring_domain, ''), 'Direct / none') AS source, count(DISTINCT properties.$session_id) AS sessions FROM events WHERE ${pv} AND ${since}${human} GROUP BY source ORDER BY sessions DESC LIMIT 10`),
+    hogql(`SELECT if(coalesce(properties.$referring_domain, '') IN ('', '$direct'), 'Direct / none', properties.$referring_domain) AS source, count(DISTINCT properties.$session_id) AS sessions FROM events WHERE ${pv} AND ${since}${human} GROUP BY source ORDER BY sessions DESC LIMIT 10`),
     hogql(`SELECT properties.$geoip_country_name AS country, count(DISTINCT person_id) AS visitors FROM events WHERE ${pv} AND ${since}${human} AND properties.$geoip_country_name != '' GROUP BY country ORDER BY visitors DESC LIMIT 10`),
     getUserFlow(since, human, flowPages),
   ]);
