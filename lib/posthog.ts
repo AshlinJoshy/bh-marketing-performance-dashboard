@@ -88,16 +88,23 @@ function pageBucket(e: string): string {
 // pages (bucketed), shown as Source → 1st → 2nd → 3rd page. Drop-off is implied
 // — a session with fewer pages simply has no further link (no "Exit" node).
 // Optional pageFilter keeps only sessions whose path sequence touches a substring.
-async function getUserFlow(since: string, human: string, pageFilter?: string[]): Promise<FlowData> {
+async function getUserFlow(since: string, human: string, pageFilter?: string[], exact = false): Promise<FlowData> {
   let filterWhere = "";
   if (pageFilter && pageFilter.length) {
     // Accept a bare slug ("buy"), a path ("/en/buy"), or a full page URL pasted
     // from the breakdown ("https://www.bhomes.com/betterhomes-mobile-app"): drop
-    // the protocol, keep host + path chars, and match against the host+path array.
+    // the protocol, keep host + path chars. Multiple entries are OR-ed together.
+    //  • contains (default): substring match against the host+path array
+    //  • exact: the visited path OR host+path equals the term
     const terms = pageFilter
       .map((t) => t.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/[^a-z0-9/_.-]/g, ""))
       .filter(Boolean);
-    if (terms.length) filterWhere = ` WHERE arrayExists(p -> ${terms.map((t) => `p LIKE '%${t}%'`).join(" OR ")}, fullpaths)`;
+    if (terms.length) {
+      const clause = exact
+        ? (t: string) => `(arrayExists(p -> p = '${t}', paths) OR arrayExists(p -> p = '${t}', fullpaths))`
+        : (t: string) => `arrayExists(p -> p LIKE '%${t}%', fullpaths)`;
+      filterWhere = ` WHERE ${terms.map(clause).join(" OR ")}`;
+    }
   }
   // Entry-source classification. Order matters (first match wins):
   //  • Direct — no referrer ('' or PostHog's '$direct' sentinel) or a self-referral (bhomes.com)
@@ -224,7 +231,7 @@ async function getUserFlow(since: string, human: string, pageFilter?: string[]):
 
 const isDate = (s?: string): string | null => (s && /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null);
 
-export async function getWebMetrics(daysRaw = 30, fromRaw?: string, toRaw?: string, humansOnly = true, flowPages?: string[]): Promise<WebMetrics> {
+export async function getWebMetrics(daysRaw = 30, fromRaw?: string, toRaw?: string, humansOnly = true, flowPages?: string[], flowMatch?: string): Promise<WebMetrics> {
   const from = isDate(fromRaw);
   const to = isDate(toRaw);
   let days = Math.max(1, Math.min(365, Math.round(daysRaw || 30)));
@@ -265,9 +272,9 @@ export async function getWebMetrics(daysRaw = 30, fromRaw?: string, toRaw?: stri
     ),
     hogql(`SELECT toDate(timestamp) AS day, count() AS pageviews, count(DISTINCT person_id) AS visitors FROM events WHERE ${pv} AND ${since}${human} GROUP BY day ORDER BY day`),
     hogql(`SELECT properties.$pathname AS path, count() AS views FROM events WHERE ${pv} AND ${since}${human} AND properties.$pathname != '' GROUP BY path ORDER BY views DESC LIMIT 12`),
-    hogql(`SELECT if(coalesce(properties.$referring_domain, '') IN ('', '$direct'), 'Direct / none', properties.$referring_domain) AS source, count(DISTINCT properties.$session_id) AS sessions FROM events WHERE ${pv} AND ${since}${human} GROUP BY source ORDER BY sessions DESC LIMIT 10`),
+    hogql(`SELECT coalesce(nullif(nullif(properties.$referring_domain, ''), '$direct'), 'Direct / none') AS source, count(DISTINCT properties.$session_id) AS sessions FROM events WHERE ${pv} AND ${since}${human} GROUP BY source ORDER BY sessions DESC LIMIT 10`),
     hogql(`SELECT properties.$geoip_country_name AS country, count(DISTINCT person_id) AS visitors FROM events WHERE ${pv} AND ${since}${human} AND properties.$geoip_country_name != '' GROUP BY country ORDER BY visitors DESC LIMIT 10`),
-    getUserFlow(since, human, flowPages),
+    getUserFlow(since, human, flowPages, flowMatch === "exact"),
   ]);
 
   const row = ov && ov[0];

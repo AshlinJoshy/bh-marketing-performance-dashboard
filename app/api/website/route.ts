@@ -11,6 +11,7 @@ export async function GET(req: Request) {
   const to = searchParams.get("to") || undefined;
   const humansOnly = searchParams.get("humans") !== "0";
   const flowPages = (searchParams.get("flowPages") || "").split(",").map((s) => s.trim()).filter(Boolean);
-  const data = await getWebMetrics(days, from, to, humansOnly, flowPages);
+  const flowMatch = searchParams.get("flowMatch") || undefined;
+  const data = await getWebMetrics(days, from, to, humansOnly, flowPages, flowMatch);
   return Response.json(data);
 }
