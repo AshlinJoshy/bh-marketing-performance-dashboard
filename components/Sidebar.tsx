@@ -11,8 +11,8 @@ const NAV: NavItem[] = [
   { href: "/people", label: "People Sentiment", icon: "💬" },
   { href: "/website", label: "Website", icon: "🌐" },
   { href: "/seo", label: "SEO", icon: "🔍" },
-  { href: "/blog", label: "Blog & Content", icon: "✍️", soon: true },
-  { href: "/competitors", label: "Competitor Intel", icon: "🎯", soon: true },
+  { href: "/digital", label: "Digital Performance", icon: "📈", soon: true },
+  { href: "/portals", label: "Portals", icon: "🏠", soon: true },
 ];
 
 export default function Sidebar() {
