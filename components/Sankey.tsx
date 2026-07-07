@@ -139,31 +139,39 @@ export default function Sankey({ flow, captions }: { flow: FlowData; captions?: 
         </svg>
       </div>
 
-      {/* hover tooltip — top sub-sources */}
-      {hover && hoverNode?.breakdown?.length ? (
-        <div
-          style={{
-            position: "fixed", left: Math.min(hover.x + 14, (typeof window !== "undefined" ? window.innerWidth : 9999) - 280),
-            top: hover.y + 14, zIndex: 60, pointerEvents: "none",
-            background: "#fff", border: "1px solid var(--border)", borderRadius: 8,
-            boxShadow: "0 6px 24px rgba(0,0,0,.16)", padding: "10px 12px", width: 250,
-          }}
-        >
-          <div style={{ fontSize: 12, fontWeight: 700, color: C.dark, marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ width: 9, height: 9, borderRadius: 2, background: nodeColor(hoverNode.label), display: "inline-block" }} />
-            {hoverNode.label} · {hoverNode.value}
-          </div>
-          {hoverNode.breakdown.slice(0, 8).map((b) => (
-            <div key={b.label} style={{ display: "flex", justifyContent: "space-between", gap: 14, fontSize: 11, color: C.mid, lineHeight: 1.75 }}>
-              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 165 }}>{b.label}</span>
-              <span style={{ fontWeight: 600, color: C.dark }}>{b.value}</span>
+      {/* hover tooltip — top 5 sub-entries with view rate */}
+      {hover && hoverNode?.breakdown?.length ? (() => {
+        const denom = hoverNode.breakdown.reduce((a, b) => a + b.value, 0) || 1;
+        const metric = hoverNode.col === 0 ? "sessions" : "views";
+        const top = hoverNode.breakdown.slice(0, 5);
+        return (
+          <div
+            style={{
+              position: "fixed", left: Math.min(hover.x + 14, (typeof window !== "undefined" ? window.innerWidth : 9999) - 290),
+              top: hover.y + 14, zIndex: 60, pointerEvents: "none",
+              background: "#fff", border: "1px solid var(--border)", borderRadius: 8,
+              boxShadow: "0 6px 24px rgba(0,0,0,.16)", padding: "10px 12px", width: 260,
+            }}
+          >
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.dark, marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ width: 9, height: 9, borderRadius: 2, background: nodeColor(hoverNode.label), display: "inline-block" }} />
+              {hoverNode.label} · {hoverNode.value}
             </div>
-          ))}
-          <div style={{ fontSize: 10, color: C.sand, marginTop: 6 }}>
-            {hoverNode.breakdown.length > 8 ? `+${hoverNode.breakdown.length - 8} more · ` : ""}click to open ▾
+            {top.map((b) => {
+              const pct = Math.round((b.value / denom) * 100);
+              return (
+                <div key={b.label} style={{ display: "flex", justifyContent: "space-between", gap: 12, fontSize: 11, color: C.mid, lineHeight: 1.8 }}>
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 150 }}>{b.label}</span>
+                  <span style={{ fontWeight: 600, color: C.dark, whiteSpace: "nowrap" }}>{b.value} <span style={{ color: C.mid, fontWeight: 400 }}>· {pct}%</span></span>
+                </div>
+              );
+            })}
+            <div style={{ fontSize: 10, color: C.sand, marginTop: 6 }}>
+              top 5 by {metric}{hoverNode.breakdown.length > 5 ? ` · +${hoverNode.breakdown.length - 5} more` : ""} · click to open ▾
+            </div>
           </div>
-        </div>
-      ) : null}
+        );
+      })() : null}
 
       {/* click-to-open — full breakdown panel */}
       {openNode?.breakdown?.length ? (() => {
