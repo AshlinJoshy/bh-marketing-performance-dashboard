@@ -245,6 +245,12 @@ export async function getWebMetrics(daysRaw = 30, fromRaw?: string, toRaw?: stri
     since = `timestamp >= now() - INTERVAL ${days} DAY`;
     label = `last ${days} days`;
   }
+  // Production website only: real hosts are the apex bhomes.com or a *.bhomes.com
+  // subdomain (www, eos…). This drops the ~99 Vercel preview/staging deploys
+  // (*.vercel.app) and any other non-production host that reports into this
+  // PostHog project. Applied to every query below (they all interpolate ${since}),
+  // including the journey flow.
+  since += ` AND (lower(properties.$host) = 'bhomes.com' OR lower(properties.$host) LIKE '%.bhomes.com')`;
 
   const key = process.env.POSTHOG_API_KEY;
   const base: WebMetrics = { connected: !!key, hasData: false, humansOnly, days, label, overview: null, bots: { pageviews: 0, pct: 0 }, trend: [], topPages: [], sources: [], countries: [], flow: { nodes: [], links: [], sessions: 0 } };
