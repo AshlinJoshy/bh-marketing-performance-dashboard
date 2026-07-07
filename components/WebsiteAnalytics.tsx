@@ -322,7 +322,7 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
                   <HelpTip text="How real visitors move: entry Source → 1st page → 2nd page → 3rd page. URLs are grouped into page types (Buy listings, Blog, Area guides…); only the top 5 show, rest as 'Other'. Ribbon thickness = sessions. Where a node's ribbons thin out, that gap is drop-off — those visitors left." />
                 </div>
                 <div className="chart-sub">
-                  Source → 1st → 2nd → 3rd page · top 5 page types · drop-off implied · {fmt(data.flow.sessions)} human sessions{flowPages ? ` · filtered to: ${flowPages} (${flowExact ? "exact" : "contains"})` : ""}
+                  Source → 1st → 2nd → 3rd page · top 5 page types · drop-off implied · {fmt(data.flow.sessions)} human sessions (visits — not unique visitors; a returning visitor counts once per visit){flowPages ? ` · filtered to: ${flowPages} (${flowExact ? "exact" : "contains"})` : ""}
                 </div>
                 <div className="table-controls" style={{ marginTop: 8, marginBottom: 4 }}>
                   <input
