@@ -22,18 +22,26 @@ const SEARCH_ENGINES = ["google.", "bing.", "yahoo.", "duckduckgo.", "ecosia.", 
 async function hogql(sql: string): Promise<any[][] | null> {
   const key = process.env.POSTHOG_API_KEY;
   if (!key) return null;
+  // Hard timeout so one slow/heavy query can never hang the server render (which
+  // would leave the tab stuck on its loading skeleton). On timeout we return null
+  // and the caller degrades gracefully to an empty section.
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), Number(process.env.POSTHOG_TIMEOUT_MS || 15000));
   try {
     const res = await fetch(`${HOST.replace(/\/$/, "")}/api/projects/${PROJECT}/query/`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
       body: JSON.stringify({ query: { kind: "HogQLQuery", query: sql } }),
       cache: "no-store",
+      signal: ctrl.signal,
     });
     if (!res.ok) return null;
     const data = await res.json();
     return Array.isArray(data?.results) ? data.results : [];
   } catch {
     return null;
+  } finally {
+    clearTimeout(t);
   }
 }
 
@@ -104,11 +112,16 @@ async function getUserFlow(since: string, human: string, pageFilter?: string[]):
     `ref LIKE '%google.%' OR ref LIKE '%bing.%' OR ref LIKE '%yahoo.%' OR ref LIKE '%duckduckgo.%' OR ref LIKE '%ecosia.%' OR ref LIKE '%yandex.%' OR ref LIKE '%baidu.%' OR ref LIKE '%brave.%', 'Organic Search', ` +
     `ref LIKE '%facebook.%' OR ref LIKE '%instagram.%' OR ref LIKE '%linkedin.%' OR ref = 't.co' OR ref LIKE '%youtube.%' OR ref LIKE '%tiktok.%', 'Social', ` +
     `'Referral')`;
-  // one row per session: entry referrer + ordered page paths
+  // one row per session: entry referrer + ordered page paths. The heavier
+  // host+path array (fullpaths) is built ONLY when a page filter needs it — on a
+  // normal load we don't pay for it.
+  const fullpathsSel = filterWhere
+    ? `, arrayMap(x -> x.2, arraySort(x -> x.1, groupArray((timestamp, lower(concat(coalesce(properties.$host, ''), coalesce(nullif(properties.$pathname, ''), '/'))))))) AS fullpaths `
+    : ` `;
   const innerSessions =
     `SELECT argMin(coalesce(properties.$referring_domain, ''), timestamp) AS ref, ` +
-    `arrayMap(x -> x.2, arraySort(x -> x.1, groupArray((timestamp, lower(coalesce(nullif(properties.$pathname, ''), '/')))))) AS paths, ` +
-    `arrayMap(x -> x.2, arraySort(x -> x.1, groupArray((timestamp, lower(concat(coalesce(properties.$host, ''), coalesce(nullif(properties.$pathname, ''), '/'))))))) AS fullpaths ` +
+    `arrayMap(x -> x.2, arraySort(x -> x.1, groupArray((timestamp, lower(coalesce(nullif(properties.$pathname, ''), '/')))))) AS paths` +
+    fullpathsSel +
     `FROM events WHERE event = '$pageview' AND ${since}${human} AND properties.$session_id != '' GROUP BY properties.$session_id`;
   const [rows, bdRows, pageBdRows] = await Promise.all([
     hogql(
