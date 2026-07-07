@@ -223,7 +223,7 @@ body {
 /* SANKEY — click-to-open source breakdown */
 .sankey-open { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--warm-white); padding: 12px 14px; }
 .sankey-open-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12.5px; font-weight: 600; color: var(--dark); margin-bottom: 10px; flex-wrap: wrap; }
-.sankey-open-list { display: flex; flex-direction: column; gap: 6px; }
+.sankey-open-list { display: flex; flex-direction: column; gap: 6px; max-height: 360px; overflow-y: auto; }
 .sankey-open-row { display: grid; grid-template-columns: 190px 1fr 90px; align-items: center; gap: 10px; font-size: 11.5px; }
 .sankey-open-name { color: var(--dark); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sankey-open-bar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; }

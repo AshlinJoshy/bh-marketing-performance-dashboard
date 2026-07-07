@@ -118,7 +118,7 @@ async function getUserFlow(since: string, human: string, pageFilter?: string[]):
     hogql(
       `SELECT ${pageBucket("path")} AS bucket, concat(host, path) AS page, count() AS views ` +
         `FROM (SELECT lower(coalesce(nullif(properties.$pathname, ''), '/')) AS path, coalesce(properties.$host, '') AS host ` +
-        `FROM events WHERE event = '$pageview' AND ${since}${human}) GROUP BY bucket, page ORDER BY views DESC LIMIT 500`,
+        `FROM events WHERE event = '$pageview' AND ${since}${human}) GROUP BY bucket, page ORDER BY views DESC LIMIT 2000`,
     ),
   ]);
   if (!rows || !rows.length) return { nodes: [], links: [], sessions: 0 };
@@ -172,6 +172,28 @@ async function getUserFlow(since: string, human: string, pageFilter?: string[]):
     return rest > 0 ? [...sorted.slice(0, 12), { label: `+${sorted.length - 12} more`, value: rest }] : sorted.slice(0, 12);
   };
   for (const n of nodes) if (n.col === 0) n.breakdown = foldTop(byChannel.get(n.label) ?? []);
+
+  // per-bucket PAGE breakdown (host + path) → attach to the page nodes (col ≥ 1).
+  // Remap each raw page-type through the SAME top-5 fold the flow uses (cat), so a
+  // node like "Other" lists the pages from every folded-away category too, and the
+  // same page is merged when two categories fold together.
+  const byBucket = new Map<string, Map<string, number>>();
+  for (const r of pageBdRows ?? []) {
+    const folded = cat(String(r[0] || "")); // '' → skip
+    if (!folded) continue;
+    const page = String(r[1] || "(unknown)");
+    const m = byBucket.get(folded) ?? new Map<string, number>();
+    m.set(page, (m.get(page) ?? 0) + Number(r[2] || 0));
+    byBucket.set(folded, m);
+  }
+  const foldPages = (m?: Map<string, number>) => {
+    if (!m) return [];
+    const arr = [...m].map(([label, value]) => ({ label, value })).sort((a, b) => b.value - a.value);
+    if (arr.length <= 40) return arr;
+    const rest = arr.slice(40).reduce((a, b) => a + b.value, 0);
+    return [...arr.slice(0, 40), { label: `+${arr.length - 40} more pages`, value: rest }];
+  };
+  for (const n of nodes) if (n.col >= 1) n.breakdown = foldPages(byBucket.get(n.label));
 
   const links: FlowLink[] = [];
   for (const [k, v] of l01) { const [a, b] = k.split("|||"); links.push({ source: `0:${a}`, target: `1:${b}`, value: v }); }
