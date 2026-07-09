@@ -200,29 +200,47 @@ function smIdx(header: string[]): Record<string, number> {
 async function smQuery(fields: string[], from: string, to: string, maxRows: number): Promise<any[][] | null> {
   const key = process.env.SUPERMETRICS_API_KEY;
   if (!key) return null;
+  // Documented v2 method: POST JSON with `Authorization: Bearer <key>`, fields as
+  // a comma-separated string. (The api_key is NOT put in the body.)
   const payload: Record<string, unknown> = {
     ds_id: "GW",
     ds_accounts: [process.env.GSC_SITE_URL || "sc-domain:bhomes.com"],
+    ds_user: process.env.SUPERMETRICS_DS_USER || "zahra.firouzi@bhomes.com",
     date_range_type: "custom",
     start_date: from,
     end_date: to,
-    fields,
+    fields: fields.join(","),
     max_rows: maxRows,
   };
-  const dsUser = process.env.SUPERMETRICS_DS_USER || "zahra.firouzi@bhomes.com";
-  if (dsUser) payload.ds_user = dsUser;
-  const url = `${SM_ENDPOINT}?json=${encodeURIComponent(JSON.stringify(payload))}&api_key=${encodeURIComponent(key)}`;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 20000);
   try {
-    const res = await fetch(url, { cache: "no-store", signal: ctrl.signal });
+    const res = await fetch(SM_ENDPOINT, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+      body: JSON.stringify(payload),
+      cache: "no-store",
+      signal: ctrl.signal,
+    });
+    const text = await res.text().catch(() => "");
     if (!res.ok) {
-      console.error(`[gsc/supermetrics] HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 240)}`);
+      console.error(`[gsc/supermetrics] HTTP ${res.status}: ${text.slice(0, 300)}`);
       return null;
     }
-    const j = await res.json();
-    if (j?.error) console.error(`[gsc/supermetrics] API error: ${JSON.stringify(j.error).slice(0, 240)}`);
-    const rows = j?.data ?? j?.rows ?? null;
+    let j: any;
+    try {
+      j = JSON.parse(text);
+    } catch {
+      console.error(`[gsc/supermetrics] non-JSON response: ${text.slice(0, 200)}`);
+      return null;
+    }
+    if (j?.error) {
+      console.error(`[gsc/supermetrics] API error: ${JSON.stringify(j.error).slice(0, 300)}`);
+      return null;
+    }
+    // Envelope is usually { data: [[header],[row]…] }; tolerate { data: { data: [...] } }.
+    let rows: any = j?.data;
+    if (rows && !Array.isArray(rows) && Array.isArray(rows.data)) rows = rows.data;
     return Array.isArray(rows) ? rows : null;
   } catch (e) {
     console.error(`[gsc/supermetrics] error: ${e instanceof Error ? e.message : String(e)}`);
