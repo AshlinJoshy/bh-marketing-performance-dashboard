@@ -1,23 +1,15 @@
 import type { Metadata } from "next";
+import SeoDashboard from "@/components/SeoDashboard";
+import { getSeoData } from "@/lib/seo";
 
 export const metadata: Metadata = {
-  title: "SEO — betterhomes Marketing Hub",
+  title: "SEO & AIO — betterhomes Marketing Hub",
 };
 
-export default function SeoPage() {
-  return (
-    <>
-      <div className="section-header">
-        <div>
-          <div className="page-title">SEO</div>
-          <div className="page-sub">Search performance — keyword rankings, backlinks &amp; SERP visibility</div>
-        </div>
-      </div>
-      <div className="chart-card">
-        <div className="empty-state" style={{ height: 240 }}>
-          Nothing here yet — SEO tracking is coming soon.
-        </div>
-      </div>
-    </>
-  );
+export const dynamic = "force-dynamic";
+export const maxDuration = 30;
+
+export default async function SeoPage() {
+  const initial = await getSeoData();
+  return <SeoDashboard initial={initial} />;
 }

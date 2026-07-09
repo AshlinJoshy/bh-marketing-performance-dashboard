@@ -305,3 +305,72 @@ export async function getWebMetrics(daysRaw = 30, fromRaw?: string, toRaw?: stri
     flow: fl ?? { nodes: [], links: [], sessions: 0 },
   };
 }
+
+// ── SEO tab: traffic by channel + AI sessions (by source) + organic pageviews ──
+// Same entry-source classification as the journey Sankey, but aggregated as
+// per-channel pageviews & sessions (production hosts + humans only).
+function channelClassify(ref: string): string {
+  return (
+    `multiIf(` +
+    `${ref} = '' OR ${ref} = '$direct' OR ${ref} LIKE '%bhomes.com%', 'Direct', ` +
+    `${ref} LIKE '%chatgpt.%' OR ${ref} LIKE '%openai.%' OR ${ref} LIKE '%perplexity.%' OR ${ref} LIKE '%claude.%' OR ${ref} LIKE '%gemini.google%' OR ${ref} LIKE '%copilot.%', 'AI Assistant', ` +
+    `${ref} LIKE '%google.%' OR ${ref} LIKE '%bing.%' OR ${ref} LIKE '%yahoo.%' OR ${ref} LIKE '%duckduckgo.%' OR ${ref} LIKE '%ecosia.%' OR ${ref} LIKE '%yandex.%' OR ${ref} LIKE '%baidu.%' OR ${ref} LIKE '%brave.%', 'Organic Search', ` +
+    `${ref} LIKE '%facebook.%' OR ${ref} LIKE '%instagram.%' OR ${ref} LIKE '%linkedin.%' OR ${ref} = 't.co' OR ${ref} LIKE '%youtube.%' OR ${ref} LIKE '%tiktok.%', 'Social', ` +
+    `'Referral')`
+  );
+}
+
+export interface SeoTraffic {
+  connected: boolean;
+  label: string;
+  totalPageviews: number;
+  organicPageviews: number;
+  aiSessions: number;
+  totalSessions: number;
+  byChannel: { channel: string; pageviews: number; sessions: number }[];
+  aiBySource: { source: string; sessions: number }[];
+}
+
+export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 30): Promise<SeoTraffic> {
+  const key = process.env.POSTHOG_API_KEY;
+  const from = isDate(fromRaw);
+  const to = isDate(toRaw);
+  const days = Math.max(1, Math.min(365, Math.round(daysRaw || 30)));
+  let since: string;
+  let label: string;
+  if (from && to && from <= to) {
+    since = `timestamp >= toDateTime('${from} 00:00:00') AND timestamp <= toDateTime('${to} 23:59:59')`;
+    label = `${from} → ${to}`;
+  } else {
+    since = `timestamp >= now() - INTERVAL ${days} DAY`;
+    label = `last ${days} days`;
+  }
+  since += ` AND (lower(properties.$host) = 'bhomes.com' OR lower(properties.$host) LIKE '%.bhomes.com')`;
+  const base: SeoTraffic = { connected: !!key, label, totalPageviews: 0, organicPageviews: 0, aiSessions: 0, totalSessions: 0, byChannel: [], aiBySource: [] };
+  if (!key) return base;
+
+  const dc = DATACENTER_CITIES.map((c) => `'${c}'`).join(", ");
+  const human = ` AND NOT (coalesce(properties.$virt_is_bot, false) = true OR properties.$geoip_city_name IN (${dc}) OR properties.$os = 'Linux')`;
+  const chan = channelClassify("ref");
+  // one row per session: first referrer + its pageview count
+  const inner = `SELECT properties.$session_id AS sid, argMin(coalesce(properties.$referring_domain, ''), timestamp) AS ref, count() AS pv FROM events WHERE event = '$pageview' AND ${since}${human} AND properties.$session_id != '' GROUP BY sid`;
+  const aiRef = `(ref LIKE '%chatgpt.%' OR ref LIKE '%openai.%' OR ref LIKE '%perplexity.%' OR ref LIKE '%claude.%' OR ref LIKE '%gemini.google%' OR ref LIKE '%copilot.%')`;
+
+  const [chanRows, aiRows] = await Promise.all([
+    hogql(`SELECT ${chan} AS channel, sum(pv) AS pageviews, count() AS sessions FROM (${inner}) GROUP BY channel ORDER BY pageviews DESC`),
+    hogql(`SELECT ref, count() AS sessions FROM (${inner}) WHERE ${aiRef} GROUP BY ref ORDER BY sessions DESC LIMIT 20`),
+  ]);
+
+  for (const r of chanRows ?? []) {
+    const ch = String(r[0] || "");
+    const pvv = Number(r[1] || 0);
+    const ss = Number(r[2] || 0);
+    base.byChannel.push({ channel: ch, pageviews: pvv, sessions: ss });
+    base.totalPageviews += pvv;
+    base.totalSessions += ss;
+    if (ch === "Organic Search") base.organicPageviews = pvv;
+    if (ch === "AI Assistant") base.aiSessions = ss;
+  }
+  base.aiBySource = (aiRows ?? []).map((r) => ({ source: String(r[0] || "(unknown)"), sessions: Number(r[1] || 0) }));
+  return base;
+}

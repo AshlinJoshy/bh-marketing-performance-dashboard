@@ -364,3 +364,28 @@ export async function triggerIngestAction() {
     return { ok: false as const, error: e instanceof Error ? e.message : String(e) };
   }
 }
+
+// Save the SEO tab's target keyword list (tracked in GSC). Single-row config.
+export async function saveSeoConfigAction(keywords: unknown) {
+  const db = adminClient();
+  if (!db) return { ok: false as const, error: "SUPABASE_SERVICE_ROLE_KEY not set" };
+  try {
+    const clean = (Array.isArray(keywords) ? keywords : [])
+      .map((k) => String(k).trim())
+      .filter(Boolean)
+      .slice(0, 100);
+    const { error } = await db
+      .from("seo_config")
+      .upsert({ id: 1, payload: { keywords: clean }, updated_at: new Date().toISOString() }, { onConflict: "id" });
+    if (error) {
+      const hint = /relation .*seo_config.* does not exist/i.test(error.message)
+        ? "The seo_config table isn't created yet — apply migration 0010."
+        : error.message;
+      return { ok: false as const, error: hint };
+    }
+    revalidatePath("/seo");
+    return { ok: true as const };
+  } catch (e) {
+    return { ok: false as const, error: e instanceof Error ? e.message : String(e) };
+  }
+}

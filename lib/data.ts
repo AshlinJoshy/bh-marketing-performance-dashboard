@@ -362,3 +362,38 @@ export async function getPerfRuns(limit = 5): Promise<PerfRun[]> {
     return [];
   }
 }
+
+// ── SEO tab config (editable target keyword list) ───────────────
+export const DEFAULT_SEO_KEYWORDS = [
+  "rent apartment abu dhabi",
+  "dubai villa for sale",
+  "apartment for rent abu dhabi",
+  "villa for sale in dubai",
+  "apartments for sale in abu dhabi",
+  "townhouses for sale in dubai",
+  "villas for sale in dubai",
+  "dubai marina apartments for sale",
+  "villas for sale in sharjah",
+  "apartment for sale in dubai",
+  "apartment for rent in dubai",
+  "property for sale in dubai",
+  "villas for sale in abu dhabi",
+  "dubai apartment for sale",
+];
+
+export interface SeoConfig {
+  keywords: string[];
+}
+
+/** The editable SEO config (target keywords tracked in GSC). */
+export async function getSeoConfig(): Promise<SeoConfig> {
+  const db = readClient();
+  if (!db) return { keywords: DEFAULT_SEO_KEYWORDS };
+  try {
+    const { data } = await db.from("seo_config").select("payload").eq("id", 1).maybeSingle();
+    const kw = (data?.payload as { keywords?: string[] } | null)?.keywords;
+    return { keywords: kw?.length ? kw : DEFAULT_SEO_KEYWORDS };
+  } catch {
+    return { keywords: DEFAULT_SEO_KEYWORDS };
+  }
+}
