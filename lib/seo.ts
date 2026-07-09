@@ -1,9 +1,10 @@
-// SEO tab aggregator — pulls the three live sources in parallel:
-//   • PostHog   → traffic by channel, AI sessions (+ by source), organic pageviews
-//   • GSC       → organic clicks / impressions + target-keyword rankings
-//   • Metabase  → organic & AI leads, pipeline stage, open/closed status
-// Each source degrades to a "not connected" shape on its own, so a missing
-// credential only blanks its section — the rest of the tab still renders.
+// SEO tab aggregator.
+//
+// PostHog (traffic) + GSC live together in getSeoData — both are fast and load
+// with the page. Metabase leads are pulled SEPARATELY via getSeoLeads (fetched
+// client-side) because that CRM view is slow; keeping it off the page's server
+// render means a slow Metabase query can never stall or kill the fast PostHog /
+// GSC queries (they no longer share one function invocation).
 import { getSeoTraffic, type SeoTraffic } from "@/lib/posthog";
 import { getGscMetrics, type GscData } from "@/lib/gsc";
 import { getLeadsData, type LeadsData } from "@/lib/metabase";
@@ -16,7 +17,6 @@ export interface SeoData {
   keywords: string[];
   traffic: SeoTraffic;
   gsc: GscData;
-  leads: LeadsData;
 }
 
 const isDate = (s?: string): string | null => (s && /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null);
@@ -29,13 +29,16 @@ export function seoRange(fromRaw?: string, toRaw?: string): { from: string; to: 
   return from <= to ? { from, to } : { from: to, to: from };
 }
 
+/** Fast half: PostHog traffic + GSC (loads with the page). */
 export async function getSeoData(fromRaw?: string, toRaw?: string): Promise<SeoData> {
   const { from, to } = seoRange(fromRaw, toRaw);
   const cfg = await getSeoConfig();
-  const [traffic, gsc, leads] = await Promise.all([
-    getSeoTraffic(from, to),
-    getGscMetrics(from, to, cfg.keywords),
-    getLeadsData(from, to),
-  ]);
-  return { from, to, label: `${from} → ${to}`, keywords: cfg.keywords, traffic, gsc, leads };
+  const [traffic, gsc] = await Promise.all([getSeoTraffic(from, to), getGscMetrics(from, to, cfg.keywords)]);
+  return { from, to, label: `${from} → ${to}`, keywords: cfg.keywords, traffic, gsc };
+}
+
+/** Slow half: Metabase leads (fetched separately, client-side). */
+export async function getSeoLeads(fromRaw?: string, toRaw?: string): Promise<LeadsData> {
+  const { from, to } = seoRange(fromRaw, toRaw);
+  return getLeadsData(from, to);
 }

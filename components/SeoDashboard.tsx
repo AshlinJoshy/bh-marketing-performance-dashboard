@@ -7,6 +7,7 @@ import HelpTip from "@/components/HelpTip";
 import { saveSeoConfigAction } from "@/app/actions";
 import { C } from "@/lib/theme";
 import type { SeoData } from "@/lib/seo";
+import type { LeadsData } from "@/lib/metabase";
 
 const fmt = (n: number | null | undefined) => (n == null ? "—" : new Intl.NumberFormat("en-US").format(Math.round(n)));
 const fmtK = (n: number | null | undefined) => {
@@ -30,7 +31,6 @@ const chColor = (c: string) => CH_COLORS[c] ?? C.mid;
 const STAGE_ORDER = ["New", "Qualified", "Viewing", "Listed", "Valuation", "Reserved", "Offer", "Deal"];
 const STATUS_ORDER = ["Open", "Closed", "Completed"];
 
-// Small "source not connected" card telling the user which env vars to add.
 function ConnectCard({ title, lines }: { title: string; lines: string[] }) {
   return (
     <div className="chart-card">
@@ -58,6 +58,10 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
   const [loading, setLoading] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
 
+  // Leads load SEPARATELY (slow Metabase view) so it can't stall PostHog/GSC.
+  const [leads, setLeads] = useState<LeadsData | null>(null);
+  const [leadsLoading, setLeadsLoading] = useState(true);
+
   // keyword editor
   const [kwOpen, setKwOpen] = useState(false);
   const [kwInput, setKwInput] = useState(initial.keywords.join("\n"));
@@ -71,12 +75,12 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
     return `from=${ymd(f)}&to=${ymd(t)}`;
   }, [mode, from, to, days]);
 
+  // fast half — PostHog + GSC
   const load = useCallback(async (qs: string) => {
     setLoading(true);
     try {
       const res = await fetch(`/api/seo?${qs}`, { cache: "no-store" });
       const json = await res.json();
-      // Only replace state with a well-formed payload; a 500/{error} keeps last good data.
       if (res.ok && json && json.traffic) {
         setData(json as SeoData);
         setUpdatedAt(new Date().toLocaleTimeString());
@@ -90,17 +94,51 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
     }
   }, []);
 
-  useEffect(() => setUpdatedAt(new Date().toLocaleTimeString()), []);
+  // slow half — Metabase leads (independent request)
+  const loadLeads = useCallback(async (qs: string) => {
+    setLeadsLoading(true);
+    try {
+      const res = await fetch(`/api/seo/leads?${qs}`, { cache: "no-store" });
+      const json = await res.json();
+      if (res.ok && json && typeof json.connected === "boolean") setLeads(json as LeadsData);
+      else {
+        console.error("[seo] leads returned an error", json?.error ?? res.status);
+        setLeads({ connected: true, label: "", aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [], error: json?.error || `HTTP ${res.status}` });
+      }
+    } catch (e) {
+      console.error("[seo] leads fetch failed", e);
+      setLeads({ connected: true, label: "", aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [], error: String(e) });
+    } finally {
+      setLeadsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    setUpdatedAt(new Date().toLocaleTimeString());
+    loadLeads(rangeQs());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function pickPreset(d: number) {
     setMode("preset");
     setDays(d);
     const t = new Date();
     const f = new Date(Date.now() - (d - 1) * 864e5);
-    load(`from=${ymd(f)}&to=${ymd(t)}`);
+    const qs = `from=${ymd(f)}&to=${ymd(t)}`;
+    load(qs);
+    loadLeads(qs);
   }
   function applyCustom() {
-    if (from && to && from <= to) load(`from=${from}&to=${to}`);
+    if (from && to && from <= to) {
+      const qs = `from=${from}&to=${to}`;
+      load(qs);
+      loadLeads(qs);
+    }
+  }
+  function refresh() {
+    const qs = rangeQs();
+    load(qs);
+    loadLeads(qs);
   }
   function saveKeywords() {
     setKwMsg(null);
@@ -115,16 +153,15 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
     });
   }
 
-  const { traffic, gsc, leads } = data;
+  const { traffic, gsc } = data;
   const aiSources = traffic.aiBySource.slice(0, 8);
   const channels = traffic.byChannel.filter((c) => c.pageviews > 0);
   const errors = [
     traffic.error ? `PostHog: ${traffic.error}` : null,
     gsc.connected && gsc.error ? `GSC: ${gsc.error}` : null,
-    leads.connected && leads.error ? `Metabase: ${leads.error}` : null,
+    leads?.connected && leads.error ? `Metabase: ${leads.error}` : null,
   ].filter(Boolean) as string[];
 
-  // pivot leads stage/status into {label -> {organic, ai}}
   const pivot = (rows: { segment: string; n: number }[] & any[], key: "stage" | "status") => {
     const m = new Map<string, { organic: number; ai: number }>();
     for (const r of rows) {
@@ -135,8 +172,8 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
     }
     return m;
   };
-  const stageMap = pivot(leads.stage as any, "stage");
-  const statusMap = pivot(leads.status as any, "status");
+  const stageMap = pivot((leads?.stage ?? []) as any, "stage");
+  const statusMap = pivot((leads?.status ?? []) as any, "status");
   const orderRows = (m: Map<string, { organic: number; ai: number }>, order: string[]) => {
     const keys = [...new Set([...order, ...m.keys()])].filter((k) => m.has(k));
     return keys.map((k) => ({ label: k, ...(m.get(k) as { organic: number; ai: number }) }));
@@ -150,15 +187,12 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
           <div className="page-sub">Search &amp; AI performance — GSC · PostHog · Metabase · {data.label}</div>
         </div>
         <span className="bot-left" style={{ gap: 10, flexWrap: "wrap" }}>
-          {(["GSC", "PostHog", "Metabase"] as const).map((s) => {
-            const on = s === "GSC" ? gsc.connected : s === "PostHog" ? traffic.connected : leads.connected;
-            return (
-              <span key={s} style={{ fontSize: 11, color: on ? C.green : C.sand, display: "inline-flex", alignItems: "center", gap: 4 }}>
-                <span style={{ width: 7, height: 7, borderRadius: "50%", background: on ? C.green : C.sand, display: "inline-block" }} />
-                {s}
-              </span>
-            );
-          })}
+          {([["GSC", gsc.connected], ["PostHog", traffic.connected], ["Metabase", leads ? leads.connected : null]] as [string, boolean | null][]).map(([s, on]) => (
+            <span key={s} style={{ fontSize: 11, color: on == null ? C.sand : on ? C.green : C.sand, display: "inline-flex", alignItems: "center", gap: 4 }}>
+              <span style={{ width: 7, height: 7, borderRadius: "50%", background: on == null ? "#ccc" : on ? C.green : C.sand, display: "inline-block" }} />
+              {s}
+            </span>
+          ))}
           {updatedAt && <span style={{ fontSize: 11, color: C.mid }}>· updated {updatedAt}</span>}
         </span>
       </div>
@@ -183,7 +217,7 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
         )}
         <div className="field" style={{ marginLeft: "auto" }}>
           <label>&nbsp;</label>
-          <button className="filter-btn" onClick={() => load(rangeQs())} disabled={loading}>{loading ? "Refreshing…" : "↻ Refresh"}</button>
+          <button className="filter-btn" onClick={refresh} disabled={loading}>{loading ? "Refreshing…" : "↻ Refresh"}</button>
         </div>
       </div>
 
@@ -195,12 +229,13 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
               {errors.map((e, i) => (<div key={i}>⚠ {e}</div>))}
             </div>
           )}
+
           {/* KPI strip */}
           <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(3,1fr)" }}>
             <div className="kpi-card">
               <div className="kpi-label">AI referral leads <HelpTip text="Leads whose UTM/source is an LLM (ChatGPT, Perplexity…). From Metabase." /></div>
-              <div className="kpi-value" style={{ color: C.green }}>{leads.connected ? fmt(leads.aiLeads) : "—"}</div>
-              <div className="kpi-change">{leads.connected ? "Metabase · LLM sources" : "connect Metabase"}</div>
+              <div className="kpi-value" style={{ color: C.green }}>{!leads ? "…" : leads.connected ? fmt(leads.aiLeads) : "—"}</div>
+              <div className="kpi-change">{leadsLoading && !leads ? "loading…" : leads?.connected ? "Metabase · LLM sources" : "connect Metabase"}</div>
             </div>
             <div className="kpi-card">
               <div className="kpi-label">AI sessions <HelpTip text="Website sessions referred by an LLM. From PostHog (humans only)." /></div>
@@ -239,7 +274,7 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
                   <ChartBox type="bar"
                     data={{ labels: channels.map((c) => c.channel), datasets: [{ label: "Pageviews", data: channels.map((c) => c.pageviews), backgroundColor: channels.map((c) => chColor(c.channel)), borderRadius: 5 }] }}
                     options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true }, y: { ticks: { autoSkip: false, font: { size: 11 } } } } }} />
-                ) : <div className="empty-state">{traffic.connected ? "No pageviews in range." : "PostHog not connected."}</div>}
+                ) : <div className="empty-state">{traffic.error ? `⚠ ${traffic.error}` : traffic.connected ? "No pageviews in range." : "PostHog not connected."}</div>}
               </div>
             </div>
             <div className="chart-card">
@@ -296,9 +331,11 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
             )}
           </div>
 
-          {/* leads */}
-          <div className="chart-title" style={{ marginTop: 22, marginBottom: 10 }}>Organic &amp; AI leads <HelpTip text="From the CRM via Metabase. Organic = website enquiries / pop-up with no paid UTM. AI = LLM UTM source." /></div>
-          {!leads.connected ? (
+          {/* leads (loaded separately) */}
+          <div className="chart-title" style={{ marginTop: 22, marginBottom: 10 }}>Organic &amp; AI leads <HelpTip text="From the CRM via Metabase. Organic = website enquiries / pop-up with no paid UTM. AI = LLM UTM source. Loads separately so it never blocks the rest of the tab." /></div>
+          {leadsLoading && !leads ? (
+            <div className="chart-card"><div className="empty-state" style={{ height: 120 }}><span className="spinner" />Loading leads from Metabase…</div></div>
+          ) : !leads?.connected ? (
             <ConnectCard title="Metabase" lines={["METABASE_URL", "METABASE_USERNAME", "METABASE_PASSWORD"]} />
           ) : leads.error ? (
             <div className="chart-card"><div className="empty-state" style={{ height: "auto", padding: "22px 16px" }}>⚠ {leads.error}</div></div>
@@ -357,7 +394,7 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
           )}
 
           <div style={{ fontSize: 11, color: C.mid, marginTop: 14 }}>
-            Sources: PostHog $pageview (humans, production hosts) · Google Search Console ({gsc.connected ? "live" : "not connected"}) · Metabase betterhomes leads ({leads.connected ? "live" : "not connected"}). Content production &amp; outreach are tracked outside these connectors and are intentionally omitted.
+            Sources: PostHog $pageview (humans, production hosts) · Google Search Console ({gsc.connected ? "live" : "not connected"}) · Metabase betterhomes leads ({leads?.connected ? "live" : "not connected"}, loaded separately). Content production &amp; outreach are tracked outside these connectors and are intentionally omitted.
           </div>
         </div>
       </div>
