@@ -281,7 +281,7 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
           {/* leads */}
           <div className="chart-title" style={{ marginTop: 22, marginBottom: 10 }}>Organic &amp; AI leads <HelpTip text="From the CRM via Metabase. Organic = website enquiries / pop-up with no paid UTM. AI = LLM UTM source." /></div>
           {!leads.connected ? (
-            <ConnectCard title="Metabase" lines={["METABASE_URL", "METABASE_API_KEY"]} />
+            <ConnectCard title="Metabase" lines={["METABASE_URL", "METABASE_USERNAME", "METABASE_PASSWORD"]} />
           ) : (
             <>
               <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(4,1fr)" }}>
