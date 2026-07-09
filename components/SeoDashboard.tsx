@@ -257,7 +257,7 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
               </div>
             )}
             {!gsc.connected ? (
-              <ConnectCard title="Google Search Console" lines={["GSC_SITE_URL", "GSC_CLIENT_EMAIL", "GSC_PRIVATE_KEY"]} />
+              <ConnectCard title="Google Search Console" lines={["SUPERMETRICS_API_KEY", "— or —", "GSC_CLIENT_EMAIL + GSC_PRIVATE_KEY"]} />
             ) : (
               <div className="table-scroll" style={{ marginTop: 6 }}>
                 <table className="perf-table">

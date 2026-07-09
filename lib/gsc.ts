@@ -107,8 +107,18 @@ async function gscQuery(body: Record<string, unknown>): Promise<any | null> {
   }
 }
 
-/** Organic totals for the range + avg position for each target keyword. */
+/**
+ * Organic totals + per-keyword rankings. Two interchangeable backends:
+ *   • Supermetrics Data Fetching API — used when SUPERMETRICS_API_KEY is set
+ *     (no Google Cloud setup; GSC is already authorized inside Supermetrics).
+ *   • Google service account — used otherwise (GSC_CLIENT_EMAIL/PRIVATE_KEY).
+ */
 export async function getGscMetrics(from: string, to: string, targetKeywords: string[] = []): Promise<GscData> {
+  if (process.env.SUPERMETRICS_API_KEY) return getGscViaSupermetrics(from, to, targetKeywords);
+  return getGscViaServiceAccount(from, to, targetKeywords);
+}
+
+async function getGscViaServiceAccount(from: string, to: string, targetKeywords: string[] = []): Promise<GscData> {
   const connected = !!(process.env.GSC_CLIENT_EMAIL && process.env.GSC_PRIVATE_KEY);
   const base: GscData = { connected, totals: null, keywords: [], label: `${from} → ${to}` };
   if (!connected) return base;
@@ -128,6 +138,121 @@ export async function getGscMetrics(from: string, to: string, targetKeywords: st
   if (targetKeywords.length) {
     const byQ = new Map<string, any>();
     for (const r of kwRes?.rows ?? []) byQ.set(String(r.keys?.[0] || "").toLowerCase(), r);
+    base.keywords = targetKeywords.map((k) => {
+      const r = byQ.get(k.trim().toLowerCase());
+      return {
+        keyword: k,
+        clicks: r?.clicks || 0,
+        impressions: r?.impressions || 0,
+        ctr: r?.ctr || 0,
+        position: r ? Math.round((r.position || 0) * 10) / 10 : null,
+      };
+    });
+  }
+  return base;
+}
+
+// ── Supermetrics Data Fetching API backend ──────────────────────
+// Uses your Supermetrics API key so GSC is pulled through Supermetrics (which
+// already has the property authorized) instead of a Google service account.
+//   SUPERMETRICS_API_KEY   the Data Fetching API key (hub.supermetrics.com)
+//   SUPERMETRICS_DS_USER   the Supermetrics login that authorized GSC
+//                          (defaults to zahra.firouzi@bhomes.com)
+//   GSC_SITE_URL           the GSC account/site (defaults to sc-domain:bhomes.com)
+//   SUPERMETRICS_API_URL   override the endpoint if your plan differs
+const SM_ENDPOINT = process.env.SUPERMETRICS_API_URL || "https://api.supermetrics.com/enterprise/v2/query/data/json";
+
+function smNum(v: unknown): number {
+  const n = typeof v === "string" ? parseFloat(v.replace(/[^0-9.-]/g, "")) : Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+const smCtr = (v: number) => (v > 1 ? v / 100 : v); // normalize % → fraction
+
+// Supermetrics /data/json returns a 2-D array with a header row first.
+function smSplit(rows: any[][] | null): { header: string[]; data: any[][] } {
+  if (!rows || !rows.length) return { header: [], data: [] };
+  const first = rows[0].map((x) => String(x).toLowerCase());
+  const isHeader = first.some((s) => s.includes("click") || s.includes("impress") || s.includes("query") || s.includes("search") || s.includes("position") || s.includes("ctr"));
+  return isHeader ? { header: rows[0].map(String), data: rows.slice(1) } : { header: [], data: rows };
+}
+function smIdx(header: string[]): Record<string, number> {
+  const idx: Record<string, number> = {};
+  header.forEach((h, i) => {
+    const s = String(h).toLowerCase();
+    if (idx.query === undefined && (s.includes("query") || s.includes("search"))) idx.query = i;
+    if (idx.clicks === undefined && s.includes("click")) idx.clicks = i;
+    if (idx.impressions === undefined && s.includes("impress")) idx.impressions = i;
+    if (idx.ctr === undefined && s.includes("ctr")) idx.ctr = i;
+    if (idx.position === undefined && s.includes("position")) idx.position = i;
+  });
+  return idx;
+}
+
+async function smQuery(fields: string[], from: string, to: string, maxRows: number): Promise<any[][] | null> {
+  const key = process.env.SUPERMETRICS_API_KEY;
+  if (!key) return null;
+  const payload: Record<string, unknown> = {
+    ds_id: "GW",
+    ds_accounts: [process.env.GSC_SITE_URL || "sc-domain:bhomes.com"],
+    date_range_type: "custom",
+    start_date: from,
+    end_date: to,
+    fields,
+    max_rows: maxRows,
+  };
+  const dsUser = process.env.SUPERMETRICS_DS_USER || "zahra.firouzi@bhomes.com";
+  if (dsUser) payload.ds_user = dsUser;
+  const url = `${SM_ENDPOINT}?json=${encodeURIComponent(JSON.stringify(payload))}&api_key=${encodeURIComponent(key)}`;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 20000);
+  try {
+    const res = await fetch(url, { cache: "no-store", signal: ctrl.signal });
+    if (!res.ok) return null;
+    const j = await res.json();
+    const rows = j?.data ?? j?.rows ?? null;
+    return Array.isArray(rows) ? rows : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function getGscViaSupermetrics(from: string, to: string, targetKeywords: string[] = []): Promise<GscData> {
+  const base: GscData = { connected: true, totals: null, keywords: [], label: `${from} → ${to}` };
+  const [totRows, kwRows] = await Promise.all([
+    smQuery(["clicks", "impressions", "ctr", "position"], from, to, 1),
+    targetKeywords.length ? smQuery(["query", "clicks", "impressions", "ctr", "position"], from, to, 5000) : Promise.resolve(null),
+  ]);
+
+  const tot = smSplit(totRows);
+  if (tot.data.length) {
+    const i = tot.header.length ? smIdx(tot.header) : { clicks: 0, impressions: 1, ctr: 2, position: 3 };
+    const r = tot.data[tot.data.length - 1];
+    base.totals = {
+      clicks: smNum(r[i.clicks ?? 0]),
+      impressions: smNum(r[i.impressions ?? 1]),
+      ctr: smCtr(smNum(r[i.ctr ?? 2])),
+      position: smNum(r[i.position ?? 3]),
+    };
+  } else {
+    base.totals = { clicks: 0, impressions: 0, ctr: 0, position: 0 };
+  }
+
+  if (targetKeywords.length) {
+    const kw = smSplit(kwRows);
+    const i = kw.header.length ? smIdx(kw.header) : { query: 0, clicks: 1, impressions: 2, ctr: 3, position: 4 };
+    const byQ = new Map<string, { clicks: number; impressions: number; ctr: number; position: number }>();
+    for (const r of kw.data) {
+      const q = String(r[i.query ?? 0] ?? "").toLowerCase();
+      if (!q) continue;
+      byQ.set(q, {
+        clicks: smNum(r[i.clicks ?? 1]),
+        impressions: smNum(r[i.impressions ?? 2]),
+        ctr: smCtr(smNum(r[i.ctr ?? 3])),
+        position: smNum(r[i.position ?? 4]),
+      });
+    }
     base.keywords = targetKeywords.map((k) => {
       const r = byQ.get(k.trim().toLowerCase());
       return {
