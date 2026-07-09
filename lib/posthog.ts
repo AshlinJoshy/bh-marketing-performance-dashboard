@@ -19,14 +19,15 @@ const DATACENTER_CITIES = ["Ashburn", "Boardman", "Council Bluffs", "The Dalles"
 
 const SEARCH_ENGINES = ["google.", "bing.", "yahoo.", "duckduckgo.", "ecosia.", "yandex.", "baidu.", "brave."];
 
-async function hogql(sql: string): Promise<any[][] | null> {
+async function hogql(sql: string, timeoutMs = Number(process.env.POSTHOG_TIMEOUT_MS || 15000)): Promise<any[][] | null> {
   const key = process.env.POSTHOG_API_KEY;
   if (!key) return null;
   // Hard timeout so one slow/heavy query can never hang the server render (which
   // would leave the tab stuck on its loading skeleton). On timeout we return null
-  // and the caller degrades gracefully to an empty section.
+  // and the caller degrades gracefully to an empty section. Heavy per-session
+  // scans can pass a larger timeout.
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), Number(process.env.POSTHOG_TIMEOUT_MS || 15000));
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(`${HOST.replace(/\/$/, "")}/api/projects/${PROJECT}/query/`, {
       method: "POST",
@@ -352,13 +353,18 @@ export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 
   const dc = DATACENTER_CITIES.map((c) => `'${c}'`).join(", ");
   const human = ` AND NOT (coalesce(properties.$virt_is_bot, false) = true OR properties.$geoip_city_name IN (${dc}) OR properties.$os = 'Linux')`;
   const chan = channelClassify("ref");
-  // one row per session: first referrer + its pageview count
+  // HEAVY: one per-session pass (argMin first referrer) → channel pageviews &
+  // sessions. Given extra time so a large range isn't cut off (this is the only
+  // heavy scan, so it won't contend with the AI query below).
   const inner = `SELECT properties.$session_id AS sid, argMin(coalesce(properties.$referring_domain, ''), timestamp) AS ref, count() AS pv FROM events WHERE event = '$pageview' AND ${since}${human} AND properties.$session_id != '' GROUP BY sid`;
-  const aiRef = `(ref LIKE '%chatgpt.%' OR ref LIKE '%openai.%' OR ref LIKE '%perplexity.%' OR ref LIKE '%claude.%' OR ref LIKE '%gemini.google%' OR ref LIKE '%copilot.%')`;
+  // LIGHT: AI sessions by LLM referrer, filtered at the event level (no
+  // per-session pass) — cheap and independent of the heavy query. LLM referrers
+  // only appear on the entry pageview, so this ≈ first-referrer attribution.
+  const aiRefEvent = `(properties.$referring_domain LIKE '%chatgpt.%' OR properties.$referring_domain LIKE '%openai.%' OR properties.$referring_domain LIKE '%perplexity.%' OR properties.$referring_domain LIKE '%claude.%' OR properties.$referring_domain LIKE '%gemini.google%' OR properties.$referring_domain LIKE '%copilot.%')`;
 
   const [chanRows, aiRows] = await Promise.all([
-    hogql(`SELECT ${chan} AS channel, sum(pv) AS pageviews, count() AS sessions FROM (${inner}) GROUP BY channel ORDER BY pageviews DESC`),
-    hogql(`SELECT ref, count() AS sessions FROM (${inner}) WHERE ${aiRef} GROUP BY ref ORDER BY sessions DESC LIMIT 20`),
+    hogql(`SELECT ${chan} AS channel, sum(pv) AS pageviews, count() AS sessions FROM (${inner}) GROUP BY channel ORDER BY pageviews DESC`, 25000),
+    hogql(`SELECT properties.$referring_domain AS ref, count(DISTINCT properties.$session_id) AS sessions FROM events WHERE event = '$pageview' AND ${since}${human} AND ${aiRefEvent} GROUP BY ref ORDER BY sessions DESC LIMIT 20`),
   ]);
 
   for (const r of chanRows ?? []) {
@@ -372,5 +378,8 @@ export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 
     if (ch === "AI Assistant") base.aiSessions = ss;
   }
   base.aiBySource = (aiRows ?? []).map((r) => ({ source: String(r[0] || "(unknown)"), sessions: Number(r[1] || 0) }));
+  // Fallback: if the heavy channel scan was cut off, still surface AI sessions
+  // from the light query so that KPI + chart aren't stranded at 0.
+  if (!base.aiSessions && base.aiBySource.length) base.aiSessions = base.aiBySource.reduce((a, s) => a + s.sessions, 0);
   return base;
 }
