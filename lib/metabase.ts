@@ -43,8 +43,10 @@ const IS_POPUP = `(${utmSource} LIKE '%pop-up%' OR ${utmMedium} LIKE '%pop-up%' 
 const IS_WEB_NOUTM = `(LOWER(enquiry_source) = 'website' AND (utm IS NULL OR ${utmSource} IS NULL OR ${utmSource} = ''))`;
 const SEG = `CASE WHEN ${IS_AI} THEN 'ai' WHEN (${IS_WEB_NOUTM} OR ${IS_POPUP}) THEN 'organic' ELSE 'other' END`;
 
-// Session token from username/password, cached in-process and refreshed on a 401.
+// Session token from username/password, cached in-process, coalesced across
+// concurrent callers, and refreshed on a 401.
 let mbSession: { token: string; exp: number } | null = null;
+let mbSessionInFlight: Promise<string | null> | null = null;
 
 async function mbSessionToken(): Promise<string | null> {
   const url = process.env.METABASE_URL;
@@ -52,25 +54,40 @@ async function mbSessionToken(): Promise<string | null> {
   const pass = process.env.METABASE_PASSWORD;
   if (!url || !user || !pass) return null;
   if (mbSession && mbSession.exp > Date.now()) return mbSession.token;
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 15000);
+  if (mbSessionInFlight) return mbSessionInFlight;
+  mbSessionInFlight = (async () => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 15000);
+    try {
+      const res = await fetch(`${url.replace(/\/$/, "")}/api/session`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username: user, password: pass }),
+        cache: "no-store",
+        signal: ctrl.signal,
+      });
+      if (!res.ok) {
+        console.error(`[metabase] session login failed: HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 160)}`);
+        return null;
+      }
+      const j = await res.json();
+      if (!j?.id) {
+        console.error("[metabase] session login: no token in response");
+        return null;
+      }
+      mbSession = { token: String(j.id), exp: Date.now() + 13 * 864e5 }; // tokens last ~14d
+      return mbSession.token;
+    } catch (e) {
+      console.error(`[metabase] session login error: ${e instanceof Error ? e.message : String(e)}`);
+      return null;
+    } finally {
+      clearTimeout(t);
+    }
+  })();
   try {
-    const res = await fetch(`${url.replace(/\/$/, "")}/api/session`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ username: user, password: pass }),
-      cache: "no-store",
-      signal: ctrl.signal,
-    });
-    if (!res.ok) return null;
-    const j = await res.json();
-    if (!j?.id) return null;
-    mbSession = { token: String(j.id), exp: Date.now() + 13 * 864e5 }; // tokens last ~14d
-    return mbSession.token;
-  } catch {
-    return null;
+    return await mbSessionInFlight;
   } finally {
-    clearTimeout(t);
+    mbSessionInFlight = null;
   }
 }
 
@@ -87,7 +104,7 @@ async function mbQuery(sql: string, retry = true): Promise<any[][] | null> {
     headers["X-Metabase-Session"] = token;
   }
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 15000);
+  const t = setTimeout(() => ctrl.abort(), 20000);
   try {
     const res = await fetch(`${url.replace(/\/$/, "")}/api/dataset`, {
       method: "POST",
@@ -101,10 +118,14 @@ async function mbQuery(sql: string, retry = true): Promise<any[][] | null> {
       clearTimeout(t);
       return mbQuery(sql, false);
     }
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.error(`[metabase] dataset HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
+      return null;
+    }
     const j = await res.json();
     return (j?.data?.rows as any[][]) ?? null;
-  } catch {
+  } catch (e) {
+    console.error(`[metabase] dataset error: ${e instanceof Error ? e.message : String(e)}`);
     return null;
   } finally {
     clearTimeout(t);
@@ -120,6 +141,14 @@ export async function getLeadsData(fromRaw: string, toRaw: string): Promise<Lead
   const base: LeadsData = { connected, label, aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [] };
   if (!connected) return base;
   if (!isDate(fromRaw) || !isDate(toRaw)) return { ...base, error: "bad date range" };
+  // Precise auth check first, so a login problem reads clearly instead of a
+  // generic "query failed".
+  if (!process.env.METABASE_API_KEY) {
+    const tok = await mbSessionToken();
+    if (!tok) {
+      return { ...base, error: "Metabase login failed — check METABASE_URL / METABASE_USERNAME / METABASE_PASSWORD (SSO or 2FA logins can't authenticate with a password)." };
+    }
+  }
   const range = `created_at >= '${fromRaw} 00:00:00' AND created_at <= '${toRaw} 23:59:59'`;
 
   const [segRows, srcRows, stageRows, statusRows] = await Promise.all([
@@ -138,8 +167,11 @@ export async function getLeadsData(fromRaw: string, toRaw: string): Promise<Lead
     ),
   ]);
 
-  // If the very first query failed outright, report not-really-connected.
-  if (!segRows) return { ...base, error: "Metabase query failed — check METABASE_URL / METABASE_API_KEY / DB access." };
+  // Auth worked but the query didn't come back.
+  if (!segRows) {
+    console.error("[metabase] leads segment query returned no rows (timeout or view error)");
+    return { ...base, error: "Metabase reachable but the leads query failed or timed out (20s) — the view may be slow for this range, or the account can't read it." };
+  }
 
   for (const r of segRows) {
     const sub = String(r[0] ?? "");

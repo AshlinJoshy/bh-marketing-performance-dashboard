@@ -36,10 +36,14 @@ async function hogql(sql: string, timeoutMs = Number(process.env.POSTHOG_TIMEOUT
       cache: "no-store",
       signal: ctrl.signal,
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.error(`[posthog] query HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
+      return null;
+    }
     const data = await res.json();
     return Array.isArray(data?.results) ? data.results : [];
-  } catch {
+  } catch (e) {
+    console.error(`[posthog] query error: ${e instanceof Error ? e.message : String(e)} — ${sql.slice(0, 120)}`);
     return null;
   } finally {
     clearTimeout(t);
@@ -330,6 +334,7 @@ export interface SeoTraffic {
   totalSessions: number;
   byChannel: { channel: string; pageviews: number; sessions: number }[];
   aiBySource: { source: string; sessions: number }[];
+  error?: string;
 }
 
 export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 30): Promise<SeoTraffic> {
@@ -367,6 +372,7 @@ export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 
     hogql(`SELECT properties.$referring_domain AS ref, count(DISTINCT properties.$session_id) AS sessions FROM events WHERE event = '$pageview' AND ${since}${human} AND ${aiRefEvent} GROUP BY ref ORDER BY sessions DESC LIMIT 20`),
   ]);
 
+  if (!chanRows) base.error = "PostHog traffic query failed or timed out.";
   for (const r of chanRows ?? []) {
     const ch = String(r[0] || "");
     const pvv = Number(r[1] || 0);

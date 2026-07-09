@@ -72,12 +72,16 @@ async function accessToken(): Promise<string | null> {
       body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: jwt }),
       cache: "no-store",
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.error(`[gsc] token HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
+      return null;
+    }
     const j = await res.json();
     if (!j?.access_token) return null;
     tokenCache = { token: j.access_token as string, exp: now + Number(j.expires_in || 3600) };
     return tokenCache.token;
-  } catch {
+  } catch (e) {
+    console.error(`[gsc] token error: ${e instanceof Error ? e.message : String(e)}`);
     return null;
   }
 }
@@ -98,9 +102,13 @@ async function gscQuery(body: Record<string, unknown>): Promise<any | null> {
         signal: ctrl.signal,
       },
     );
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.error(`[gsc] searchAnalytics HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
+      return null;
+    }
     return await res.json();
-  } catch {
+  } catch (e) {
+    console.error(`[gsc] searchAnalytics error: ${e instanceof Error ? e.message : String(e)}`);
     return null;
   } finally {
     clearTimeout(t);
@@ -131,6 +139,7 @@ async function getGscViaServiceAccount(from: string, to: string, targetKeywords:
   ]);
 
   const row = totalsRes?.rows?.[0];
+  if (!totalsRes) base.error = `GSC auth or query failed — check GSC_CLIENT_EMAIL / GSC_PRIVATE_KEY and that the service account is a user on ${SITE}.`;
   base.totals = row
     ? { clicks: row.clicks || 0, impressions: row.impressions || 0, ctr: row.ctr || 0, position: row.position || 0 }
     : { clicks: 0, impressions: 0, ctr: 0, position: 0 };
@@ -207,11 +216,16 @@ async function smQuery(fields: string[], from: string, to: string, maxRows: numb
   const t = setTimeout(() => ctrl.abort(), 20000);
   try {
     const res = await fetch(url, { cache: "no-store", signal: ctrl.signal });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.error(`[gsc/supermetrics] HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 240)}`);
+      return null;
+    }
     const j = await res.json();
+    if (j?.error) console.error(`[gsc/supermetrics] API error: ${JSON.stringify(j.error).slice(0, 240)}`);
     const rows = j?.data ?? j?.rows ?? null;
     return Array.isArray(rows) ? rows : null;
-  } catch {
+  } catch (e) {
+    console.error(`[gsc/supermetrics] error: ${e instanceof Error ? e.message : String(e)}`);
     return null;
   } finally {
     clearTimeout(t);
@@ -225,6 +239,7 @@ async function getGscViaSupermetrics(from: string, to: string, targetKeywords: s
     targetKeywords.length ? smQuery(["query", "clicks", "impressions", "ctr", "position"], from, to, 5000) : Promise.resolve(null),
   ]);
 
+  if (!totRows) base.error = "Supermetrics returned no GSC data — check SUPERMETRICS_API_KEY, the DS user, and that GSC is authorized.";
   const tot = smSplit(totRows);
   if (tot.data.length) {
     const i = tot.header.length ? smIdx(tot.header) : { clicks: 0, impressions: 1, ctr: 2, position: 3 };

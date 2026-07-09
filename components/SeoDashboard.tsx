@@ -75,10 +75,16 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
     setLoading(true);
     try {
       const res = await fetch(`/api/seo?${qs}`, { cache: "no-store" });
-      setData((await res.json()) as SeoData);
-      setUpdatedAt(new Date().toLocaleTimeString());
-    } catch {
-      /* keep last good data */
+      const json = await res.json();
+      // Only replace state with a well-formed payload; a 500/{error} keeps last good data.
+      if (res.ok && json && json.traffic) {
+        setData(json as SeoData);
+        setUpdatedAt(new Date().toLocaleTimeString());
+      } else {
+        console.error("[seo] refresh returned an error", json?.error ?? res.status);
+      }
+    } catch (e) {
+      console.error("[seo] refresh failed", e);
     } finally {
       setLoading(false);
     }
@@ -112,6 +118,11 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
   const { traffic, gsc, leads } = data;
   const aiSources = traffic.aiBySource.slice(0, 8);
   const channels = traffic.byChannel.filter((c) => c.pageviews > 0);
+  const errors = [
+    traffic.error ? `PostHog: ${traffic.error}` : null,
+    gsc.connected && gsc.error ? `GSC: ${gsc.error}` : null,
+    leads.connected && leads.error ? `Metabase: ${leads.error}` : null,
+  ].filter(Boolean) as string[];
 
   // pivot leads stage/status into {label -> {organic, ai}}
   const pivot = (rows: { segment: string; n: number }[] & any[], key: "stage" | "status") => {
@@ -179,6 +190,11 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
       <div style={{ position: "relative", minHeight: 120 }}>
         {loading && <div className="seo-loading"><span className="spinner" />Updating…</div>}
         <div style={{ opacity: loading ? 0.4 : 1, transition: "opacity .15s", pointerEvents: loading ? "none" : "auto" }}>
+          {errors.length > 0 && (
+            <div style={{ background: "rgba(201,74,74,.1)", border: "1px solid rgba(201,74,74,.35)", color: "var(--dark)", borderRadius: 10, padding: "10px 14px", marginBottom: 16, fontSize: 12.5, lineHeight: 1.7 }}>
+              {errors.map((e, i) => (<div key={i}>⚠ {e}</div>))}
+            </div>
+          )}
           {/* KPI strip */}
           <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(3,1fr)" }}>
             <div className="kpi-card">
@@ -258,6 +274,8 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
             )}
             {!gsc.connected ? (
               <ConnectCard title="Google Search Console" lines={["SUPERMETRICS_API_KEY", "— or —", "GSC_CLIENT_EMAIL + GSC_PRIVATE_KEY"]} />
+            ) : gsc.error ? (
+              <div className="empty-state" style={{ height: "auto", padding: "22px 16px" }}>⚠ {gsc.error}</div>
             ) : (
               <div className="table-scroll" style={{ marginTop: 6 }}>
                 <table className="perf-table">
@@ -282,6 +300,8 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
           <div className="chart-title" style={{ marginTop: 22, marginBottom: 10 }}>Organic &amp; AI leads <HelpTip text="From the CRM via Metabase. Organic = website enquiries / pop-up with no paid UTM. AI = LLM UTM source." /></div>
           {!leads.connected ? (
             <ConnectCard title="Metabase" lines={["METABASE_URL", "METABASE_USERNAME", "METABASE_PASSWORD"]} />
+          ) : leads.error ? (
+            <div className="chart-card"><div className="empty-state" style={{ height: "auto", padding: "22px 16px" }}>⚠ {leads.error}</div></div>
           ) : (
             <>
               <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(4,1fr)" }}>
