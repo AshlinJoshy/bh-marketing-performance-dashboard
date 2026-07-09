@@ -367,25 +367,34 @@ export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 
   // only appear on the entry pageview, so this ≈ first-referrer attribution.
   const aiRefEvent = `(properties.$referring_domain LIKE '%chatgpt.%' OR properties.$referring_domain LIKE '%openai.%' OR properties.$referring_domain LIKE '%perplexity.%' OR properties.$referring_domain LIKE '%claude.%' OR properties.$referring_domain LIKE '%gemini.google%' OR properties.$referring_domain LIKE '%copilot.%')`;
 
-  const [chanRows, aiRows] = await Promise.all([
+  const organicRef = SEARCH_ENGINES.map((e) => `properties.$referring_domain LIKE '%${e}%'`).join(" OR ");
+  const [chanRows, aiRows, totalRows] = await Promise.all([
+    // best-effort: per-session channel breakdown (powers the "by channel" chart)
     hogql(`SELECT ${chan} AS channel, sum(pv) AS pageviews, count() AS sessions FROM (${inner}) GROUP BY channel ORDER BY pageviews DESC`, 25000),
+    // cheap: AI sessions by LLM referrer
     hogql(`SELECT properties.$referring_domain AS ref, count(DISTINCT properties.$session_id) AS sessions FROM events WHERE event = '$pageview' AND ${since}${human} AND ${aiRefEvent} GROUP BY ref ORDER BY sessions DESC LIMIT 20`),
+    // cheap + GUARANTEED: headline totals in a single scan (no per-session pass),
+    // so the KPIs are always populated even if the channel breakdown times out.
+    hogql(`SELECT count() AS total, countIf(${organicRef}) AS organic, count(DISTINCT properties.$session_id) AS sessions FROM events WHERE event = '$pageview' AND ${since}${human}`),
   ]);
 
-  if (!chanRows) base.error = "PostHog traffic query failed or timed out.";
   for (const r of chanRows ?? []) {
     const ch = String(r[0] || "");
-    const pvv = Number(r[1] || 0);
-    const ss = Number(r[2] || 0);
-    base.byChannel.push({ channel: ch, pageviews: pvv, sessions: ss });
-    base.totalPageviews += pvv;
-    base.totalSessions += ss;
-    if (ch === "Organic Search") base.organicPageviews = pvv;
-    if (ch === "AI Assistant") base.aiSessions = ss;
+    base.byChannel.push({ channel: ch, pageviews: Number(r[1] || 0), sessions: Number(r[2] || 0) });
+    if (ch === "Organic Search") base.organicPageviews = Number(r[1] || 0); // session-attributed (preferred)
   }
   base.aiBySource = (aiRows ?? []).map((r) => ({ source: String(r[0] || "(unknown)"), sessions: Number(r[1] || 0) }));
-  // Fallback: if the heavy channel scan was cut off, still surface AI sessions
-  // from the light query so that KPI + chart aren't stranded at 0.
-  if (!base.aiSessions && base.aiBySource.length) base.aiSessions = base.aiBySource.reduce((a, s) => a + s.sessions, 0);
+
+  // Headline numbers come from the guaranteed cheap query (never 0 when data exists).
+  const tr = totalRows?.[0];
+  if (tr) {
+    base.totalPageviews = Number(tr[0] || 0);
+    base.totalSessions = Number(tr[2] || 0);
+    if (!base.organicPageviews) base.organicPageviews = Number(tr[1] || 0); // fallback if the channel scan didn't return
+  }
+  const aiNode = base.byChannel.find((c) => c.channel === "AI Assistant");
+  base.aiSessions = aiNode ? aiNode.sessions : base.aiBySource.reduce((a, s) => a + s.sessions, 0);
+
+  if (!totalRows && !chanRows) base.error = "PostHog traffic query failed or timed out.";
   return base;
 }
