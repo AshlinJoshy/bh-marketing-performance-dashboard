@@ -19,25 +19,38 @@ const DATACENTER_CITIES = ["Ashburn", "Boardman", "Council Bluffs", "The Dalles"
 
 const SEARCH_ENGINES = ["google.", "bing.", "yahoo.", "duckduckgo.", "ecosia.", "yandex.", "baidu.", "brave."];
 
-async function hogql(sql: string): Promise<any[][] | null> {
+async function hogql(sql: string, timeoutMs = Number(process.env.POSTHOG_TIMEOUT_MS || 15000)): Promise<any[][] | null> {
   const key = process.env.POSTHOG_API_KEY;
   if (!key) return null;
+  // Hard timeout so one slow/heavy query can never hang the server render (which
+  // would leave the tab stuck on its loading skeleton). On timeout we return null
+  // and the caller degrades gracefully to an empty section. Heavy per-session
+  // scans can pass a larger timeout.
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(`${HOST.replace(/\/$/, "")}/api/projects/${PROJECT}/query/`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
       body: JSON.stringify({ query: { kind: "HogQLQuery", query: sql } }),
       cache: "no-store",
+      signal: ctrl.signal,
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.error(`[posthog] query HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
+      return null;
+    }
     const data = await res.json();
     return Array.isArray(data?.results) ? data.results : [];
-  } catch {
+  } catch (e) {
+    console.error(`[posthog] query error: ${e instanceof Error ? e.message : String(e)} — ${sql.slice(0, 120)}`);
     return null;
+  } finally {
+    clearTimeout(t);
   }
 }
 
-export interface FlowNode { id: string; label: string; col: number; value: number; kind: string }
+export interface FlowNode { id: string; label: string; col: number; value: number; kind: string; breakdown?: { label: string; value: number }[] }
 export interface FlowLink { source: string; target: string; value: number }
 export interface FlowData { nodes: FlowNode[]; links: FlowLink[]; sessions: number }
 
@@ -80,24 +93,65 @@ function pageBucket(e: string): string {
 // pages (bucketed), shown as Source → 1st → 2nd → 3rd page. Drop-off is implied
 // — a session with fewer pages simply has no further link (no "Exit" node).
 // Optional pageFilter keeps only sessions whose path sequence touches a substring.
-async function getUserFlow(since: string, human: string, pageFilter?: string[]): Promise<FlowData> {
+async function getUserFlow(since: string, human: string, pageFilter?: string[], exact = false): Promise<FlowData> {
   let filterWhere = "";
   if (pageFilter && pageFilter.length) {
-    const terms = pageFilter.map((t) => t.replace(/[^a-z0-9/_-]/gi, "").toLowerCase()).filter(Boolean);
-    if (terms.length) filterWhere = ` WHERE arrayExists(p -> ${terms.map((t) => `p LIKE '%${t}%'`).join(" OR ")}, paths)`;
+    // Accept a bare slug ("buy"), a path ("/en/buy"), or a full page URL pasted
+    // from the breakdown ("https://www.bhomes.com/betterhomes-mobile-app"): drop
+    // the protocol, keep host + path chars. Multiple entries are OR-ed together.
+    //  • contains (default): substring match against the host+path array
+    //  • exact: the visited path OR host+path equals the term
+    const terms = pageFilter
+      .map((t) => t.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/[^a-z0-9/_.-]/g, ""))
+      .filter(Boolean);
+    if (terms.length) {
+      const clause = exact
+        ? (t: string) => `(arrayExists(p -> p = '${t}', paths) OR arrayExists(p -> p = '${t}', fullpaths))`
+        : (t: string) => `arrayExists(p -> p LIKE '%${t}%', fullpaths)`;
+      filterWhere = ` WHERE ${terms.map(clause).join(" OR ")}`;
+    }
   }
+  // Entry-source classification. Order matters (first match wins):
+  //  • Direct — no referrer ('' or PostHog's '$direct' sentinel) or a self-referral (bhomes.com)
+  //  • AI Assistant — ChatGPT/Perplexity/Claude/Gemini/Copilot (checked before Organic so gemini.google → AI)
+  //  • Organic Search — search engines
+  //  • Social — checked with an EXACT t.co match (avoids '%t.co%' catching chatgpt.com / trustpilot.com)
+  //  • Referral — anything else (a link on another site)
   const chan =
-    `multiIf(ref = '', 'Direct', ` +
-    `ref LIKE '%google.%' OR ref LIKE '%bing.%' OR ref LIKE '%yahoo.%' OR ref LIKE '%duckduckgo.%' OR ref LIKE '%ecosia.%', 'Organic Search', ` +
-    `ref LIKE '%facebook.%' OR ref LIKE '%instagram.%' OR ref LIKE '%linkedin.%' OR ref LIKE '%t.co%' OR ref LIKE '%youtube.%' OR ref LIKE '%tiktok.%', 'Social', ` +
+    `multiIf(` +
+    `ref = '' OR ref = '$direct' OR ref LIKE '%bhomes.com%', 'Direct', ` +
+    `ref LIKE '%chatgpt.%' OR ref LIKE '%openai.%' OR ref LIKE '%perplexity.%' OR ref LIKE '%claude.%' OR ref LIKE '%gemini.google%' OR ref LIKE '%copilot.%', 'AI Assistant', ` +
+    `ref LIKE '%google.%' OR ref LIKE '%bing.%' OR ref LIKE '%yahoo.%' OR ref LIKE '%duckduckgo.%' OR ref LIKE '%ecosia.%' OR ref LIKE '%yandex.%' OR ref LIKE '%baidu.%' OR ref LIKE '%brave.%', 'Organic Search', ` +
+    `ref LIKE '%facebook.%' OR ref LIKE '%instagram.%' OR ref LIKE '%linkedin.%' OR ref = 't.co' OR ref LIKE '%youtube.%' OR ref LIKE '%tiktok.%', 'Social', ` +
     `'Referral')`;
-  const rows = await hogql(
-    `SELECT ${chan} AS channel, ${pageBucket("arrayElement(paths, 1)")} AS b1, ${pageBucket("arrayElement(paths, 2)")} AS b2, ${pageBucket("arrayElement(paths, 3)")} AS b3, count() AS sessions FROM (` +
-      `SELECT argMin(coalesce(properties.$referring_domain, ''), timestamp) AS ref, ` +
-      `arrayMap(x -> x.2, arraySort(x -> x.1, groupArray((timestamp, lower(coalesce(nullif(properties.$pathname, ''), '/')))))) AS paths ` +
-      `FROM events WHERE event = '$pageview' AND ${since}${human} AND properties.$session_id != '' GROUP BY properties.$session_id` +
-      `)${filterWhere} GROUP BY channel, b1, b2, b3 ORDER BY sessions DESC LIMIT 500`,
-  );
+  // one row per session: entry referrer + ordered page paths. The heavier
+  // host+path array (fullpaths) is built ONLY when a page filter needs it — on a
+  // normal load we don't pay for it.
+  const fullpathsSel = filterWhere
+    ? `, arrayMap(x -> x.2, arraySort(x -> x.1, groupArray((timestamp, lower(concat(coalesce(properties.$host, ''), coalesce(nullif(properties.$pathname, ''), '/'))))))) AS fullpaths `
+    : ` `;
+  const innerSessions =
+    `SELECT argMin(coalesce(properties.$referring_domain, ''), timestamp) AS ref, ` +
+    `arrayMap(x -> x.2, arraySort(x -> x.1, groupArray((timestamp, lower(coalesce(nullif(properties.$pathname, ''), '/')))))) AS paths` +
+    fullpathsSel +
+    `FROM events WHERE event = '$pageview' AND ${since}${human} AND properties.$session_id != '' GROUP BY properties.$session_id`;
+  const [rows, bdRows, pageBdRows] = await Promise.all([
+    hogql(
+      `SELECT ${chan} AS channel, ${pageBucket("arrayElement(paths, 1)")} AS b1, ${pageBucket("arrayElement(paths, 2)")} AS b2, ${pageBucket("arrayElement(paths, 3)")} AS b3, count() AS sessions ` +
+        `FROM (${innerSessions})${filterWhere} GROUP BY channel, b1, b2, b3 ORDER BY sessions DESC LIMIT 500`,
+    ),
+    hogql(
+      `SELECT ${chan} AS channel, if(ref = '' OR ref = '$direct', '(direct)', ref) AS domain, count() AS sessions ` +
+        `FROM (${innerSessions})${filterWhere} GROUP BY channel, domain ORDER BY sessions DESC LIMIT 300`,
+    ),
+    // per-bucket page composition (host + path) so a page node can show exactly
+    // which real pages — across subdomains like survey./promo. — make it up.
+    hogql(
+      `SELECT ${pageBucket("path")} AS bucket, concat(host, path) AS page, count() AS views ` +
+        `FROM (SELECT lower(coalesce(nullif(properties.$pathname, ''), '/')) AS path, coalesce(properties.$host, '') AS host ` +
+        `FROM events WHERE event = '$pageview' AND ${since}${human}) GROUP BY bucket, page ORDER BY views DESC LIMIT 2000`,
+    ),
+  ]);
   if (!rows || !rows.length) return { nodes: [], links: [], sessions: 0 };
 
   const data = rows.map((r) => ({ channel: String(r[0] || "Referral"), b1: String(r[1] || ""), b2: String(r[2] || ""), b3: String(r[3] || ""), sessions: Number(r[4] || 0) }));
@@ -133,6 +187,45 @@ async function getUserFlow(since: string, human: string, pageFilter?: string[]):
   };
   mk(v0, 0); mk(v1, 1); mk(v2, 2); mk(v3, 3);
 
+  // per-source domain breakdown → attach to the entry-source (col 0) nodes so the
+  // UI can show "how many from each domain" on hover and expand it on click.
+  const byChannel = new Map<string, { label: string; value: number }[]>();
+  for (const r of bdRows ?? []) {
+    const ch = String(r[0] || "Referral");
+    const arr = byChannel.get(ch) ?? [];
+    arr.push({ label: String(r[1] || "(unknown)"), value: Number(r[2] || 0) });
+    byChannel.set(ch, arr);
+  }
+  const foldTop = (arr: { label: string; value: number }[]) => {
+    const sorted = [...arr].sort((a, b) => b.value - a.value);
+    if (sorted.length <= 12) return sorted;
+    const rest = sorted.slice(12).reduce((a, b) => a + b.value, 0);
+    return rest > 0 ? [...sorted.slice(0, 12), { label: `+${sorted.length - 12} more`, value: rest }] : sorted.slice(0, 12);
+  };
+  for (const n of nodes) if (n.col === 0) n.breakdown = foldTop(byChannel.get(n.label) ?? []);
+
+  // per-bucket PAGE breakdown (host + path) → attach to the page nodes (col ≥ 1).
+  // Remap each raw page-type through the SAME top-5 fold the flow uses (cat), so a
+  // node like "Other" lists the pages from every folded-away category too, and the
+  // same page is merged when two categories fold together.
+  const byBucket = new Map<string, Map<string, number>>();
+  for (const r of pageBdRows ?? []) {
+    const folded = cat(String(r[0] || "")); // '' → skip
+    if (!folded) continue;
+    const page = String(r[1] || "(unknown)");
+    const m = byBucket.get(folded) ?? new Map<string, number>();
+    m.set(page, (m.get(page) ?? 0) + Number(r[2] || 0));
+    byBucket.set(folded, m);
+  }
+  const foldPages = (m?: Map<string, number>) => {
+    if (!m) return [];
+    const arr = [...m].map(([label, value]) => ({ label, value })).sort((a, b) => b.value - a.value);
+    if (arr.length <= 40) return arr;
+    const rest = arr.slice(40).reduce((a, b) => a + b.value, 0);
+    return [...arr.slice(0, 40), { label: `+${arr.length - 40} more pages`, value: rest }];
+  };
+  for (const n of nodes) if (n.col >= 1) n.breakdown = foldPages(byBucket.get(n.label));
+
   const links: FlowLink[] = [];
   for (const [k, v] of l01) { const [a, b] = k.split("|||"); links.push({ source: `0:${a}`, target: `1:${b}`, value: v }); }
   for (const [k, v] of l12) { const [a, b] = k.split("|||"); links.push({ source: `1:${a}`, target: `2:${b}`, value: v }); }
@@ -143,7 +236,7 @@ async function getUserFlow(since: string, human: string, pageFilter?: string[]):
 
 const isDate = (s?: string): string | null => (s && /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null);
 
-export async function getWebMetrics(daysRaw = 30, fromRaw?: string, toRaw?: string, humansOnly = true, flowPages?: string[]): Promise<WebMetrics> {
+export async function getWebMetrics(daysRaw = 30, fromRaw?: string, toRaw?: string, humansOnly = true, flowPages?: string[], flowMatch?: string): Promise<WebMetrics> {
   const from = isDate(fromRaw);
   const to = isDate(toRaw);
   let days = Math.max(1, Math.min(365, Math.round(daysRaw || 30)));
@@ -157,6 +250,12 @@ export async function getWebMetrics(daysRaw = 30, fromRaw?: string, toRaw?: stri
     since = `timestamp >= now() - INTERVAL ${days} DAY`;
     label = `last ${days} days`;
   }
+  // Production website only: real hosts are the apex bhomes.com or a *.bhomes.com
+  // subdomain (www, eos…). This drops the ~99 Vercel preview/staging deploys
+  // (*.vercel.app) and any other non-production host that reports into this
+  // PostHog project. Applied to every query below (they all interpolate ${since}),
+  // including the journey flow.
+  since += ` AND (lower(properties.$host) = 'bhomes.com' OR lower(properties.$host) LIKE '%.bhomes.com')`;
 
   const key = process.env.POSTHOG_API_KEY;
   const base: WebMetrics = { connected: !!key, hasData: false, humansOnly, days, label, overview: null, bots: { pageviews: 0, pct: 0 }, trend: [], topPages: [], sources: [], countries: [], flow: { nodes: [], links: [], sessions: 0 } };
@@ -184,9 +283,9 @@ export async function getWebMetrics(daysRaw = 30, fromRaw?: string, toRaw?: stri
     ),
     hogql(`SELECT toDate(timestamp) AS day, count() AS pageviews, count(DISTINCT person_id) AS visitors FROM events WHERE ${pv} AND ${since}${human} GROUP BY day ORDER BY day`),
     hogql(`SELECT properties.$pathname AS path, count() AS views FROM events WHERE ${pv} AND ${since}${human} AND properties.$pathname != '' GROUP BY path ORDER BY views DESC LIMIT 12`),
-    hogql(`SELECT coalesce(nullif(properties.$referring_domain, ''), 'Direct / none') AS source, count(DISTINCT properties.$session_id) AS sessions FROM events WHERE ${pv} AND ${since}${human} GROUP BY source ORDER BY sessions DESC LIMIT 10`),
+    hogql(`SELECT coalesce(nullif(nullif(properties.$referring_domain, ''), '$direct'), 'Direct / none') AS source, count(DISTINCT properties.$session_id) AS sessions FROM events WHERE ${pv} AND ${since}${human} GROUP BY source ORDER BY sessions DESC LIMIT 10`),
     hogql(`SELECT properties.$geoip_country_name AS country, count(DISTINCT person_id) AS visitors FROM events WHERE ${pv} AND ${since}${human} AND properties.$geoip_country_name != '' GROUP BY country ORDER BY visitors DESC LIMIT 10`),
-    getUserFlow(since, human, flowPages),
+    getUserFlow(since, human, flowPages, flowMatch === "exact"),
   ]);
 
   const row = ov && ov[0];
@@ -210,4 +309,92 @@ export async function getWebMetrics(daysRaw = 30, fromRaw?: string, toRaw?: stri
     countries: (co ?? []).map((r) => ({ country: String(r[0] || "—"), visitors: Number(r[1] || 0) })),
     flow: fl ?? { nodes: [], links: [], sessions: 0 },
   };
+}
+
+// ── SEO tab: traffic by channel + AI sessions (by source) + organic pageviews ──
+// Same entry-source classification as the journey Sankey, but aggregated as
+// per-channel pageviews & sessions (production hosts + humans only).
+function channelClassify(ref: string): string {
+  return (
+    `multiIf(` +
+    `${ref} = '' OR ${ref} = '$direct' OR ${ref} LIKE '%bhomes.com%', 'Direct', ` +
+    `${ref} LIKE '%chatgpt.%' OR ${ref} LIKE '%openai.%' OR ${ref} LIKE '%perplexity.%' OR ${ref} LIKE '%claude.%' OR ${ref} LIKE '%gemini.google%' OR ${ref} LIKE '%copilot.%', 'AI Assistant', ` +
+    `${ref} LIKE '%google.%' OR ${ref} LIKE '%bing.%' OR ${ref} LIKE '%yahoo.%' OR ${ref} LIKE '%duckduckgo.%' OR ${ref} LIKE '%ecosia.%' OR ${ref} LIKE '%yandex.%' OR ${ref} LIKE '%baidu.%' OR ${ref} LIKE '%brave.%', 'Organic Search', ` +
+    `${ref} LIKE '%facebook.%' OR ${ref} LIKE '%instagram.%' OR ${ref} LIKE '%linkedin.%' OR ${ref} = 't.co' OR ${ref} LIKE '%youtube.%' OR ${ref} LIKE '%tiktok.%', 'Social', ` +
+    `'Referral')`
+  );
+}
+
+export interface SeoTraffic {
+  connected: boolean;
+  label: string;
+  totalPageviews: number;
+  organicPageviews: number;
+  aiSessions: number;
+  totalSessions: number;
+  byChannel: { channel: string; pageviews: number; sessions: number }[];
+  aiBySource: { source: string; sessions: number }[];
+  error?: string;
+}
+
+export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 30): Promise<SeoTraffic> {
+  const key = process.env.POSTHOG_API_KEY;
+  const from = isDate(fromRaw);
+  const to = isDate(toRaw);
+  const days = Math.max(1, Math.min(365, Math.round(daysRaw || 30)));
+  let since: string;
+  let label: string;
+  if (from && to && from <= to) {
+    since = `timestamp >= toDateTime('${from} 00:00:00') AND timestamp <= toDateTime('${to} 23:59:59')`;
+    label = `${from} → ${to}`;
+  } else {
+    since = `timestamp >= now() - INTERVAL ${days} DAY`;
+    label = `last ${days} days`;
+  }
+  since += ` AND (lower(properties.$host) = 'bhomes.com' OR lower(properties.$host) LIKE '%.bhomes.com')`;
+  const base: SeoTraffic = { connected: !!key, label, totalPageviews: 0, organicPageviews: 0, aiSessions: 0, totalSessions: 0, byChannel: [], aiBySource: [] };
+  if (!key) return base;
+
+  const dc = DATACENTER_CITIES.map((c) => `'${c}'`).join(", ");
+  const human = ` AND NOT (coalesce(properties.$virt_is_bot, false) = true OR properties.$geoip_city_name IN (${dc}) OR properties.$os = 'Linux')`;
+  const chan = channelClassify("ref");
+  // HEAVY: one per-session pass (argMin first referrer) → channel pageviews &
+  // sessions. Given extra time so a large range isn't cut off (this is the only
+  // heavy scan, so it won't contend with the AI query below).
+  const inner = `SELECT properties.$session_id AS sid, argMin(coalesce(properties.$referring_domain, ''), timestamp) AS ref, count() AS pv FROM events WHERE event = '$pageview' AND ${since}${human} AND properties.$session_id != '' GROUP BY sid`;
+  // LIGHT: AI sessions by LLM referrer, filtered at the event level (no
+  // per-session pass) — cheap and independent of the heavy query. LLM referrers
+  // only appear on the entry pageview, so this ≈ first-referrer attribution.
+  const aiRefEvent = `(properties.$referring_domain LIKE '%chatgpt.%' OR properties.$referring_domain LIKE '%openai.%' OR properties.$referring_domain LIKE '%perplexity.%' OR properties.$referring_domain LIKE '%claude.%' OR properties.$referring_domain LIKE '%gemini.google%' OR properties.$referring_domain LIKE '%copilot.%')`;
+
+  const organicRef = SEARCH_ENGINES.map((e) => `properties.$referring_domain LIKE '%${e}%'`).join(" OR ");
+  const [chanRows, aiRows, totalRows] = await Promise.all([
+    // best-effort: per-session channel breakdown (powers the "by channel" chart)
+    hogql(`SELECT ${chan} AS channel, sum(pv) AS pageviews, count() AS sessions FROM (${inner}) GROUP BY channel ORDER BY pageviews DESC`, 25000),
+    // cheap: AI sessions by LLM referrer
+    hogql(`SELECT properties.$referring_domain AS ref, count(DISTINCT properties.$session_id) AS sessions FROM events WHERE event = '$pageview' AND ${since}${human} AND ${aiRefEvent} GROUP BY ref ORDER BY sessions DESC LIMIT 20`),
+    // cheap + GUARANTEED: headline totals in a single scan (no per-session pass),
+    // so the KPIs are always populated even if the channel breakdown times out.
+    hogql(`SELECT count() AS total, countIf(${organicRef}) AS organic, count(DISTINCT properties.$session_id) AS sessions FROM events WHERE event = '$pageview' AND ${since}${human}`),
+  ]);
+
+  for (const r of chanRows ?? []) {
+    const ch = String(r[0] || "");
+    base.byChannel.push({ channel: ch, pageviews: Number(r[1] || 0), sessions: Number(r[2] || 0) });
+    if (ch === "Organic Search") base.organicPageviews = Number(r[1] || 0); // session-attributed (preferred)
+  }
+  base.aiBySource = (aiRows ?? []).map((r) => ({ source: String(r[0] || "(unknown)"), sessions: Number(r[1] || 0) }));
+
+  // Headline numbers come from the guaranteed cheap query (never 0 when data exists).
+  const tr = totalRows?.[0];
+  if (tr) {
+    base.totalPageviews = Number(tr[0] || 0);
+    base.totalSessions = Number(tr[2] || 0);
+    if (!base.organicPageviews) base.organicPageviews = Number(tr[1] || 0); // fallback if the channel scan didn't return
+  }
+  const aiNode = base.byChannel.find((c) => c.channel === "AI Assistant");
+  base.aiSessions = aiNode ? aiNode.sessions : base.aiBySource.reduce((a, s) => a + s.sessions, 0);
+
+  if (!totalRows && !chanRows) base.error = "PostHog traffic query failed or timed out.";
+  return base;
 }

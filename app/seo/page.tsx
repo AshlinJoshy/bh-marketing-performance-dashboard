@@ -1,14 +1,15 @@
 import type { Metadata } from "next";
-import SeoWebsite from "@/components/SeoWebsite";
-import { getWebMetrics } from "@/lib/posthog";
+import SeoDashboard from "@/components/SeoDashboard";
+import { getSeoData } from "@/lib/seo";
 
 export const metadata: Metadata = {
-  title: "SEO & Website — betterhomes Marketing Hub",
+  title: "SEO & AIO — betterhomes Marketing Hub",
 };
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 45;
 
 export default async function SeoPage() {
-  const initial = await getWebMetrics(30);
-  return <SeoWebsite initial={initial} />;
+  const initial = await getSeoData();
+  return <SeoDashboard initial={initial} />;
 }

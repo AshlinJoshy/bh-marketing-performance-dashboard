@@ -17,7 +17,7 @@ const ymd = (d: Date) => d.toISOString().slice(0, 10);
 
 const legendBottom = { legend: { position: "bottom" as const, labels: { font: { size: 10 } } } };
 
-export default function SeoWebsite({ initial }: { initial: WebMetrics }) {
+export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
   const [data, setData] = useState<WebMetrics>(initial);
   const [mode, setMode] = useState<"preset" | "custom">("preset");
   const [days, setDays] = useState<number>(initial.days || 30);
@@ -32,11 +32,12 @@ export default function SeoWebsite({ initial }: { initial: WebMetrics }) {
   const [insPending, startInsights] = useTransition();
   const [flowInput, setFlowInput] = useState(""); // what's typed in the journey filter box
   const [flowPages, setFlowPages] = useState(""); // the applied journey filter
+  const [flowExact, setFlowExact] = useState(false); // contains (false) vs exact (true) match
 
   const load = useCallback(async (qs: string, silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const res = await fetch(`/api/seo?${qs}`, { cache: "no-store" });
+      const res = await fetch(`/api/website?${qs}`, { cache: "no-store" });
       const json = (await res.json()) as WebMetrics;
       setData(json);
       setUpdatedAt(new Date().toLocaleTimeString());
@@ -54,8 +55,8 @@ export default function SeoWebsite({ initial }: { initial: WebMetrics }) {
   );
   // humans + journey-page-filter suffix shared by every load
   const tail = useCallback(
-    (h = humansOnly) => `&humans=${h ? 1 : 0}${flowPages.trim() ? `&flowPages=${encodeURIComponent(flowPages.trim())}` : ""}`,
-    [humansOnly, flowPages],
+    (h = humansOnly) => `&humans=${h ? 1 : 0}${flowPages.trim() ? `&flowPages=${encodeURIComponent(flowPages.trim())}${flowExact ? "&flowMatch=exact" : ""}` : ""}`,
+    [humansOnly, flowPages, flowExact],
   );
   const qsFor = useCallback(() => `${rangeQs()}${tail()}`, [rangeQs, tail]);
 
@@ -84,7 +85,15 @@ export default function SeoWebsite({ initial }: { initial: WebMetrics }) {
   function applyFlowFilter() {
     const pages = flowInput.trim();
     setFlowPages(pages);
-    const t = `&humans=${humansOnly ? 1 : 0}${pages ? `&flowPages=${encodeURIComponent(pages)}` : ""}`;
+    const t = `&humans=${humansOnly ? 1 : 0}${pages ? `&flowPages=${encodeURIComponent(pages)}${flowExact ? "&flowMatch=exact" : ""}` : ""}`;
+    load(`${rangeQs()}${t}`, false);
+  }
+  // Switch contains/exact; re-run immediately if a filter is already applied.
+  function setMatch(exact: boolean) {
+    setFlowExact(exact);
+    const pages = flowPages.trim();
+    if (!pages) return;
+    const t = `&humans=${humansOnly ? 1 : 0}&flowPages=${encodeURIComponent(pages)}${exact ? "&flowMatch=exact" : ""}`;
     load(`${rangeQs()}${t}`, false);
   }
   function clearFlowFilter() {
@@ -109,8 +118,8 @@ export default function SeoWebsite({ initial }: { initial: WebMetrics }) {
     <>
       <div className="section-header">
         <div>
-          <div className="page-title">SEO &amp; Website</div>
-          <div className="page-sub">Live website traffic &amp; search performance — from PostHog · {data.label}</div>
+          <div className="page-title">Website</div>
+          <div className="page-sub">Live website traffic &amp; engagement — from PostHog · {data.label}</div>
         </div>
         <span className="bot-left" style={{ gap: 8 }}>
           {data.connected && <span className="pulse-dot" style={{ background: live ? C.green : C.sand }} />}
@@ -267,7 +276,7 @@ export default function SeoWebsite({ initial }: { initial: WebMetrics }) {
                         labels: data.sources.map((s) => s.source),
                         datasets: [{ label: "Sessions", data: data.sources.map((s) => s.sessions), backgroundColor: C.sage }],
                       }}
-                      options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } }}
+                      options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } }, y: { ticks: { autoSkip: false, font: { size: 10 } } } } }}
                     />
                   </div>
                 </div>
@@ -285,7 +294,7 @@ export default function SeoWebsite({ initial }: { initial: WebMetrics }) {
                         labels: data.topPages.map((p) => p.path),
                         datasets: [{ label: "Pageviews", data: data.topPages.map((p) => p.views), backgroundColor: C.coral }],
                       }}
-                      options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } }}
+                      options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } }, y: { ticks: { autoSkip: false, font: { size: 10 } } } } }}
                     />
                   </div>
                 </div>
@@ -300,7 +309,7 @@ export default function SeoWebsite({ initial }: { initial: WebMetrics }) {
                         labels: data.countries.map((c) => c.country),
                         datasets: [{ label: "Visitors", data: data.countries.map((c) => c.visitors), backgroundColor: C.blue }],
                       }}
-                      options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } }}
+                      options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } }, y: { ticks: { autoSkip: false, font: { size: 10 } } } } }}
                     />
                   </div>
                 </div>
@@ -313,19 +322,23 @@ export default function SeoWebsite({ initial }: { initial: WebMetrics }) {
                   <HelpTip text="How real visitors move: entry Source → 1st page → 2nd page → 3rd page. URLs are grouped into page types (Buy listings, Blog, Area guides…); only the top 5 show, rest as 'Other'. Ribbon thickness = sessions. Where a node's ribbons thin out, that gap is drop-off — those visitors left." />
                 </div>
                 <div className="chart-sub">
-                  Source → 1st → 2nd → 3rd page · top 5 page types · drop-off implied · {fmt(data.flow.sessions)} human sessions{flowPages ? ` · filtered to: ${flowPages}` : ""}
+                  Source → 1st → 2nd → 3rd page · top 5 page types · drop-off implied · {fmt(data.flow.sessions)} human sessions (visits — not unique visitors; a returning visitor counts once per visit){flowPages ? ` · filtered to: ${flowPages} (${flowExact ? "exact" : "contains"})` : ""}
                 </div>
                 <div className="table-controls" style={{ marginTop: 8, marginBottom: 4 }}>
                   <input
                     className="search-box"
-                    placeholder="Focus on page(s) — e.g. buy, blog, area-guide (comma-separated)"
+                    placeholder="Focus on page(s) — keyword, path, or full URL; separate multiple with commas"
                     value={flowInput}
                     onChange={(e) => setFlowInput(e.target.value)}
                     onKeyDown={(e) => { if (e.key === "Enter") applyFlowFilter(); }}
                   />
+                  <div className="ps-platforms" title="Contains = page path includes the text. Exact = the page equals it exactly.">
+                    <button className={`filter-btn${!flowExact ? " active" : ""}`} onClick={() => setMatch(false)} disabled={loading}>Contains</button>
+                    <button className={`filter-btn${flowExact ? " active" : ""}`} onClick={() => setMatch(true)} disabled={loading}>Exact</button>
+                  </div>
                   <button className="filter-btn" onClick={applyFlowFilter} disabled={loading}>Apply</button>
                   {flowPages && <button className="filter-btn" onClick={clearFlowFilter} disabled={loading}>Clear</button>}
-                  <HelpTip text="Type one or more page keywords and press Apply. The diagram rebuilds to only the journeys that pass through any of those pages — so you can see what people do before/after a specific page." />
+                  <HelpTip text="Filter the journeys to sessions that pass through the page(s) you enter. Separate multiple pages with commas (any match is kept). Contains = path includes the text (e.g. 'buy'); Exact = the page equals it exactly — paste a full URL from a node's breakdown for an exact match." />
                 </div>
                 {data.flow.nodes.length > 0 ? (
                   <Sankey flow={data.flow} captions={["Source", "1st page", "2nd page", "3rd page"]} />
@@ -337,7 +350,7 @@ export default function SeoWebsite({ initial }: { initial: WebMetrics }) {
               </div>
 
               <div style={{ fontSize: 11, color: C.mid, marginTop: 12 }}>
-                Source: PostHog <code>$pageview</code> events · organic = sessions from search engines · keyword rankings &amp; backlinks (Semrush) can be added next.
+                Source: PostHog <code>$pageview</code> events · organic = sessions from search engines.
               </div>
 
               {/* AI data-driven insights */}

@@ -3,6 +3,8 @@
 import { runIngest } from "@/lib/ingest";
 import { refreshInsightsCache } from "@/lib/insights";
 import { getWebMetrics } from "@/lib/posthog";
+import { getPerfMetrics } from "@/lib/data";
+import { PERF_PLATFORM_META, type PerfPlatform } from "@/lib/perfTypes";
 import { adminClient } from "@/lib/supabase";
 import { revalidatePath } from "next/cache";
 
@@ -205,6 +207,94 @@ export async function saveSocialConfigAction(payload: unknown) {
   }
 }
 
+// Save the Social Performance benchmark config (brands + per-platform handles +
+// actor ids). Stored under the `benchmark` key of the single social_config row
+// via read-modify-write, so it never clobbers the sentiment config there.
+export async function savePerfConfigAction(benchmark: unknown) {
+  const db = adminClient();
+  if (!db) return { ok: false as const, error: "SUPABASE_SERVICE_ROLE_KEY not set" };
+  try {
+    const { data } = await db.from("social_config").select("payload").eq("id", 1).maybeSingle();
+    const payload = { ...((data?.payload as Record<string, unknown>) ?? {}), benchmark };
+    const { error } = await db
+      .from("social_config")
+      .upsert({ id: 1, payload, updated_at: new Date().toISOString() }, { onConflict: "id" });
+    if (error) {
+      const hint = /relation .*social_config.* does not exist/i.test(error.message)
+        ? "The social_config table isn't created yet — apply migration 0008."
+        : error.message;
+      return { ok: false as const, error: hint };
+    }
+    revalidatePath("/people");
+    return { ok: true as const };
+  } catch (e) {
+    return { ok: false as const, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+// "Receive insights" on the Performance benchmark — Gemini reads the per-brand
+// metrics for the selected platform and returns competitive, actionable takeaways
+// (the live version of the report's closing "what to take from this" slide).
+export async function receivePerfInsightsAction(platform: string) {
+  const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+  if (!key) return { ok: false as const, error: "No Gemini API key configured — add GEMINI_API_KEY to env vars." };
+  try {
+    const rows = (await getPerfMetrics()).filter((m) => m.platform === platform);
+    if (!rows.length) return { ok: false as const, error: "No benchmark data for this platform yet — run the benchmark first." };
+    const meta = PERF_PLATFORM_META[platform as PerfPlatform];
+    const name = meta?.name ?? platform;
+    const playLabel = meta?.playLabel ?? "plays";
+    const videoLabel = meta?.videoLabel ?? "videos";
+
+    let corpus = `PLATFORM: ${name}\nPeriod: ${rows[0].period_label ?? "recent"}\n\n`;
+    for (const r of rows) {
+      corpus +=
+        `${r.brand}${r.is_us ? " (THIS IS US — betterhomes)" : ""}: ` +
+        `followers ${r.followers ?? "?"}, posts ${r.posts} (${r.reels} ${videoLabel} / ${r.images} static), ` +
+        `avg likes ${r.avg_likes}, avg comments ${r.avg_comments}, ` +
+        `avg ${playLabel} ${r.avg_plays ?? "n/a"}, total reach ${r.total_plays}, ` +
+        `engagement rate ${r.engagement_rate ?? "n/a"}%\n`;
+    }
+
+    const prompt =
+      `You are a social-media strategist for "betterhomes", a real-estate brokerage in DUBAI, UAE. ` +
+      `Below is a ${name} performance benchmark of betterhomes against competitor agencies for ${rows[0].period_label ?? "the period"}. ` +
+      `Compare betterhomes to the competitors and give specific, forward-looking actions to close gaps and scale strengths — ` +
+      `what format mix to shift to, whose content to study, what to post more/less of, how to lift reach and engagement. ` +
+      `Name actual competitors and numbers from the data. Do NOT just restate the metrics.` +
+      `\n\n${corpus}\n\n` +
+      `Return ONLY a JSON array of 4-6 objects: {"kind":"...","label":"...","text":"..."}. ` +
+      `kind: "high" (urgent gap to close), "medium" (worth doing), "win" (strength to protect/scale). ` +
+      `label: 3-6 word headline. text: 2-3 specific, actionable sentences.`;
+
+    const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${key}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.5, maxOutputTokens: 1600 } }),
+        cache: "no-store",
+      },
+    );
+    const json = await res.json();
+    const raw = String(json?.candidates?.[0]?.content?.parts?.[0]?.text ?? "");
+    const cleaned = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
+    const s = cleaned.indexOf("[");
+    const e = cleaned.lastIndexOf("]");
+    if (s === -1 || e === -1 || e <= s) return { ok: false as const, error: "Gemini returned an unexpected format" };
+    const arr: { kind?: string; label?: string; text?: string }[] = JSON.parse(cleaned.slice(s, e + 1));
+    const ALLOWED = new Set(["high", "medium", "win", "test"]);
+    const insights = arr
+      .map((it) => ({ kind: ALLOWED.has(it?.kind ?? "") ? (it.kind as string) : "medium", label: String(it?.label ?? "").slice(0, 60), text: String(it?.text ?? "").slice(0, 500) }))
+      .filter((it) => it.label && it.text);
+    if (!insights.length) return { ok: false as const, error: "No insights returned — run the benchmark first." };
+    return { ok: true as const, insights, label: `${name} · ${rows[0].period_label ?? ""}`.trim() };
+  } catch (e) {
+    return { ok: false as const, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 // "Receive insights" on the SEO tab — Gemini reads the (bot-filtered) web
 // analytics for the selected range and returns data-driven recommendations.
 export async function receiveWebInsightsAction(days: number, from?: string, to?: string) {
@@ -270,6 +360,31 @@ export async function triggerIngestAction() {
     const r = await runIngest("manual");
     revalidatePath("/pr");
     return { ok: true as const, inserted: r.inserted, updated: r.updated, considered: r.considered, found: r.found };
+  } catch (e) {
+    return { ok: false as const, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+// Save the SEO tab's target keyword list (tracked in GSC). Single-row config.
+export async function saveSeoConfigAction(keywords: unknown) {
+  const db = adminClient();
+  if (!db) return { ok: false as const, error: "SUPABASE_SERVICE_ROLE_KEY not set" };
+  try {
+    const clean = (Array.isArray(keywords) ? keywords : [])
+      .map((k) => String(k).trim())
+      .filter(Boolean)
+      .slice(0, 100);
+    const { error } = await db
+      .from("seo_config")
+      .upsert({ id: 1, payload: { keywords: clean }, updated_at: new Date().toISOString() }, { onConflict: "id" });
+    if (error) {
+      const hint = /relation .*seo_config.* does not exist/i.test(error.message)
+        ? "The seo_config table isn't created yet — apply migration 0010."
+        : error.message;
+      return { ok: false as const, error: hint };
+    }
+    revalidatePath("/seo");
+    return { ok: true as const };
   } catch (e) {
     return { ok: false as const, error: e instanceof Error ? e.message : String(e) };
   }

@@ -67,6 +67,19 @@ export function PlatformIcon({ channel, size = 14 }: { channel: SocialChannel | 
           <rect x="12.4" y="12.2" width="3.6" height="3.6" rx="0.7" fill="#fff" />
         </svg>
       );
+    case "tiktok": {
+      // Black tile with the note in white + the signature cyan/magenta offsets.
+      const note =
+        "M16.4 3.2c.28 1.9 1.5 3.36 3.4 3.62v2.34c-1.24 0-2.4-.4-3.4-1.06v5.02a5.02 5.02 0 1 1-5.02-5.02c.27 0 .53.02.79.06v2.46a2.62 2.62 0 1 0 1.84 2.5V3.2z";
+      return (
+        <svg {...common} aria-label="TikTok">
+          <rect width="24" height="24" rx="6" fill="#010101" />
+          <path d={note} fill="#25F4EE" transform="translate(-0.85,0.6)" />
+          <path d={note} fill="#FE2C55" transform="translate(0.85,-0.6)" />
+          <path d={note} fill="#fff" />
+        </svg>
+      );
+    }
     default:
       return <span style={{ fontSize: size }}>•</span>;
   }

@@ -293,3 +293,107 @@ export async function getSocialRuns(limit = 5): Promise<SocialRun[]> {
     return [];
   }
 }
+
+// ── Social Performance (benchmark) reads ────────────────────────
+import { mergePerfConfig } from "@/lib/perfTypes";
+import type { PerfConfig, PerfMetrics, PerfPost, PerfRun } from "@/lib/perfTypes";
+
+/** The editable benchmark config (brands + per-platform handles + actor ids). */
+export async function getPerfConfig(): Promise<PerfConfig> {
+  const db = readClient();
+  if (!db) return mergePerfConfig(null);
+  try {
+    const { data } = await db.from("social_config").select("payload").eq("id", 1).maybeSingle();
+    const benchmark = (data?.payload as { benchmark?: Partial<PerfConfig> } | null)?.benchmark ?? null;
+    return mergePerfConfig(benchmark);
+  } catch {
+    return mergePerfConfig(null);
+  }
+}
+
+/** Per-brand-per-platform benchmark snapshots (seed or live). */
+export async function getPerfMetrics(): Promise<PerfMetrics[]> {
+  const db = readClient();
+  if (!db) return [];
+  try {
+    const { data, error } = await db
+      .from("social_perf_metrics")
+      .select(
+        "brand,is_us,platform,followers,posts,reels,images,avg_likes,avg_comments,avg_plays,total_plays,engagement_rate,time_window,period_label,source,captured_at",
+      )
+      .order("total_plays", { ascending: false });
+    if (error || !data) return [];
+    return data as PerfMetrics[];
+  } catch {
+    return [];
+  }
+}
+
+/** Individual scraped posts (top-post cards), highest-reach first. */
+export async function getPerfPosts(limit = 400): Promise<PerfPost[]> {
+  const db = readClient();
+  if (!db) return [];
+  try {
+    const { data, error } = await db
+      .from("social_perf_posts")
+      .select("id,brand,is_us,platform,external_id,url,type,posted_at,likes,comments,shares,plays,caption")
+      .order("plays", { ascending: false, nullsFirst: false })
+      .limit(limit);
+    if (error || !data) return [];
+    return data as PerfPost[];
+  } catch {
+    return [];
+  }
+}
+
+/** Recent benchmark-run history for the status line. */
+export async function getPerfRuns(limit = 5): Promise<PerfRun[]> {
+  const db = readClient();
+  if (!db) return [];
+  try {
+    const { data, error } = await db
+      .from("social_perf_runs")
+      .select("ran_at,trigger,ok,time_window,brands,platforms,posts_found,metrics_written,error")
+      .order("ran_at", { ascending: false })
+      .limit(limit);
+    if (error || !data) return [];
+    return data as PerfRun[];
+  } catch {
+    return [];
+  }
+}
+
+// ── SEO tab config (editable target keyword list) ───────────────
+export const DEFAULT_SEO_KEYWORDS = [
+  "rent apartment abu dhabi",
+  "dubai villa for sale",
+  "apartment for rent abu dhabi",
+  "villa for sale in dubai",
+  "apartments for sale in abu dhabi",
+  "townhouses for sale in dubai",
+  "villas for sale in dubai",
+  "dubai marina apartments for sale",
+  "villas for sale in sharjah",
+  "apartment for sale in dubai",
+  "apartment for rent in dubai",
+  "property for sale in dubai",
+  "villas for sale in abu dhabi",
+  "dubai apartment for sale",
+];
+
+export interface SeoConfig {
+  keywords: string[];
+}
+
+/** The editable SEO config (target keywords tracked in GSC). */
+export async function getSeoConfig(): Promise<SeoConfig> {
+  const db = readClient();
+  if (!db) return { keywords: DEFAULT_SEO_KEYWORDS };
+  try {
+    const { data } = await db.from("seo_config").select("payload").eq("id", 1).maybeSingle();
+    const kw = (data?.payload as { keywords?: string[] } | null)?.keywords;
+    return { keywords: kw?.length ? kw : DEFAULT_SEO_KEYWORDS };
+  } catch {
+    return { keywords: DEFAULT_SEO_KEYWORDS };
+  }
+}
