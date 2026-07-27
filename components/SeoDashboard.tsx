@@ -275,11 +275,13 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
           <div className="charts-grid-2">
             <div className="chart-card">
               <div className="chart-title">Traffic by channel</div>
-              <div className="chart-sub">Pageviews by entry source · {traffic.label}</div>
+              <div className="chart-sub">
+                {traffic.approxChannels ? "Entry pageviews by source · approximate" : "Pageviews by entry source"} · {traffic.label}
+              </div>
               <div className="chart-canvas-wrap">
                 {channels.length ? (
                   <ChartBox type="bar"
-                    data={{ labels: channels.map((c) => c.channel), datasets: [{ label: "Pageviews", data: channels.map((c) => c.pageviews), backgroundColor: channels.map((c) => chColor(c.channel)), borderRadius: 5 }] }}
+                    data={{ labels: channels.map((c) => c.channel), datasets: [{ label: traffic.approxChannels ? "Entry pageviews" : "Pageviews", data: channels.map((c) => c.pageviews), backgroundColor: channels.map((c) => chColor(c.channel)), borderRadius: 5 }] }}
                     options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true }, y: { ticks: { autoSkip: false, font: { size: 11 } } } } }} />
                 ) : <div className="empty-state">{traffic.error ? `⚠ ${traffic.error}` : traffic.connected ? "No pageviews in range." : "PostHog not connected."}</div>}
               </div>

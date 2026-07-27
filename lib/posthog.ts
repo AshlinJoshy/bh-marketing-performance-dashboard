@@ -347,6 +347,8 @@ export interface SeoTraffic {
   totalSessions: number;
   byChannel: { channel: string; pageviews: number; sessions: number }[];
   aiBySource: { source: string; sessions: number }[];
+  /** byChannel came from entry-level attribution, not the per-session pass. */
+  approxChannels?: boolean;
   error?: string;
 }
 
@@ -408,6 +410,38 @@ export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 
   const aiNode = base.byChannel.find((c) => c.channel === "AI Assistant");
   base.aiSessions = aiNode ? aiNode.sessions : base.aiBySource.reduce((a, s) => a + s.sessions, 0);
 
-  if (!totalRows && !chanRows) base.error = "PostHog traffic query failed or timed out.";
+  if (!totalRows && !chanRows) {
+    base.error = "PostHog traffic query failed or timed out.";
+    return base;
+  }
+
+  // The per-session pass is the only heavy scan, so it times out on its own over
+  // a long range while the cheap totals still succeed. That used to leave
+  // byChannel empty with no error set, and the card rendered "No pageviews in
+  // range" — reporting a dead query as an absence of traffic.
+  //
+  // Retry at entry level instead: internal navigation carries a bhomes.com
+  // referrer, so excluding it leaves ≈ the entry pageview of each session. That
+  // is first-touch attribution without the GROUP BY, which is the same
+  // reasoning the AI-sessions query above already relies on. Counts are entries
+  // rather than all pageviews, so the caller flags the chart as approximate.
+  const contradiction = base.byChannel.length === 0 && base.totalPageviews > 0;
+  if (!chanRows || contradiction) {
+    const entryRef = `coalesce(properties.$referring_domain, '')`;
+    const entryRows = await hogql(
+      `SELECT ${channelClassify(entryRef)} AS channel, count() AS entries, count(DISTINCT properties.$session_id) AS sessions ` +
+        `FROM events WHERE event = '$pageview' AND ${since}${human} AND NOT (${entryRef} LIKE '%bhomes.com%') ` +
+        `GROUP BY channel ORDER BY entries DESC`,
+    );
+    if (entryRows?.length) {
+      base.byChannel = entryRows.map((r) => ({ channel: String(r[0] || ""), pageviews: Number(r[1] || 0), sessions: Number(r[2] || 0) }));
+      base.approxChannels = true;
+      if (!base.organicPageviews) {
+        base.organicPageviews = base.byChannel.find((c) => c.channel === "Organic Search")?.pageviews ?? 0;
+      }
+    } else {
+      base.error = "Channel breakdown timed out — try a shorter range (7 or 30 days).";
+    }
+  }
   return base;
 }
