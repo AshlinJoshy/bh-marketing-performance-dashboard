@@ -81,6 +81,45 @@ const MONTH_LABEL = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Se
 const prettyMonth = (m: string) => `${MONTH_LABEL[Number(m.slice(5, 7)) - 1]} ${m.slice(2, 4)}`;
 const prettyBucket = (b: string, g: GroupBy) => (g === "month" ? prettyMonth(b) : b);
 
+/**
+ * Shown while the brand filter refetches. Mirrors the real layout so the page
+ * doesn't jump, and leaves the controls bar in place so the selection you just
+ * made stays visible.
+ */
+function DataSkeleton() {
+  return (
+    <div aria-busy="true" aria-label="Loading figures…">
+      <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(4,1fr)" }}>
+        {Array.from({ length: 4 }).map((_, i) => (
+          <div key={i} className="kpi-card">
+            <div className="skeleton sk-line short" />
+            <div className="skeleton sk-big" />
+            <div className="skeleton sk-line" />
+          </div>
+        ))}
+      </div>
+      <div className="chart-card" style={{ marginBottom: 20 }}>
+        <div className="skeleton sk-line" style={{ width: "34%" }} />
+        <div className="skeleton sk-block" style={{ height: 300 }} />
+      </div>
+      <div className="charts-grid-2">
+        {Array.from({ length: 2 }).map((_, i) => (
+          <div key={i} className="chart-card">
+            <div className="skeleton sk-line" style={{ width: "40%" }} />
+            <div className="skeleton sk-block" style={{ height: 250 }} />
+          </div>
+        ))}
+      </div>
+      <div className="chart-card">
+        <div className="skeleton sk-line" style={{ width: "26%" }} />
+        {Array.from({ length: 6 }).map((_, i) => (
+          <div key={i} className="skeleton sk-line" style={{ width: "100%", height: 14 }} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function CompanyPerformance({ initial }: { initial: CompanyData }) {
   const [data, setData] = useState<CompanyData>(initial);
   const [loading, setLoading] = useState(false);
@@ -431,6 +470,10 @@ export default function CompanyPerformance({ initial }: { initial: CompanyData }
             </div>
           </div>
 
+          {loading ? (
+            <DataSkeleton />
+          ) : (
+          <>
           {/* ── KPIs ──────────────────────────────────────────────────────── */}
           <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(4,1fr)" }}>
             {salesDivision ? (
@@ -732,6 +775,8 @@ export default function CompanyPerformance({ initial }: { initial: CompanyData }
               </p>
             </div>
           </div>
+          </>
+          )}
         </>
       )}
     </>
