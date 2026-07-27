@@ -52,9 +52,26 @@ export const LEAD_DIVISIONS = ["Sales", "Leasing"] as const;
 export type DealDivision = (typeof DEAL_DIVISIONS)[number];
 export type LeadDivision = (typeof LEAD_DIVISIONS)[number];
 
+/**
+ * Trading entities are reported as two brands: the Betterhomes family (the main
+ * book plus the Local bucket and the Elite/Exclusive licences) and Prime, which
+ * is kept separate. Matching is by entity NAME rather than division_id so the
+ * grouping survives id changes, and any entity we don't recognise surfaces as
+ * its own brand instead of being silently folded into a total.
+ */
+export const BRAND_GROUPS: { key: string; label: string; names: string[] }[] = [
+  { key: "betterhomes", label: "Betterhomes", names: ["Betterhomes", "Local", "BH Elite", "BH Exclusive"] },
+  { key: "prime", label: "Prime", names: ["Prime"] },
+];
+
+/** Entities excluded everywhere — system rows with no trading activity. */
+const EXCLUDED_ENTITIES = ["Admin Control"];
+
 export interface Brand {
-  id: number;
-  name: string;
+  key: string;
+  label: string;
+  /** The underlying CRM entities folded into this brand. */
+  entities: string[];
 }
 
 /** Month-indexed series: series[channel][monthIndex]. */
@@ -68,8 +85,8 @@ export interface CompanyData {
   months: string[];
   channels: string[];
   brands: Brand[];
-  /** Brand ids the figures are filtered to; empty = all brands. */
-  brandIds: number[];
+  /** Brand group key the figures are filtered to; "" = all brands. */
+  brand: string;
   leads: Record<LeadDivision, Series>;
   deals: Record<DealDivision, Series>;
   comm: Record<DealDivision, Series>;
@@ -135,14 +152,32 @@ function channelSql(col: string): string {
 // A deal counts when it reached reservation and wasn't withdrawn.
 const DEAL_VALID = `d.status IN ('Reserved','Closed','Completed') AND d.state <> 'Withdrawn'`;
 
-const brandFilter = (ids: number[], col: string) =>
-  ids.length ? ` AND ${col} IN (${ids.map((n) => Number(n)).join(",")})` : "";
+const sqlStr = (s: string) => `'${s.replace(/'/g, "''")}'`;
 
-export async function getCompanyData(fromRaw?: string, toRaw?: string, brandIdsRaw?: number[]): Promise<CompanyData> {
+/**
+ * Restrict to a brand group by name, via a subquery on `divisions` — avoids
+ * hardcoding division ids and keeps it to a single round trip.
+ */
+function brandFilter(brand: string, col: string): string {
+  const names = brandNames(brand);
+  if (!names.length) return "";
+  return ` AND ${col} IN (SELECT id FROM divisions WHERE name IN (${names.map(sqlStr).join(",")}))`;
+}
+
+/** Entity names a brand key selects; empty means "all brands". */
+function brandNames(brand: string): string[] {
+  const group = BRAND_GROUPS.find((g) => g.key === brand);
+  if (group) return group.names;
+  // an entity we don't group, addressed directly as "entity:<name>"
+  if (brand.startsWith("entity:")) return [brand.slice("entity:".length)];
+  return [];
+}
+
+export async function getCompanyData(fromRaw?: string, toRaw?: string, brandRaw?: string): Promise<CompanyData> {
   const { from, to } = companyRange(fromRaw, toRaw);
   const months = monthList(from, to);
   const idx = new Map(months.map((m, i) => [m, i]));
-  const brandIds = (brandIdsRaw ?? []).filter((n) => Number.isFinite(n)).map(Number);
+  const brand = brandRaw && brandNames(brandRaw).length ? String(brandRaw) : "";
 
   const connected = !!(
     process.env.METABASE_URL &&
@@ -157,7 +192,7 @@ export async function getCompanyData(fromRaw?: string, toRaw?: string, brandIdsR
     months,
     channels: [...CHANNELS],
     brands: [],
-    brandIds,
+    brand,
     leads: { Sales: emptySeries(months.length), Leasing: emptySeries(months.length) },
     deals: { Offplan: emptySeries(months.length), Secondary: emptySeries(months.length), Leasing: emptySeries(months.length) },
     comm: { Offplan: emptySeries(months.length), Secondary: emptySeries(months.length), Leasing: emptySeries(months.length) },
@@ -174,7 +209,7 @@ export async function getCompanyData(fromRaw?: string, toRaw?: string, brandIdsR
            COUNT(*) AS n
     FROM leads l
     WHERE l.created_at >= '${from}' AND l.created_at < ${until}
-      AND l.type IN ('Buyer','Seller','Tenant','Landlord')${brandFilter(brandIds, "l.division_id")}
+      AND l.type IN ('Buyer','Seller','Tenant','Landlord')${brandFilter(brand, "l.division_id")}
     GROUP BY 1,2,3`;
 
   const dealsSql = `
@@ -190,7 +225,7 @@ export async function getCompanyData(fromRaw?: string, toRaw?: string, brandIdsR
     LEFT JOIN listings li ON li.id = d.listing_id AND li.listable_type = 'Property'
     LEFT JOIN properties p ON p.id = li.listable_id
     WHERE d.reserved_at >= '${from}' AND d.reserved_at < ${until}
-      AND ${DEAL_VALID}${brandFilter(brandIds, "d.division_id")}
+      AND ${DEAL_VALID}${brandFilter(brand, "d.division_id")}
     GROUP BY 1,2,3`;
 
   const brandsSql = `SELECT id, name FROM divisions ORDER BY name`;
@@ -203,9 +238,22 @@ export async function getCompanyData(fromRaw?: string, toRaw?: string, brandIdsR
     mbQuery(brandsSql, true, 10000),
   ]);
 
-  base.brands = (brandRows ?? [])
-    .map((r) => ({ id: Number(r[0]), name: String(r[1] ?? "") }))
-    .filter((b) => b.name && b.name !== "Admin Control");
+  // Fold the CRM entities into brand groups. Anything unrecognised becomes its
+  // own brand so a newly-added licence shows up rather than vanishing.
+  const entityNames = (brandRows ?? [])
+    .map((r) => String(r[1] ?? "").trim())
+    .filter((n) => n && !EXCLUDED_ENTITIES.includes(n));
+  const grouped = new Set(BRAND_GROUPS.flatMap((g) => g.names));
+  base.brands = [
+    ...BRAND_GROUPS.filter((g) => g.names.some((n) => entityNames.includes(n))).map((g) => ({
+      key: g.key,
+      label: g.label,
+      entities: g.names.filter((n) => entityNames.includes(n)),
+    })),
+    ...entityNames
+      .filter((n) => !grouped.has(n))
+      .map((n) => ({ key: `entity:${n}`, label: n, entities: [n] })),
+  ];
 
   if (!leadRows && !dealRows) {
     console.error("[company] both Metabase aggregates failed (timeout or auth)");

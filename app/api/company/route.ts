@@ -8,12 +8,9 @@ export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const from = searchParams.get("from") || undefined;
   const to = searchParams.get("to") || undefined;
-  const brands = (searchParams.get("brands") || "")
-    .split(",")
-    .map((s) => Number(s.trim()))
-    .filter((n) => Number.isFinite(n) && n > 0);
+  const brand = searchParams.get("brand") || undefined;
   try {
-    const data = await getCompanyData(from, to, brands);
+    const data = await getCompanyData(from, to, brand);
     return Response.json(data);
   } catch (e) {
     console.error(`[api/company] ${e instanceof Error ? e.message : String(e)}`);

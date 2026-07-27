@@ -84,7 +84,7 @@ const prettyBucket = (b: string, g: GroupBy) => (g === "month" ? prettyMonth(b) 
 export default function CompanyPerformance({ initial }: { initial: CompanyData }) {
   const [data, setData] = useState<CompanyData>(initial);
   const [loading, setLoading] = useState(false);
-  const [brandIds, setBrandIds] = useState<number[]>([]);
+  const [brand, setBrand] = useState<string>("");
 
   const [period, setPeriod] = useState<string>("all"); // all | 2025 | 2026
   const [division, setDivision] = useState<DivKey>("All");
@@ -94,10 +94,10 @@ export default function CompanyPerformance({ initial }: { initial: CompanyData }
   const [contribMetric, setContribMetric] = useState<"leads" | "deals" | "revenue">("revenue");
 
   /* ── brand filter is the only server round trip ─────────────────────────── */
-  const load = useCallback(async (ids: number[]) => {
+  const load = useCallback(async (b: string) => {
     setLoading(true);
     try {
-      const qs = ids.length ? `?brands=${ids.join(",")}` : "";
+      const qs = b ? `?brand=${encodeURIComponent(b)}` : "";
       const res = await fetch(`/api/company${qs}`, { cache: "no-store" });
       const json = await res.json();
       if (res.ok && json && Array.isArray(json.months)) setData(json as CompanyData);
@@ -115,8 +115,8 @@ export default function CompanyPerformance({ initial }: { initial: CompanyData }
       firstRun.done = true;
       return; // the server already rendered the unfiltered view
     }
-    load(brandIds);
-  }, [brandIds, load, firstRun]);
+    load(brand);
+  }, [brand, load, firstRun]);
 
   const { months, channels } = data;
   const { leadDivs, dealDivs, convValid } = divsFor(division);
@@ -404,17 +404,15 @@ export default function CompanyPerformance({ initial }: { initial: CompanyData }
             </div>
 
             <div className="field">
-              <label>Brand <HelpTip text="The trading entity that booked the deal. Refetches from the CRM." /></label>
-              <select
-                className="ps-select"
-                value={brandIds.length === 1 ? String(brandIds[0]) : "all"}
-                onChange={(e) => setBrandIds(e.target.value === "all" ? [] : [Number(e.target.value)])}
-                disabled={loading}
-              >
-                <option value="all">All brands</option>
+              <label>
+                Brand{" "}
+                <HelpTip text="Betterhomes combines the main book with Local, BH Elite and BH Exclusive. Prime is reported separately. Changing this refetches from the CRM." />
+              </label>
+              <select className="ps-select" value={brand} onChange={(e) => setBrand(e.target.value)} disabled={loading}>
+                <option value="">All brands</option>
                 {data.brands.map((b) => (
-                  <option key={b.id} value={b.id}>
-                    {b.name}
+                  <option key={b.key} value={b.key}>
+                    {b.label}
                   </option>
                 ))}
               </select>
@@ -721,6 +719,11 @@ export default function CompanyPerformance({ initial }: { initial: CompanyData }
                 <strong>Data notes.</strong> April 2025 lead volume includes a one-off bulk import of ~98,900
                 unattributed enquiries — lead totals and overall conversion for that month, and for 2025 as a whole, are
                 distorted. Channel-level figures other than &ldquo;No Source&rdquo; are unaffected.
+              </p>
+              <p style={{ margin: "0 0 8px" }}>
+                <strong>Brands.</strong> &ldquo;Betterhomes&rdquo; combines the main book with the Local bucket and the
+                BH Elite and BH Exclusive licences. Prime is reported separately. Any trading entity added to the CRM in
+                future appears as its own brand rather than being folded into a total.
               </p>
               <p style={{ margin: 0 }}>
                 <strong>Not shown.</strong> Portal spend, cost per deal, revenue after portal expense and return on spend
