@@ -8,7 +8,7 @@
 //
 // Portal economics (spend, cost per deal, revenue after portal expense, return on
 // spend) are intentionally absent — the CRM holds no spend data.
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import ChartBox from "@/components/Chart";
 import HelpTip from "@/components/HelpTip";
 import { C } from "@/lib/theme";
@@ -17,13 +17,23 @@ import type { CompanyData, DealDivision, LeadDivision } from "@/lib/company";
 /* ── formatting (mirrors the report's fmt* helpers) ───────────────────────── */
 const fmtInt = (n: number) => new Intl.NumberFormat("en-US").format(Math.round(n || 0));
 const fmtCompact = (n: number) => {
-  const v = n || 0;
-  if (Math.abs(v) >= 1e9) return `${(v / 1e9).toFixed(1)}B`;
-  if (Math.abs(v) >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
-  if (Math.abs(v) >= 1e3) return `${(v / 1e3).toFixed(0)}K`;
-  return fmtInt(v);
+  const a = Math.abs(n || 0);
+  if (a >= 1e6) {
+    const v = (n || 0) / 1e6;
+    return `${v % 1 ? v.toFixed(1) : v.toFixed(0)}M`;
+  }
+  if (a >= 1e3) {
+    const v = (n || 0) / 1e3;
+    return `${v % 1 && a < 1e4 ? v.toFixed(1) : Math.round(v)}K`;
+  }
+  return `${Math.round(n || 0)}`;
 };
-const fmtAED = (n: number) => `AED ${fmtCompact(n)}`;
+const fmtAED = (n: number) => {
+  const a = Math.abs(n || 0);
+  if (a >= 1e6) return `AED ${((n || 0) / 1e6).toFixed(a >= 1e7 ? 0 : 1)}M`;
+  if (a >= 1e3) return `AED ${Math.round((n || 0) / 1e3)}K`;
+  return `AED ${Math.round(n || 0)}`;
+};
 const fmtPct = (n: number | null, dp = 1) => (n == null || !Number.isFinite(n) ? "—" : `${(n * 100).toFixed(dp)}%`);
 
 const START_LABEL = "January 2025";
@@ -51,18 +61,21 @@ const DIV_LABEL: Record<DivKey, string> = {
 
 /**
  * Which stored divisions a filter selects. Leads are stored Sales/Leasing while
- * deals are stored Offplan/Secondary/Leasing, so off-plan and secondary have no
- * lead series at all — enquiries carry no off-plan flag. Conversion is therefore
- * only meaningful for All, Sales and Leasing.
+ * deals are stored Offplan/Secondary/Leasing, so an off-plan or secondary view
+ * can only ever show ALL sales enquiries — nothing finer exists, because
+ * enquiries carry no off-plan flag. Conversion is withheld for those two.
  */
 function divsFor(d: DivKey): { leadDivs: LeadDivision[]; dealDivs: DealDivision[]; convValid: boolean } {
   switch (d) {
     case "Sales":
       return { leadDivs: ["Sales"], dealDivs: ["Offplan", "Secondary"], convValid: true };
+    // Off-plan and secondary still show ALL sales enquiries — there's no finer
+    // split available — but conversion is withheld, because dividing one slice
+    // of sales deals by every sales lead would read as a real rate and isn't.
     case "Offplan":
-      return { leadDivs: [], dealDivs: ["Offplan"], convValid: false };
+      return { leadDivs: ["Sales"], dealDivs: ["Offplan"], convValid: false };
     case "Secondary":
-      return { leadDivs: [], dealDivs: ["Secondary"], convValid: false };
+      return { leadDivs: ["Sales"], dealDivs: ["Secondary"], convValid: false };
     case "Leasing":
       return { leadDivs: ["Leasing"], dealDivs: ["Leasing"], convValid: true };
     default:
@@ -70,16 +83,36 @@ function divsFor(d: DivKey): { leadDivs: LeadDivision[]; dealDivs: DealDivision[
   }
 }
 
+const DIV_PHRASE: Record<DivKey, string> = {
+  All: "sales & leasing",
+  Sales: "sales",
+  Offplan: "off-plan sales",
+  Secondary: "secondary sales",
+  Leasing: "leasing",
+};
+
+const GRAIN_NOUN: Record<GroupBy, string> = { month: "month", quarter: "quarter", year: "year" };
+
 type GroupBy = "month" | "quarter" | "year";
 const bucketOf = (month: string, g: GroupBy) => {
   const [y, m] = month.split("-");
   if (g === "year") return y;
-  if (g === "quarter") return `${y} Q${Math.floor((Number(m) - 1) / 3) + 1}`;
+  if (g === "quarter") return `${y}-Q${Math.floor((Number(m) - 1) / 3) + 1}`;
   return month;
 };
 const MONTH_LABEL = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const prettyMonth = (m: string) => `${MONTH_LABEL[Number(m.slice(5, 7)) - 1]} ${m.slice(2, 4)}`;
-const prettyBucket = (b: string, g: GroupBy) => (g === "month" ? prettyMonth(b) : b);
+/** "Jun ’25" / "Q2 ’25" / "2025" — the report's own bucket labels. */
+const bucketLabel = (b: string, g: GroupBy) => {
+  if (g === "year") return b;
+  if (g === "quarter") {
+    const [y, q] = b.split("-");
+    return `${q} ’${y.slice(2)}`;
+  }
+  const [y, mo] = b.split("-");
+  return `${MONTH_LABEL[Number(mo) - 1]} ’${y.slice(2)}`;
+};
+const prettyMonth = (m: string) => bucketLabel(m, "month");
+const prettyBucket = (b: string, g: GroupBy) => bucketLabel(b, g);
 
 /**
  * Shown while the brand filter refetches. Mirrors the real layout so the page
@@ -129,6 +162,8 @@ export default function CompanyPerformance({ initial }: { initial: CompanyData }
   const [division, setDivision] = useState<DivKey>("All");
   const [groupBy, setGroupBy] = useState<GroupBy>("month");
   const [channel, setChannel] = useState<string>("all");
+  /** Which single bucket the KPI cards describe; "__all__" = the whole range. */
+  const [bucket, setBucket] = useState<string>("__all__");
   const [revShare, setRevShare] = useState(false);
   const [contribMetric, setContribMetric] = useState<"leads" | "deals" | "revenue">("revenue");
 
@@ -148,46 +183,30 @@ export default function CompanyPerformance({ initial }: { initial: CompanyData }
     }
   }, []);
 
-  const firstRun = useMemo(() => ({ done: false }), []);
-  useEffect(() => {
-    if (!firstRun.done) {
-      firstRun.done = true;
-      return; // the server already rendered the unfiltered view
-    }
-    load(brand);
-  }, [brand, load, firstRun]);
+  /** Changing brand fetches straight from the handler — no effect round trip. */
+  const pickBrand = (next: string) => {
+    setBrand(next);
+    load(next);
+  };
 
   const { months, channels } = data;
   const { leadDivs, dealDivs, convValid } = divsFor(division);
 
-  /* ── month indices for the selected period, and the comparable previous one ─ */
-  const { idxs, prevIdxs, periodLabel } = useMemo(() => {
+  /* ── month indices for the selected period ──────────────────────────────── */
+  const { idxs, periodLabel } = useMemo(() => {
     let sel = months.map((_, i) => i);
     if (period === "2025") sel = months.map((m, i) => (m.startsWith("2025") ? i : -1)).filter((i) => i >= 0);
     else if (period === "2026") sel = months.map((m, i) => (m.startsWith("2026") ? i : -1)).filter((i) => i >= 0);
-    const first = sel[0] ?? 0;
-    const prev = [];
-    for (let i = Math.max(0, first - sel.length); i < first; i++) prev.push(i);
     const lbl =
       period === "all"
         ? `${prettyMonth(months[0] ?? "")} – ${prettyMonth(months[months.length - 1] ?? "")}`
         : period === "2025"
           ? "2025"
           : "2026 to date";
-    return { idxs: sel, prevIdxs: prev, periodLabel: lbl };
+    return { idxs: sel, periodLabel: lbl };
   }, [months, period]);
 
   const activeChannels = channel === "all" ? channels : channels.filter((c) => c === channel);
-
-  /* ── aggregation helpers ────────────────────────────────────────────────── */
-  const sumOver = useCallback(
-    (block: Record<string, Record<string, number[]>>, divs: string[], chs: string[], indices: number[]) => {
-      let t = 0;
-      for (const dv of divs) for (const c of chs) for (const i of indices) t += block[dv]?.[c]?.[i] ?? 0;
-      return t;
-    },
-    [],
-  );
 
   const byChannel = useCallback(
     (block: Record<string, Record<string, number[]>>, divs: string[], indices: number[]) => {
@@ -201,24 +220,6 @@ export default function CompanyPerformance({ initial }: { initial: CompanyData }
     },
     [channels],
   );
-
-  const totals = useMemo(() => {
-    const leads = sumOver(data.leads, leadDivs, activeChannels, idxs);
-    const deals = sumOver(data.deals, dealDivs, activeChannels, idxs);
-    const revenue = sumOver(data.comm, dealDivs, activeChannels, idxs);
-    const pLeads = sumOver(data.leads, leadDivs, activeChannels, prevIdxs);
-    const pDeals = sumOver(data.deals, dealDivs, activeChannels, prevIdxs);
-    const pRevenue = sumOver(data.comm, dealDivs, activeChannels, prevIdxs);
-    // all sales deals, for the off-plan / secondary share KPI
-    const allSales = sumOver(data.deals, ["Offplan", "Secondary"], activeChannels, idxs);
-    return { leads, deals, revenue, pLeads, pDeals, pRevenue, allSales };
-  }, [data, leadDivs, dealDivs, activeChannels, idxs, prevIdxs, sumOver]);
-
-  const delta = (now: number, before: number): string | null => {
-    if (!before || !Number.isFinite(before)) return null;
-    const d = (now - before) / before;
-    return `${d >= 0 ? "▲" : "▼"} ${Math.abs(d * 100).toFixed(1)}% vs prev`;
-  };
 
   /* ── per-bucket series for the stacked charts ───────────────────────────── */
   const buckets = useMemo(() => {
@@ -234,6 +235,110 @@ export default function CompanyPerformance({ initial }: { initial: CompanyData }
     }
     return { order, map };
   }, [idxs, months, groupBy]);
+
+  /** A bucket selection stops being valid when the period or grain changes. */
+  const effBucket = bucket === "__all__" || buckets.order.includes(bucket) ? bucket : "__all__";
+
+  /** Per-bucket totals, honouring the division and channel filters. */
+  const bSums = useMemo(() => {
+    const sum = (block: Record<string, Record<string, number[]>>, divs: string[]) =>
+      buckets.order.map((b) => {
+        let t = 0;
+        for (const dv of divs) for (const c of activeChannels) for (const i of buckets.map.get(b)!) t += block[dv]?.[c]?.[i] ?? 0;
+        return t;
+      });
+    return {
+      leads: sum(data.leads, leadDivs),
+      deals: sum(data.deals, dealDivs),
+      comm: sum(data.comm, dealDivs),
+      salesDeals: sum(data.deals, ["Offplan", "Secondary"]),
+    };
+  }, [buckets, data, leadDivs, dealDivs, activeChannels]);
+
+  /** "Jan 2025 – Jul 2026" · "full year 2025" · "Jan – Jul 2026" */
+  const rangeText = useMemo(() => {
+    if (!idxs.length) return "";
+    const f = months[idxs[0]];
+    const l = months[idxs[idxs.length - 1]];
+    const nice = (m: string) => `${MONTH_LABEL[Number(m.slice(5, 7)) - 1]} ${m.slice(0, 4)}`;
+    if (f === l) return nice(f);
+    if (f.slice(0, 4) === l.slice(0, 4)) {
+      if (f.endsWith("-01") && l.endsWith("-12")) return `full year ${f.slice(0, 4)}`;
+      return `${MONTH_LABEL[Number(f.slice(5, 7)) - 1]} – ${nice(l)}`;
+    }
+    return `${nice(f)} – ${nice(l)}`;
+  }, [idxs, months]);
+
+  const lastMonthIdx = months.length - 1;
+  const toPretty = data.to ? `${Number(data.to.slice(8, 10))} ${MONTH_LABEL[Number(data.to.slice(5, 7)) - 1]}` : "";
+
+  type Kpi = { label: string; value: string; cur: number | null; prev: number | null; note: string };
+
+  /**
+   * The cards describe ONE bucket (or the whole range) with the change against
+   * the bucket before it — the same shape as the report they replace.
+   */
+  const { cap, items } = useMemo(() => {
+    const gname = GRAIN_NOUN[groupBy];
+    const totL = bSums.leads.reduce((a, b) => a + b, 0);
+    const totD = bSums.deals.reduce((a, b) => a + b, 0);
+    const totC = bSums.comm.reduce((a, b) => a + b, 0);
+    const totDS = bSums.salesDeals.reduce((a, b) => a + b, 0);
+
+    let out: Kpi[];
+    let caption: string;
+
+    if (effBucket === "__all__") {
+      caption = `Entire period — ${rangeText}`;
+      out = [
+        { label: "Leads received", value: fmtInt(totL), cur: null, prev: null, note: `sum of every ${gname} in range` },
+        { label: "Deals reserved", value: fmtInt(totD), cur: null, prev: null, note: `sum of every ${gname} in range` },
+        { label: "Conversion", value: fmtPct(totL ? totD / totL : null, 2), cur: null, prev: null, note: "deals ÷ leads over the range" },
+        { label: "Gross commission", value: fmtAED(totC), cur: null, prev: null, note: "final gross commission, whole range" },
+      ];
+    } else {
+      const bi = buckets.order.indexOf(effBucket);
+      const pi = bi - 1;
+      const inProgress = buckets.map.get(effBucket)?.includes(lastMonthIdx) ?? false;
+      const convCur = bSums.leads[bi] ? bSums.deals[bi] / bSums.leads[bi] : null;
+      const convPrev = pi >= 0 && bSums.leads[pi] ? bSums.deals[pi] / bSums.leads[pi] : null;
+      caption =
+        `${gname[0].toUpperCase()}${gname.slice(1)} — ${bucketLabel(effBucket, groupBy)}` +
+        (inProgress ? ` (in progress: to ${toPretty})` : "") +
+        (pi >= 0 ? ` · change vs ${bucketLabel(buckets.order[pi], groupBy)}` : "");
+      out = [
+        { label: "Leads received", value: fmtInt(bSums.leads[bi]), cur: bSums.leads[bi], prev: pi >= 0 ? bSums.leads[pi] : null, note: `Total ${rangeText}: ${fmtInt(totL)}` },
+        { label: "Deals reserved", value: fmtInt(bSums.deals[bi]), cur: bSums.deals[bi], prev: pi >= 0 ? bSums.deals[pi] : null, note: `Total ${rangeText}: ${fmtInt(totD)}` },
+        { label: "Conversion", value: fmtPct(convCur, 2), cur: convCur, prev: convPrev, note: `Range average: ${fmtPct(totL ? totD / totL : null, 2)}` },
+        { label: "Gross commission", value: fmtAED(bSums.comm[bi]), cur: bSums.comm[bi], prev: pi >= 0 ? bSums.comm[pi] : null, note: `Total ${rangeText}: ${fmtAED(totC)}` },
+      ];
+    }
+    if (channel !== "all") caption += ` · ${channel}`;
+
+    // "No Source" collects deals that never had a lead, so a rate is nonsense.
+    if (channel === "No Source" && convValid) {
+      out[2] = { label: "Conversion", value: "—", cur: null, prev: null, note: "not meaningful — deals without a linked lead sit here" };
+    }
+
+    // Off-plan / secondary have no lead split, so show share + average instead.
+    if (!convValid) {
+      const dvName = division === "Offplan" ? "off-plan" : "secondary";
+      if (effBucket === "__all__") {
+        out[0] = { label: "Share of sales deals", value: fmtPct(totDS ? totD / totDS : null, 1), cur: null, prev: null, note: `${dvName} deals ÷ all sales deals, whole range` };
+        out[2] = { label: "Avg commission / deal", value: totD ? fmtAED(totC / totD) : "—", cur: null, prev: null, note: `gross commission ÷ ${dvName} deals` };
+      } else {
+        const bi = buckets.order.indexOf(effBucket);
+        const pi = bi - 1;
+        const shareCur = bSums.salesDeals[bi] ? bSums.deals[bi] / bSums.salesDeals[bi] : null;
+        const sharePrev = pi >= 0 && bSums.salesDeals[pi] ? bSums.deals[pi] / bSums.salesDeals[pi] : null;
+        const avgCur = bSums.deals[bi] ? bSums.comm[bi] / bSums.deals[bi] : null;
+        const avgPrev = pi >= 0 && bSums.deals[pi] ? bSums.comm[pi] / bSums.deals[pi] : null;
+        out[0] = { label: "Share of sales deals", value: fmtPct(shareCur, 1), cur: shareCur, prev: sharePrev, note: `Range: ${fmtPct(totDS ? totD / totDS : null, 1)} of sales deals` };
+        out[2] = { label: "Avg commission / deal", value: avgCur != null ? fmtAED(avgCur) : "—", cur: avgCur, prev: avgPrev, note: `Range average: ${totD ? fmtAED(totC / totD) : "—"}` };
+      }
+    }
+    return { cap: caption, items: out };
+  }, [bSums, buckets, effBucket, groupBy, rangeText, channel, convValid, division, lastMonthIdx, toPretty]);
 
   const stack = useCallback(
     (block: Record<string, Record<string, number[]>>, divs: string[]) =>
@@ -364,7 +469,6 @@ export default function CompanyPerformance({ initial }: { initial: CompanyData }
     URL.revokeObjectURL(url);
   };
 
-  const salesDivision = division === "Offplan" || division === "Secondary";
   const notConnected = !data.connected;
 
   return (
@@ -447,7 +551,7 @@ export default function CompanyPerformance({ initial }: { initial: CompanyData }
                 Brand{" "}
                 <HelpTip text="Betterhomes combines the main book with Local, BH Elite and BH Exclusive. Prime is reported separately. Changing this refetches from the CRM." />
               </label>
-              <select className="ps-select" value={brand} onChange={(e) => setBrand(e.target.value)} disabled={loading}>
+              <select className="ps-select" value={brand} onChange={(e) => pickBrand(e.target.value)} disabled={loading}>
                 <option value="">All brands</option>
                 {data.brands.map((b) => (
                   <option key={b.key} value={b.key}>
@@ -468,63 +572,78 @@ export default function CompanyPerformance({ initial }: { initial: CompanyData }
                 ))}
               </select>
             </div>
+
+            <div className="field">
+              <label>
+                Showing{" "}
+                <HelpTip text="Which single period the four cards describe. Pick a month, quarter or year to see it against the one before it; “Entire period” totals the whole range instead." />
+              </label>
+              <select className="ps-select" value={effBucket} onChange={(e) => setBucket(e.target.value)}>
+                <option value="__all__">Entire period ({rangeText})</option>
+                {buckets.order
+                  .slice()
+                  .reverse()
+                  .map((b) => (
+                    <option key={b} value={b}>
+                      {bucketLabel(b, groupBy)}
+                      {buckets.map.get(b)?.includes(lastMonthIdx) ? " (in progress)" : ""}
+                    </option>
+                  ))}
+              </select>
+            </div>
+          </div>
+
+          {/* what the page is currently showing */}
+          <div style={{ fontSize: 11.5, color: C.mid, marginTop: -8, marginBottom: 10 }}>
+            Showing: {period === "all" ? "All" : period === "2026" ? "2026 to date" : period} · {DIV_PHRASE[division]} · by{" "}
+            {groupBy} · cards: {effBucket === "__all__" ? "entire period" : bucketLabel(effBucket, groupBy)} ·{" "}
+            {channel === "all" ? "all channels" : channel}
+            {data.generatedAt ? (
+              // formatted in the viewer's locale, so server and client text differ by design
+              <span suppressHydrationWarning> — updated {new Date(data.generatedAt).toLocaleTimeString()}</span>
+            ) : null}
+          </div>
+          <div
+            style={{
+              fontSize: 11,
+              fontWeight: 600,
+              letterSpacing: ".06em",
+              textTransform: "uppercase",
+              color: C.sage,
+              marginBottom: 10,
+            }}
+          >
+            {cap}
           </div>
 
           {loading ? (
             <DataSkeleton />
           ) : (
           <>
-          {/* ── KPIs ──────────────────────────────────────────────────────── */}
+          {/* ── KPIs — one bucket, change vs the previous one ─────────────── */}
           <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(4,1fr)" }}>
-            {salesDivision ? (
-              <>
-                <div className="kpi-card">
-                  <div className="kpi-label">Deals</div>
-                  <div className="kpi-value">{fmtInt(totals.deals)}</div>
-                  <div className="kpi-change">{delta(totals.deals, totals.pDeals) ?? DIV_LABEL[division]}</div>
-                </div>
-                <div className="kpi-card">
-                  <div className="kpi-label">Share of sales deals <HelpTip text="This division's deals as a share of all Sale deals (off-plan + secondary)." /></div>
-                  <div className="kpi-value">{fmtPct(totals.allSales ? totals.deals / totals.allSales : null)}</div>
-                  <div className="kpi-change">of {fmtInt(totals.allSales)} sales deals</div>
-                </div>
-                <div className="kpi-card">
-                  <div className="kpi-label">Revenue</div>
-                  <div className="kpi-value" style={{ color: C.green }}>{fmtAED(totals.revenue)}</div>
-                  <div className="kpi-change">{delta(totals.revenue, totals.pRevenue) ?? "gross commission"}</div>
-                </div>
-                <div className="kpi-card">
-                  <div className="kpi-label">Avg commission per deal</div>
-                  <div className="kpi-value">{fmtAED(totals.deals ? totals.revenue / totals.deals : 0)}</div>
-                  <div className="kpi-change">per closed deal</div>
-                </div>
-              </>
-            ) : (
-              <>
-                <div className="kpi-card">
-                  <div className="kpi-label">Leads</div>
-                  <div className="kpi-value">{fmtInt(totals.leads)}</div>
-                  <div className="kpi-change">{delta(totals.leads, totals.pLeads) ?? "enquiries"}</div>
-                </div>
-                <div className="kpi-card">
-                  <div className="kpi-label">Deals</div>
-                  <div className="kpi-value">{fmtInt(totals.deals)}</div>
-                  <div className="kpi-change">{delta(totals.deals, totals.pDeals) ?? "reservations + completions"}</div>
-                </div>
-                <div className="kpi-card">
-                  <div className="kpi-label">Revenue <HelpTip text="Final gross commission in AED." /></div>
-                  <div className="kpi-value" style={{ color: C.green }}>{fmtAED(totals.revenue)}</div>
-                  <div className="kpi-change">{delta(totals.revenue, totals.pRevenue) ?? "gross commission"}</div>
-                </div>
-                <div className="kpi-card">
-                  <div className="kpi-label">Conversion <HelpTip text="Deals ÷ leads for the selected division and period." /></div>
-                  <div className="kpi-value">{fmtPct(convValid && totals.leads ? totals.deals / totals.leads : null, 2)}</div>
-                  <div className="kpi-change">
-                    {fmtAED(totals.deals ? totals.revenue / totals.deals : 0)} per deal
+            {items.map((it) => {
+              const hasPrev = it.cur !== null && it.prev !== null && it.prev !== 0 && Number.isFinite(it.prev);
+              const ch = hasPrev ? (it.cur! - it.prev!) / it.prev! : 0;
+              const up = hasPrev && ch >= 0.0005;
+              const down = hasPrev && ch <= -0.0005;
+              return (
+                <div className="kpi-card" key={it.label}>
+                  <div className="kpi-label">{it.label}</div>
+                  <div className="kpi-value" style={it.label === "Gross commission" ? { color: C.green } : undefined}>
+                    {it.value}
                   </div>
+                  {it.cur !== null ? (
+                    <div className="kpi-change" style={{ color: up ? C.green : down ? C.red : C.mid }}>
+                      {hasPrev
+                        ? `${up ? "\u25b2" : down ? "\u25bc" : "\u00b7"} ${Math.abs(ch * 100).toFixed(1)}% vs previous ${GRAIN_NOUN[groupBy]}`
+                        : `no previous ${GRAIN_NOUN[groupBy]} in range`}
+                    </div>
+                  ) : null}
+                  <div style={{ fontSize: 11, color: C.mid, marginTop: 4 }}>{it.note}</div>
                 </div>
-              </>
-            )}
+              );
+            })}
           </div>
 
           {/* ── revenue contribution ──────────────────────────────────────── */}
@@ -553,20 +672,16 @@ export default function CompanyPerformance({ initial }: { initial: CompanyData }
             <div className="chart-card">
               <div className="chart-title">Leads by channel</div>
               <div className="chart-sub">
-                {leadDivs.length ? `Enquiries · ${leadDivs.join(" + ")}` : "Not available for this division"}
+                {convValid
+                  ? `Enquiries received, ${groupBy}ly · ${DIV_PHRASE[division]}`
+                  : `All sales enquiries, ${groupBy}ly — enquiries are not classified by sales type`}
               </div>
               <div className="chart-canvas-wrap" style={{ height: 280 }}>
-                {leadDivs.length ? (
-                  <ChartBox
-                    type="bar"
-                    data={{ labels: buckets.order.map((b) => prettyBucket(b, groupBy)), datasets: leadDatasets }}
-                    options={stackedOpts()}
-                  />
-                ) : (
-                  <div className="empty-state" style={{ fontSize: 12, color: C.mid, textAlign: "center", padding: 30 }}>
-                    Enquiries carry no off-plan flag, so leads can&apos;t be split off-plan vs secondary.
-                  </div>
-                )}
+                <ChartBox
+                  type="bar"
+                  data={{ labels: buckets.order.map((b) => prettyBucket(b, groupBy)), datasets: leadDatasets }}
+                  options={stackedOpts()}
+                />
               </div>
             </div>
 

@@ -87,6 +87,8 @@ export interface CompanyData {
   brands: Brand[];
   /** Brand group key the figures are filtered to; "" = all brands. */
   brand: string;
+  /** When the CRM was queried, ISO — surfaced as the "updated" stamp. */
+  generatedAt: string;
   leads: Record<LeadDivision, Series>;
   deals: Record<DealDivision, Series>;
   comm: Record<DealDivision, Series>;
@@ -193,6 +195,7 @@ export async function getCompanyData(fromRaw?: string, toRaw?: string, brandRaw?
     channels: [...CHANNELS],
     brands: [],
     brand,
+    generatedAt: new Date().toISOString(),
     leads: { Sales: emptySeries(months.length), Leasing: emptySeries(months.length) },
     deals: { Offplan: emptySeries(months.length), Secondary: emptySeries(months.length), Leasing: emptySeries(months.length) },
     comm: { Offplan: emptySeries(months.length), Secondary: emptySeries(months.length), Leasing: emptySeries(months.length) },
