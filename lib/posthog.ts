@@ -17,6 +17,18 @@ const PROJECT = process.env.POSTHOG_PROJECT_ID || "198002";
 // dropping real users — Ashburn (AWS us-east-1) alone was ~92% of bogus US hits.
 const DATACENTER_CITIES = ["Ashburn", "Boardman", "Council Bluffs", "The Dalles"];
 
+/**
+ * A hit is "automated" if PostHog flagged it, OR it came from a cloud datacenter
+ * city, OR it runs desktop Linux. Real consumers are ~98% Windows/Mac/iOS/
+ * Android, so near-100%-Linux traffic (the China / Singapore / Hong Kong /
+ * Netherlands server traffic, each ~1.0 pageviews/session) is crawlers.
+ *
+ * Defined once and shared by the Website and SEO tabs. It used to be written out
+ * twice, which is how the two would eventually disagree about what a bot is
+ * while both claiming to filter them.
+ */
+const BOT_EXPR = `(coalesce(properties.$virt_is_bot, false) = true OR properties.$geoip_city_name IN (${DATACENTER_CITIES.map((c) => `'${c}'`).join(", ")}) OR properties.$os = 'Linux')`;
+
 const SEARCH_ENGINES = ["google.", "bing.", "yahoo.", "duckduckgo.", "ecosia.", "yandex.", "baidu.", "brave."];
 
 async function hogql(sql: string, timeoutMs = Number(process.env.POSTHOG_TIMEOUT_MS || 15000)): Promise<any[][] | null> {
@@ -272,12 +284,7 @@ export async function getWebMetrics(daysRaw = 30, fromRaw?: string, toRaw?: stri
   if (!key) return base;
 
   const pv = `event = '$pageview'`;
-  const dc = DATACENTER_CITIES.map((c) => `'${c}'`).join(", ");
-  // A hit is "automated" if PostHog flagged it, OR it's from a cloud datacenter
-  // city, OR it runs desktop Linux. Real consumers are ~98% Windows/Mac/iOS/
-  // Android; near-100%-Linux traffic (the China / Singapore / Hong Kong /
-  // Netherlands server traffic, each ~1.0 pageviews/session) is bots/crawlers.
-  const botExpr = `(coalesce(properties.$virt_is_bot, false) = true OR properties.$geoip_city_name IN (${dc}) OR properties.$os = 'Linux')`;
+  const botExpr = BOT_EXPR;
   const human = humansOnly ? ` AND NOT ${botExpr}` : "";
   const organic = SEARCH_ENGINES.map((e) => `properties.$referring_domain LIKE '%${e}%'`).join(" OR ");
 
@@ -370,8 +377,9 @@ export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 
   const base: SeoTraffic = { connected: !!key, label, totalPageviews: 0, organicPageviews: 0, aiSessions: 0, totalSessions: 0, byChannel: [], aiBySource: [] };
   if (!key) return base;
 
-  const dc = DATACENTER_CITIES.map((c) => `'${c}'`).join(", ");
-  const human = ` AND NOT (coalesce(properties.$virt_is_bot, false) = true OR properties.$geoip_city_name IN (${dc}) OR properties.$os = 'Linux')`;
+  // Same bot definition as the Website tab — always on here (the SEO tab has no
+  // humans-only toggle), so these figures are bot-filtered by construction.
+  const human = ` AND NOT ${BOT_EXPR}`;
   const chan = channelClassify("ref");
   // HEAVY: one per-session pass (argMin first referrer) → channel pageviews &
   // sessions. Given extra time so a large range isn't cut off (this is the only

@@ -42,8 +42,13 @@ export interface LeadsData {
 const isDate = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s);
 
 // SQL fragments (reused across the queries)
-const utmSource = `LOWER(JSON_UNQUOTE(JSON_EXTRACT(utm,'$.source')))`;
-const utmMedium = `LOWER(JSON_UNQUOTE(JSON_EXTRACT(utm,'$.medium')))`;
+// `utm` is read defensively. JSON_EXTRACT raises "Invalid JSON text" and fails
+// the ENTIRE query if a single row holds something that isn't JSON — which a
+// column fed by web forms eventually will. JSON_VALID gates every access so one
+// bad row yields NULL instead of killing the whole card.
+const utmJson = (key: string) => `CASE WHEN JSON_VALID(utm) THEN LOWER(JSON_UNQUOTE(JSON_EXTRACT(utm,'$.${key}'))) END`;
+const utmSource = utmJson("source");
+const utmMedium = utmJson("medium");
 const llmList = LLM_DOMAINS.map((d) => `'${d}'`).join(",");
 const IS_AI = `(${utmSource} IN (${llmList}) OR LOWER(enquiry_source) IN (${llmList}))`;
 const IS_POPUP = `(${utmSource} LIKE '%pop-up%' OR ${utmMedium} LIKE '%pop-up%' OR LOWER(enquiry_source) LIKE '%pop-up%')`;
@@ -98,17 +103,29 @@ async function mbSessionToken(): Promise<string | null> {
   }
 }
 
-/** Run native SQL against the CRM database. Shared with lib/company.ts. */
-export async function mbQuery(sql: string, retry = true, timeoutMs = 20000): Promise<any[][] | null> {
+export type MbResult = { rows: any[][] } | { error: string };
+
+/**
+ * Run native SQL and return either rows or the reason it failed.
+ *
+ * Metabase answers a FAILED native query with HTTP **202** and a body of
+ * `{status:"failed", error:"<the real message>"}`. 202 is a 2xx, so `res.ok` is
+ * true and the only hint of trouble is a missing `data.rows`. Callers that got
+ * back a bare `null` therefore couldn't tell a broken query from a slow one and
+ * reported everything as a timeout — while discarding the exact message Metabase
+ * had already written down. So the payload is inspected here and the reason is
+ * handed back.
+ */
+export async function mbQueryEx(sql: string, retry = true, timeoutMs = 20000): Promise<MbResult> {
   const url = process.env.METABASE_URL;
-  if (!url) return null;
+  if (!url) return { error: "METABASE_URL is not set" };
   const apiKey = process.env.METABASE_API_KEY;
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (apiKey) {
     headers["x-api-key"] = apiKey;
   } else {
     const token = await mbSessionToken();
-    if (!token) return null;
+    if (!token) return { error: "could not authenticate" };
     headers["X-Metabase-Session"] = token;
   }
   const ctrl = new AbortController();
@@ -124,20 +141,40 @@ export async function mbQuery(sql: string, retry = true, timeoutMs = 20000): Pro
     if (res.status === 401 && !apiKey && retry) {
       mbSession = null; // expired session — re-auth once
       clearTimeout(t);
-      return mbQuery(sql, false, timeoutMs);
+      return mbQueryEx(sql, false, timeoutMs);
     }
     if (!res.ok) {
-      console.error(`[metabase] dataset HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
-      return null;
+      const body = (await res.text().catch(() => "")).slice(0, 300);
+      console.error(`[metabase] dataset HTTP ${res.status}: ${body}`);
+      return { error: `HTTP ${res.status}${body ? ` — ${body}` : ""}` };
     }
     const j = await res.json();
-    return (j?.data?.rows as any[][]) ?? null;
+    // The 202-with-failure case described above.
+    if (j?.status === "failed" || (j?.error && !j?.data)) {
+      const msg = String(j?.error ?? "query failed").slice(0, 300);
+      console.error(`[metabase] query failed: ${msg}`);
+      return { error: msg };
+    }
+    const rows = j?.data?.rows;
+    if (!Array.isArray(rows)) {
+      console.error(`[metabase] unexpected response shape: ${JSON.stringify(j).slice(0, 200)}`);
+      return { error: "Metabase returned no data.rows (unexpected response shape)" };
+    }
+    return { rows };
   } catch (e) {
-    console.error(`[metabase] dataset error: ${e instanceof Error ? e.message : String(e)}`);
-    return null;
+    const aborted = e instanceof Error && e.name === "AbortError";
+    const msg = aborted ? `timed out after ${Math.round(timeoutMs / 1000)}s` : e instanceof Error ? e.message : String(e);
+    console.error(`[metabase] dataset error: ${msg}`);
+    return { error: msg };
   } finally {
     clearTimeout(t);
   }
+}
+
+/** Rows, or null when it failed. For callers that only need "did it work". */
+export async function mbQuery(sql: string, retry = true, timeoutMs = 20000): Promise<any[][] | null> {
+  const r = await mbQueryEx(sql, retry, timeoutMs);
+  return "rows" in r ? r.rows : null;
 }
 
 export async function getLeadsData(fromRaw: string, toRaw: string): Promise<LeadsData> {
@@ -163,9 +200,9 @@ export async function getLeadsData(fromRaw: string, toRaw: string): Promise<Lead
   // and '' have to be folded to a readable placeholder.
   const audit = (expr: string) => `COALESCE(NULLIF(NULLIF(${expr}, ''), 'null'), '(none)')`;
 
-  const [segRows, srcRows, stageRows, statusRows, auditRows] = await Promise.all([
+  const [segRes, srcRows, stageRows, statusRows, auditRows] = await Promise.all([
     // finer segment split: ai / website(no utm) / popup / other
-    mbQuery(
+    mbQueryEx(
       `SELECT sub, count(*) n FROM (SELECT CASE WHEN ${IS_AI} THEN 'ai' WHEN ${IS_WEB_NOUTM} THEN 'website' WHEN ${IS_POPUP} THEN 'popup' ELSE 'other' END sub FROM leads WHERE ${range}) t GROUP BY sub`,
     ),
     mbQuery(
@@ -186,11 +223,13 @@ export async function getLeadsData(fromRaw: string, toRaw: string): Promise<Lead
     ),
   ]);
 
-  // Auth worked but the query didn't come back.
-  if (!segRows) {
-    console.error("[metabase] leads segment query returned no rows (timeout or view error)");
-    return { ...base, error: "Metabase reachable but the leads query failed or timed out (20s) — the view may be slow for this range, or the account can't read it." };
+  // Auth worked but the query didn't come back. Report what Metabase actually
+  // said rather than assuming it was slow — a broken query and a slow one need
+  // completely different fixes, and only one of them is about the range.
+  if ("error" in segRes) {
+    return { ...base, error: `Metabase reachable, but the leads query failed: ${segRes.error}` };
   }
+  const segRows = segRes.rows;
 
   for (const r of segRows) {
     const sub = String(r[0] ?? "");
