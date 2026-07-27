@@ -67,6 +67,7 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
 
   // keyword editor
   const [kwOpen, setKwOpen] = useState(false);
+  const [auditOpen, setAuditOpen] = useState(false);
   const [kwInput, setKwInput] = useState(initial.keywords.join("\n"));
   const [kwMsg, setKwMsg] = useState<string | null>(null);
   const [kwSaving, startKwSave] = useTransition();
@@ -104,11 +105,11 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
       if (res.ok && json && typeof json.connected === "boolean") setLeads(json as LeadsData);
       else {
         console.error("[seo] leads returned an error", json?.error ?? res.status);
-        setLeads({ connected: true, label: "", aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [], error: json?.error || `HTTP ${res.status}` });
+        setLeads({ connected: true, label: "", aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [], sourceAudit: [], error: json?.error || `HTTP ${res.status}` });
       }
     } catch (e) {
       console.error("[seo] leads fetch failed", e);
-      setLeads({ connected: true, label: "", aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [], error: String(e) });
+      setLeads({ connected: true, label: "", aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [], sourceAudit: [], error: String(e) });
     } finally {
       setLeadsLoading(false);
     }
@@ -398,6 +399,43 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
                     </div>
                   )}
                 </div>
+              </div>
+
+              {/* Audit trail. Organic and AI are inferred from free-text
+                  enquiry_source and a JSON utm blob, so this shows every raw
+                  combination and which bucket it landed in — the 'other' rows
+                  are the ones worth reading, because that's where anything the
+                  classifier doesn't recognise ends up. */}
+              <div className="chart-card" style={{ marginTop: 4 }}>
+                <div className="chart-title" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span>Lead source audit <HelpTip text="Every enquiry_source × utm combination in the CRM for this range, and the bucket it classifies into. Organic and AI are inferred from free text, so this is how you verify the classification is right — especially the 'other' rows." /></span>
+                  <button className="filter-btn" onClick={() => setAuditOpen((v) => !v)}>{auditOpen ? "Hide" : "Show"}</button>
+                </div>
+                <div className="chart-sub">
+                  {leads.sourceAudit.length ? `${leads.sourceAudit.length} source combinations · ${leads.label}` : "No leads in range."}
+                </div>
+                {auditOpen && leads.sourceAudit.length > 0 && (
+                  <div className="table-scroll" style={{ marginTop: 10, maxHeight: 420 }}>
+                    <table className="perf-table">
+                      <thead><tr><th>enquiry_source</th><th>utm.source</th><th>utm.medium</th><th>bucket</th><th style={{ textAlign: "right" }}>leads</th></tr></thead>
+                      <tbody>
+                        {leads.sourceAudit.map((r, i) => (
+                          <tr key={i}>
+                            <td>{r.enquirySource}</td>
+                            <td className="muted">{r.utmSource}</td>
+                            <td className="muted">{r.utmMedium}</td>
+                            <td>
+                              <span style={{ fontWeight: 600, color: r.segment === "ai" ? C.green : r.segment === "organic" ? C.dark : C.mid }}>
+                                {r.segment}
+                              </span>
+                            </td>
+                            <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(r.n)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             </>
           )}

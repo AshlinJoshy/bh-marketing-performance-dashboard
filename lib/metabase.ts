@@ -29,6 +29,13 @@ export interface LeadsData {
   aiBySource: { source: string; n: number }[];
   stage: { segment: string; stage: string; n: number }[]; // pipeline (status col)
   status: { segment: string; status: string; n: number }[]; // open/closed (state col)
+  /**
+   * Raw enquiry_source × utm.source × utm.medium counts with the bucket each
+   * combination lands in. The classification below is all inference over free
+   * text, so this is the audit trail: it shows what actually exists in the view
+   * and, in particular, what fell into 'other' rather than organic or ai.
+   */
+  sourceAudit: { enquirySource: string; utmSource: string; utmMedium: string; segment: string; n: number }[];
   error?: string;
 }
 
@@ -139,7 +146,7 @@ export async function getLeadsData(fromRaw: string, toRaw: string): Promise<Lead
     (process.env.METABASE_API_KEY || (process.env.METABASE_USERNAME && process.env.METABASE_PASSWORD))
   );
   const label = `${fromRaw} → ${toRaw}`;
-  const base: LeadsData = { connected, label, aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [] };
+  const base: LeadsData = { connected, label, aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [], sourceAudit: [] };
   if (!connected) return base;
   if (!isDate(fromRaw) || !isDate(toRaw)) return { ...base, error: "bad date range" };
   // Precise auth check first, so a login problem reads clearly instead of a
@@ -152,7 +159,11 @@ export async function getLeadsData(fromRaw: string, toRaw: string): Promise<Lead
   }
   const range = `created_at >= '${fromRaw} 00:00:00' AND created_at <= '${toRaw} 23:59:59'`;
 
-  const [segRows, srcRows, stageRows, statusRows] = await Promise.all([
+  // JSON_UNQUOTE turns a JSON null into the literal string 'null', so both that
+  // and '' have to be folded to a readable placeholder.
+  const audit = (expr: string) => `COALESCE(NULLIF(NULLIF(${expr}, ''), 'null'), '(none)')`;
+
+  const [segRows, srcRows, stageRows, statusRows, auditRows] = await Promise.all([
     // finer segment split: ai / website(no utm) / popup / other
     mbQuery(
       `SELECT sub, count(*) n FROM (SELECT CASE WHEN ${IS_AI} THEN 'ai' WHEN ${IS_WEB_NOUTM} THEN 'website' WHEN ${IS_POPUP} THEN 'popup' ELSE 'other' END sub FROM leads WHERE ${range}) t GROUP BY sub`,
@@ -165,6 +176,13 @@ export async function getLeadsData(fromRaw: string, toRaw: string): Promise<Lead
     ),
     mbQuery(
       `SELECT seg, CAST(state AS CHAR) st, count(*) n FROM (SELECT state, ${SEG} seg FROM leads WHERE ${range}) t WHERE seg IN ('ai','organic') GROUP BY seg, st ORDER BY seg, n DESC`,
+    ),
+    // Audit trail — every source combination and where it lands, biggest first.
+    mbQuery(
+      `SELECT es, us, um, seg, count(*) n FROM (` +
+        `SELECT ${audit(`LOWER(TRIM(enquiry_source))`)} es, ${audit(utmSource)} us, ${audit(utmMedium)} um, ${SEG} seg ` +
+        `FROM leads WHERE ${range}` +
+        `) t GROUP BY 1,2,3,4 ORDER BY n DESC LIMIT 60`,
     ),
   ]);
 
@@ -185,5 +203,12 @@ export async function getLeadsData(fromRaw: string, toRaw: string): Promise<Lead
   base.aiBySource = (srcRows ?? []).map((r) => ({ source: String(r[0] ?? "(unknown)"), n: Number(r[1] ?? 0) }));
   base.stage = (stageRows ?? []).map((r) => ({ segment: String(r[0] ?? ""), stage: String(r[1] ?? ""), n: Number(r[2] ?? 0) }));
   base.status = (statusRows ?? []).map((r) => ({ segment: String(r[0] ?? ""), status: String(r[1] ?? ""), n: Number(r[2] ?? 0) }));
+  base.sourceAudit = (auditRows ?? []).map((r) => ({
+    enquirySource: String(r[0] ?? "(none)"),
+    utmSource: String(r[1] ?? "(none)"),
+    utmMedium: String(r[2] ?? "(none)"),
+    segment: String(r[3] ?? ""),
+    n: Number(r[4] ?? 0),
+  }));
   return base;
 }
