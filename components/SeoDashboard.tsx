@@ -99,6 +99,9 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
   // slow half — Metabase leads (independent request)
   const loadLeads = useCallback(async (qs: string) => {
     setLeadsLoading(true);
+    // A fresh payload carries no audit rows, so collapse the table rather than
+    // leaving it open and empty against the previous range.
+    setAuditOpen(false);
     try {
       const res = await fetch(`/api/seo/leads?${qs}`, { cache: "no-store" });
       const json = await res.json();
@@ -114,6 +117,30 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
       setLeadsLoading(false);
     }
   }, []);
+
+  /**
+   * The audit table costs a second full scan of the slow CRM view, so it's
+   * fetched on first open rather than with every range change, and kept once
+   * loaded.
+   */
+  const [auditLoading, setAuditLoading] = useState(false);
+  const toggleAudit = useCallback(async () => {
+    const opening = !auditOpen;
+    setAuditOpen(opening);
+    if (!opening || !leads || leads.sourceAudit.length > 0) return;
+    setAuditLoading(true);
+    try {
+      const res = await fetch(`/api/seo/leads?${rangeQs()}&audit=1`, { cache: "no-store" });
+      const json = await res.json();
+      if (res.ok && Array.isArray(json?.sourceAudit)) {
+        setLeads((prev) => (prev ? { ...prev, sourceAudit: json.sourceAudit } : prev));
+      } else console.error("[seo] audit returned an error", json?.error ?? res.status);
+    } catch (e) {
+      console.error("[seo] audit fetch failed", e);
+    } finally {
+      setAuditLoading(false);
+    }
+  }, [auditOpen, leads, rangeQs]);
 
   // Leads are fetched on mount ON PURPOSE: the Metabase CRM view is slow enough
   // that server-rendering it stalls (and used to kill) the PostHog/GSC render, so
@@ -409,10 +436,14 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
               <div className="chart-card" style={{ marginTop: 4 }}>
                 <div className="chart-title" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                   <span>Lead source audit <HelpTip text="Every enquiry_source × utm combination in the CRM for this range, and the bucket it classifies into. Organic and AI are inferred from free text, so this is how you verify the classification is right — especially the 'other' rows." /></span>
-                  <button className="filter-btn" onClick={() => setAuditOpen((v) => !v)}>{auditOpen ? "Hide" : "Show"}</button>
+                  <button className="filter-btn" onClick={toggleAudit} disabled={auditLoading}>{auditLoading ? "Loading…" : auditOpen ? "Hide" : "Show"}</button>
                 </div>
                 <div className="chart-sub">
-                  {leads.sourceAudit.length ? `${leads.sourceAudit.length} source combinations · ${leads.label}` : "No leads in range."}
+                  {auditLoading
+                    ? "Querying the CRM…"
+                    : leads.sourceAudit.length
+                      ? `${leads.sourceAudit.length} source combinations · ${leads.label}`
+                      : "Loaded on demand — it costs an extra scan of the CRM view."}
                 </div>
                 {auditOpen && leads.sourceAudit.length > 0 && (
                   <div className="table-scroll" style={{ marginTop: 10, maxHeight: 420 }}>

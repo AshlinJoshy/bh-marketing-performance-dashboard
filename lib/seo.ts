@@ -40,7 +40,7 @@ export async function getSeoData(fromRaw?: string, toRaw?: string): Promise<SeoD
 }
 
 /** Slow half: Metabase leads (fetched separately, client-side). */
-export async function getSeoLeads(fromRaw?: string, toRaw?: string): Promise<LeadsData> {
+export async function getSeoLeads(fromRaw?: string, toRaw?: string, audit = false): Promise<LeadsData> {
   const { from, to } = seoRange(fromRaw, toRaw);
-  return getLeadsData(from, to);
+  return getLeadsData(from, to, { audit });
 }

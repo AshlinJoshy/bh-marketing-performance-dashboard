@@ -54,6 +54,10 @@ const IS_AI = `(${utmSource} IN (${llmList}) OR LOWER(enquiry_source) IN (${llmL
 const IS_POPUP = `(${utmSource} LIKE '%pop-up%' OR ${utmMedium} LIKE '%pop-up%' OR LOWER(enquiry_source) LIKE '%pop-up%')`;
 const IS_WEB_NOUTM = `(LOWER(enquiry_source) = 'website' AND (utm IS NULL OR ${utmSource} IS NULL OR ${utmSource} = ''))`;
 const SEG = `CASE WHEN ${IS_AI} THEN 'ai' WHEN (${IS_WEB_NOUTM} OR ${IS_POPUP}) THEN 'organic' ELSE 'other' END`;
+// The finer split. `organic` is website+popup, so SEG is derivable from this and
+// only one of the two needs to be computed in SQL.
+const SUB = `CASE WHEN ${IS_AI} THEN 'ai' WHEN ${IS_WEB_NOUTM} THEN 'website' WHEN ${IS_POPUP} THEN 'popup' ELSE 'other' END`;
+const segOf = (sub: string) => (sub === "ai" ? "ai" : sub === "website" || sub === "popup" ? "organic" : "other");
 
 // Session token from username/password, cached in-process, coalesced across
 // concurrent callers, and refreshed on a 401.
@@ -177,7 +181,7 @@ export async function mbQuery(sql: string, retry = true, timeoutMs = 20000): Pro
   return "rows" in r ? r.rows : null;
 }
 
-export async function getLeadsData(fromRaw: string, toRaw: string): Promise<LeadsData> {
+export async function getLeadsData(fromRaw: string, toRaw: string, opts?: { audit?: boolean }): Promise<LeadsData> {
   const connected = !!(
     process.env.METABASE_URL &&
     (process.env.METABASE_API_KEY || (process.env.METABASE_USERNAME && process.env.METABASE_PASSWORD))
@@ -200,48 +204,70 @@ export async function getLeadsData(fromRaw: string, toRaw: string): Promise<Lead
   // and '' have to be folded to a readable placeholder.
   const audit = (expr: string) => `COALESCE(NULLIF(NULLIF(${expr}, ''), 'null'), '(none)')`;
 
-  const [segRes, srcRows, stageRows, statusRows, auditRows] = await Promise.all([
-    // finer segment split: ai / website(no utm) / popup / other
-    mbQueryEx(
-      `SELECT sub, count(*) n FROM (SELECT CASE WHEN ${IS_AI} THEN 'ai' WHEN ${IS_WEB_NOUTM} THEN 'website' WHEN ${IS_POPUP} THEN 'popup' ELSE 'other' END sub FROM leads WHERE ${range}) t GROUP BY sub`,
-    ),
-    mbQuery(
-      `SELECT COALESCE(NULLIF(${utmSource}, ''), LOWER(enquiry_source)) src, count(*) n FROM leads WHERE ${range} AND ${IS_AI} GROUP BY src ORDER BY n DESC`,
-    ),
-    mbQuery(
-      `SELECT seg, CAST(status AS CHAR) stage, count(*) n FROM (SELECT status, ${SEG} seg FROM leads WHERE ${range}) t WHERE seg IN ('ai','organic') GROUP BY seg, stage ORDER BY seg, n DESC`,
-    ),
-    mbQuery(
-      `SELECT seg, CAST(state AS CHAR) st, count(*) n FROM (SELECT state, ${SEG} seg FROM leads WHERE ${range}) t WHERE seg IN ('ai','organic') GROUP BY seg, st ORDER BY seg, n DESC`,
-    ),
-    // Audit trail — every source combination and where it lands, biggest first.
-    mbQuery(
-      `SELECT es, us, um, seg, count(*) n FROM (` +
-        `SELECT ${audit(`LOWER(TRIM(enquiry_source))`)} es, ${audit(utmSource)} us, ${audit(utmMedium)} um, ${SEG} seg ` +
-        `FROM leads WHERE ${range}` +
-        `) t GROUP BY 1,2,3,4 ORDER BY n DESC LIMIT 60`,
-    ),
-  ]);
-
-  // Auth worked but the query didn't come back. Report what Metabase actually
-  // said rather than assuming it was slow — a broken query and a slow one need
-  // completely different fixes, and only one of them is about the range.
-  if ("error" in segRes) {
-    return { ...base, error: `Metabase reachable, but the leads query failed: ${segRes.error}` };
+  // ONE scan. This used to be four concurrent queries (segment totals, AI by
+  // source, stage, state) plus the audit — five full passes over `leads` in the
+  // same range, each re-evaluating the same per-row JSON extraction, which is
+  // what pushed it past the 20s ceiling.
+  //
+  // They all aggregate the same rows, so a single pass grouped by the four
+  // low-cardinality dimensions carries everything, and the roll-ups are done in
+  // JS below. `aisrc` is NULL for non-AI rows on purpose: it keeps the free-text
+  // source out of the grouping key except where it's actually needed, so the
+  // result stays a few hundred rows rather than one per campaign.
+  const scanRes = await mbQueryEx(
+    `SELECT sub, aisrc, stage, st, count(*) n FROM (` +
+      `SELECT ${SUB} sub, ` +
+      `CASE WHEN ${IS_AI} THEN COALESCE(NULLIF(${utmSource}, ''), LOWER(enquiry_source)) END aisrc, ` +
+      `CAST(status AS CHAR) stage, CAST(state AS CHAR) st ` +
+      `FROM leads WHERE ${range}` +
+      `) t GROUP BY 1,2,3,4`,
+    true,
+    35000, // now the only default query, and the route allows 45s
+  );
+  if ("error" in scanRes) {
+    return { ...base, error: `Metabase reachable, but the leads query failed: ${scanRes.error}` };
   }
-  const segRows = segRes.rows;
 
-  for (const r of segRows) {
+  const aiSrc = new Map<string, number>();
+  const stageAcc = new Map<string, number>(); // "seg|stage" → n
+  const statusAcc = new Map<string, number>();
+  for (const r of scanRes.rows) {
     const sub = String(r[0] ?? "");
-    const n = Number(r[1] ?? 0);
-    if (sub === "ai") base.aiLeads = n;
-    else if (sub === "website") base.websiteNoUtm = n;
-    else if (sub === "popup") base.popup = n;
+    const src = r[1] == null ? "" : String(r[1]);
+    const stage = String(r[2] ?? "");
+    const st = String(r[3] ?? "");
+    const n = Number(r[4] ?? 0);
+    if (sub === "ai") base.aiLeads += n;
+    else if (sub === "website") base.websiteNoUtm += n;
+    else if (sub === "popup") base.popup += n;
+    const seg = segOf(sub);
+    if (seg === "ai" && src) aiSrc.set(src, (aiSrc.get(src) ?? 0) + n);
+    if (seg === "ai" || seg === "organic") {
+      stageAcc.set(`${seg}|${stage}`, (stageAcc.get(`${seg}|${stage}`) ?? 0) + n);
+      statusAcc.set(`${seg}|${st}`, (statusAcc.get(`${seg}|${st}`) ?? 0) + n);
+    }
   }
   base.organicLeads = base.websiteNoUtm + base.popup;
-  base.aiBySource = (srcRows ?? []).map((r) => ({ source: String(r[0] ?? "(unknown)"), n: Number(r[1] ?? 0) }));
-  base.stage = (stageRows ?? []).map((r) => ({ segment: String(r[0] ?? ""), stage: String(r[1] ?? ""), n: Number(r[2] ?? 0) }));
-  base.status = (statusRows ?? []).map((r) => ({ segment: String(r[0] ?? ""), status: String(r[1] ?? ""), n: Number(r[2] ?? 0) }));
+  base.aiBySource = [...aiSrc].map(([source, n]) => ({ source, n })).sort((a, b) => b.n - a.n);
+  // Same shape and ordering the four separate queries produced (seg, then n desc).
+  const split = (m: Map<string, number>) =>
+    [...m].map(([k, n]) => ({ seg: k.slice(0, k.indexOf("|")), label: k.slice(k.indexOf("|") + 1), n }))
+      .sort((a, b) => (a.seg === b.seg ? b.n - a.n : a.seg < b.seg ? -1 : 1));
+  base.stage = split(stageAcc).map((r) => ({ segment: r.seg, stage: r.label, n: r.n }));
+  base.status = split(statusAcc).map((r) => ({ segment: r.seg, status: r.label, n: r.n }));
+
+  // The audit is a second full scan with five JSON extractions per row, so it
+  // only runs when the table is actually opened.
+  const auditRows = opts?.audit
+    ? await mbQuery(
+        `SELECT es, us, um, seg, count(*) n FROM (` +
+          `SELECT ${audit(`LOWER(TRIM(enquiry_source))`)} es, ${audit(utmSource)} us, ${audit(utmMedium)} um, ${SEG} seg ` +
+          `FROM leads WHERE ${range}` +
+          `) t GROUP BY 1,2,3,4 ORDER BY n DESC LIMIT 60`,
+        true,
+        35000,
+      )
+    : null;
   base.sourceAudit = (auditRows ?? []).map((r) => ({
     enquirySource: String(r[0] ?? "(none)"),
     utmSource: String(r[1] ?? "(none)"),
