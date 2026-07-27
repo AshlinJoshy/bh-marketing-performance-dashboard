@@ -60,6 +60,9 @@ export interface WebMetrics {
   humansOnly: boolean; // is the bot filter applied
   days: number;
   label: string; // human range label
+  from: string; // resolved range start, YYYY-MM-DD — seeds the client date pickers
+  to: string; // resolved range end, YYYY-MM-DD
+  generatedAt: string; // when PostHog was queried, ISO — the "updated" stamp
   overview: { pageviews: number; visitors: number; sessions: number; organic: number } | null;
   bots: { pageviews: number; pct: number }; // automated traffic detected in range
   trend: { day: string; pageviews: number; visitors: number }[];
@@ -257,8 +260,15 @@ export async function getWebMetrics(daysRaw = 30, fromRaw?: string, toRaw?: stri
   // including the journey flow.
   since += ` AND (lower(properties.$host) = 'bhomes.com' OR lower(properties.$host) LIKE '%.bhomes.com')`;
 
+  // Resolve the range on the server so the client never derives dates itself —
+  // a `new Date()` in a useState initialiser renders differently on server and
+  // client and trips hydration.
+  const ymdOf = (d: Date) => d.toISOString().slice(0, 10);
+  const resolvedTo = from && to && from <= to ? to : ymdOf(new Date());
+  const resolvedFrom = from && to && from <= to ? from : ymdOf(new Date(Date.now() - (days - 1) * 864e5));
+
   const key = process.env.POSTHOG_API_KEY;
-  const base: WebMetrics = { connected: !!key, hasData: false, humansOnly, days, label, overview: null, bots: { pageviews: 0, pct: 0 }, trend: [], topPages: [], sources: [], countries: [], flow: { nodes: [], links: [], sessions: 0 } };
+  const base: WebMetrics = { connected: !!key, hasData: false, humansOnly, days, label, from: resolvedFrom, to: resolvedTo, generatedAt: new Date().toISOString(), overview: null, bots: { pageviews: 0, pct: 0 }, trend: [], topPages: [], sources: [], countries: [], flow: { nodes: [], links: [], sessions: 0 } };
   if (!key) return base;
 
   const pv = `event = '$pageview'`;
@@ -301,6 +311,9 @@ export async function getWebMetrics(daysRaw = 30, fromRaw?: string, toRaw?: stri
     humansOnly,
     days,
     label,
+    from: resolvedFrom,
+    to: resolvedTo,
+    generatedAt: new Date().toISOString(),
     overview,
     bots: { pageviews: botPv, pct: botPct },
     trend: (tr ?? []).map((r) => ({ day: String(r[0]), pageviews: Number(r[1] || 0), visitors: Number(r[2] || 0) })),

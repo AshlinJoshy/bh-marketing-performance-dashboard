@@ -42,12 +42,18 @@ export async function getMentions(): Promise<MentionsResult> {
         sentiment: r.sentiment as Sentiment,
         source: r.source ?? "historical_import",
       }));
-      const outlets: Outlet[] = (oRes.data ?? []).map((o) => ({
-        outlet: o.name,
-        tier: o.tier as Tier,
-        default_eav: o.default_eav,
-        default_reach: o.default_reach,
-      }));
+      // The rate card only fills gaps, so an unseeded `outlets` table would
+      // silently zero the EAV/reach of every clip that has no figure of its own
+      // (most of them — the historical import carries tier but not value). Fall
+      // back to the bundled card in that case rather than reporting zeros.
+      const outlets: Outlet[] = oRes.data?.length
+        ? oRes.data.map((o) => ({
+            outlet: o.name,
+            tier: o.tier as Tier,
+            default_eav: o.default_eav,
+            default_reach: o.default_reach,
+          }))
+        : (outletsJson as unknown as Outlet[]);
       return { source: "supabase", mentions: enrichMentions(raw, outlets) };
     }
   }

@@ -17,6 +17,8 @@ export interface SeoData {
   keywords: string[];
   traffic: SeoTraffic;
   gsc: GscData;
+  /** When the sources were queried, ISO — the "updated" stamp. */
+  generatedAt: string;
 }
 
 const isDate = (s?: string): string | null => (s && /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null);
@@ -34,7 +36,7 @@ export async function getSeoData(fromRaw?: string, toRaw?: string): Promise<SeoD
   const { from, to } = seoRange(fromRaw, toRaw);
   const cfg = await getSeoConfig();
   const [traffic, gsc] = await Promise.all([getSeoTraffic(from, to), getGscMetrics(from, to, cfg.keywords)]);
-  return { from, to, label: `${from} → ${to}`, keywords: cfg.keywords, traffic, gsc };
+  return { from, to, label: `${from} → ${to}`, keywords: cfg.keywords, traffic, gsc, generatedAt: new Date().toISOString() };
 }
 
 /** Slow half: Metabase leads (fetched separately, client-side). */

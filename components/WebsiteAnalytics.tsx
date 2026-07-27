@@ -21,8 +21,8 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
   const [data, setData] = useState<WebMetrics>(initial);
   const [mode, setMode] = useState<"preset" | "custom">("preset");
   const [days, setDays] = useState<number>(initial.days || 30);
-  const [from, setFrom] = useState<string>(ymd(new Date(Date.now() - 30 * 864e5)));
-  const [to, setTo] = useState<string>(ymd(new Date()));
+  const [from, setFrom] = useState<string>(initial.from);
+  const [to, setTo] = useState<string>(initial.to);
   const [loading, setLoading] = useState(false);
   const [live, setLive] = useState(true);
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
@@ -59,8 +59,6 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
     [humansOnly, flowPages, flowExact],
   );
   const qsFor = useCallback(() => `${rangeQs()}${tail()}`, [rangeQs, tail]);
-
-  useEffect(() => setUpdatedAt(new Date().toLocaleTimeString()), []);
 
   // Silent auto-refresh every 60s while Live (no overlay flash).
   useEffect(() => {
@@ -125,7 +123,9 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
           {data.connected && <span className="pulse-dot" style={{ background: live ? C.green : C.sand }} />}
           <span style={{ fontSize: 12, color: C.mid }}>
             {data.connected ? (live ? "Live" : "Paused") : "Not connected"}
-            {updatedAt ? ` · updated ${updatedAt}` : ""}
+            {(updatedAt ?? (data.generatedAt ? new Date(data.generatedAt).toLocaleTimeString() : null)) ? (
+              <span suppressHydrationWarning> · updated {updatedAt ?? new Date(data.generatedAt).toLocaleTimeString()}</span>
+            ) : null}
           </span>
         </span>
       </div>

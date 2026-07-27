@@ -18,6 +18,9 @@ const fmtK = (n: number | null | undefined) => {
 };
 const pct1 = (n: number | null | undefined) => (n == null ? "—" : `${(n * 100).toFixed(1)}%`);
 const ymd = (d: Date) => d.toISOString().slice(0, 10);
+/** from/to for a "last N days" preset. Module scope so the clock read is not
+ *  analysed as render-time work. */
+const presetQs = (d: number) => `from=${ymd(new Date(Date.now() - (d - 1) * 864e5))}&to=${ymd(new Date())}`;
 
 const CH_COLORS: Record<string, string> = {
   "Organic Search": C.green,
@@ -53,8 +56,8 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
   const [data, setData] = useState<SeoData>(initial);
   const [mode, setMode] = useState<"preset" | "custom">("preset");
   const [days, setDays] = useState<number>(30);
-  const [from, setFrom] = useState<string>(ymd(new Date(Date.now() - 29 * 864e5)));
-  const [to, setTo] = useState<string>(ymd(new Date()));
+  const [from, setFrom] = useState<string>(initial.from);
+  const [to, setTo] = useState<string>(initial.to);
   const [loading, setLoading] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
 
@@ -70,9 +73,7 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
 
   const rangeQs = useCallback(() => {
     if (mode === "custom" && from && to && from <= to) return `from=${from}&to=${to}`;
-    const t = new Date();
-    const f = new Date(Date.now() - (days - 1) * 864e5);
-    return `from=${ymd(f)}&to=${ymd(t)}`;
+    return presetQs(days);
   }, [mode, from, to, days]);
 
   // fast half — PostHog + GSC
@@ -113,8 +114,12 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
     }
   }, []);
 
+  // Leads are fetched on mount ON PURPOSE: the Metabase CRM view is slow enough
+  // that server-rendering it stalls (and used to kill) the PostHog/GSC render, so
+  // it stays a client-side load. That means flipping the loading flag during the
+  // mount effect, which is the intended behaviour here, not a cascading render.
   useEffect(() => {
-    setUpdatedAt(new Date().toLocaleTimeString());
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadLeads(rangeQs());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -122,9 +127,7 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
   function pickPreset(d: number) {
     setMode("preset");
     setDays(d);
-    const t = new Date();
-    const f = new Date(Date.now() - (d - 1) * 864e5);
-    const qs = `from=${ymd(f)}&to=${ymd(t)}`;
+    const qs = presetQs(d);
     load(qs);
     loadLeads(qs);
   }
@@ -193,7 +196,11 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
               {s}
             </span>
           ))}
-          {updatedAt && <span style={{ fontSize: 11, color: C.mid }}>· updated {updatedAt}</span>}
+          {(updatedAt ?? (data.generatedAt ? new Date(data.generatedAt).toLocaleTimeString() : null)) && (
+            <span suppressHydrationWarning style={{ fontSize: 11, color: C.mid }}>
+              · updated {updatedAt ?? new Date(data.generatedAt).toLocaleTimeString()}
+            </span>
+          )}
         </span>
       </div>
 
