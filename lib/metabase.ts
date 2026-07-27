@@ -91,7 +91,8 @@ async function mbSessionToken(): Promise<string | null> {
   }
 }
 
-async function mbQuery(sql: string, retry = true): Promise<any[][] | null> {
+/** Run native SQL against the CRM database. Shared with lib/company.ts. */
+export async function mbQuery(sql: string, retry = true, timeoutMs = 20000): Promise<any[][] | null> {
   const url = process.env.METABASE_URL;
   if (!url) return null;
   const apiKey = process.env.METABASE_API_KEY;
@@ -104,7 +105,7 @@ async function mbQuery(sql: string, retry = true): Promise<any[][] | null> {
     headers["X-Metabase-Session"] = token;
   }
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 20000);
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(`${url.replace(/\/$/, "")}/api/dataset`, {
       method: "POST",
@@ -116,7 +117,7 @@ async function mbQuery(sql: string, retry = true): Promise<any[][] | null> {
     if (res.status === 401 && !apiKey && retry) {
       mbSession = null; // expired session — re-auth once
       clearTimeout(t);
-      return mbQuery(sql, false);
+      return mbQuery(sql, false, timeoutMs);
     }
     if (!res.ok) {
       console.error(`[metabase] dataset HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);

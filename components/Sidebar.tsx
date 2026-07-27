@@ -12,6 +12,7 @@ const NAV: NavItem[] = [
   { href: "/website", label: "Website", icon: "🌐" },
   { href: "/seo", label: "SEO", icon: "🔍" },
   { href: "/digital", label: "Digital Performance", icon: "📈", soon: true },
+  { href: "/company", label: "Company Performance", icon: "🏢" },
   { href: "/portals", label: "Portals", icon: "🏠", soon: true },
 ];
 
