@@ -354,34 +354,67 @@ export interface SeoTraffic {
   totalSessions: number;
   byChannel: { channel: string; pageviews: number; sessions: number }[];
   aiBySource: { source: string; sessions: number }[];
+  /** Individual property pages ranked by views. */
+  propertyViews: PropertyView[];
   /**
-   * Individual property pages ranked by lead actions — a WhatsApp or call-button
-   * click on the page itself.
+   * Landing pages that organic search visitors arrived on, ranked by views.
    *
-   * This has to come from PostHog rather than the CRM. The CRM records no
-   * bhomes.com property URL at all (its `tracking_link` for these is a portal
-   * webhook endpoint), and its only property link, `leadable_id`, is used
-   * exclusively for listing-side leads — Landlord and Seller, never Buyer or
-   * Tenant. So a buyer's enquiry is not connected to the listing they enquired
-   * about anywhere in the CRM. PostHog sees the click on the page, which is the
-   * one place that connection exists.
+   * A pageview's own `$referring_domain` is a search engine only on the entry
+   * hit — internal navigation carries a bhomes.com referrer — so filtering
+   * pageviews that way yields entry pages by construction. That is exactly what
+   * a landing page is, which is why this needs no per-session pass.
    */
-  propertyLeads: PropertyLead[];
+  organicPages: OrganicPage[];
   /** byChannel came from entry-level attribution, not the per-session pass. */
   approxChannels?: boolean;
   error?: string;
 }
 
-export interface PropertyLead {
+export interface PropertyView {
   /** e.g. bh-s-289607 */
   slug: string;
   path: string;
   /** Read off the slug: bh-s-… is for sale, bh-r-… is to rent. */
   kind: "buy" | "rent" | "other";
-  whatsapp: number;
-  phone: number;
-  total: number;
+  views: number;
+  visitors: number;
 }
+
+export interface OrganicPage {
+  path: string;
+  /** Key from PAGE_SECTIONS below. */
+  category: string;
+  views: number;
+  visitors: number;
+}
+
+/**
+ * Landing-page sections, matched against the path in order — first hit wins.
+ *
+ * Derived from what bhomes.com actually serves, not guessed: the site uses
+ * /en/sales/… and /en/rentals/… rather than /buy/ and /rent/, so those are the
+ * primary rules and the /buy…, for-sale, off-plan variants are there to catch
+ * URL shapes that may appear later. The two prefix rules (blog, area guides)
+ * come first deliberately, so a blog post about property management is filed as
+ * a blog post rather than by the topic word in its slug.
+ */
+const PAGE_SECTIONS: { key: string; label: string; test: (p: string) => boolean }[] = [
+  { key: "property", label: "Property listings", test: (p) => p.startsWith("/en/property/") },
+  { key: "blog", label: "Blog", test: (p) => p.startsWith("/en/blog/") },
+  { key: "area", label: "Area guides", test: (p) => p.startsWith("/en/area-guides/") },
+  { key: "buy", label: "Buy", test: (p) => p.startsWith("/en/sales/") || p.startsWith("/en/buy") || p.includes("for-sale") },
+  { key: "rent", label: "Rent", test: (p) => p.startsWith("/en/rentals/") || p.startsWith("/en/rent") || p.includes("for-rent") },
+  { key: "list", label: "List your property", test: (p) => p.includes("list-your-property") },
+  { key: "valuation", label: "Valuation", test: (p) => p.includes("valuation") },
+  { key: "manage", label: "Property management", test: (p) => p.includes("property-management") },
+  { key: "newproj", label: "New projects", test: (p) => p.includes("new-project") || p.includes("off-plan") },
+  { key: "commercial", label: "Commercial", test: (p) => p.includes("commercial") || p.includes("development-sales") },
+];
+export const PAGE_SECTION_LABELS: Record<string, string> = {
+  ...Object.fromEntries(PAGE_SECTIONS.map((s) => [s.key, s.label])),
+  other: "Other",
+};
+const sectionOf = (path: string) => PAGE_SECTIONS.find((s) => s.test(path))?.key ?? "other";
 
 export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 30): Promise<SeoTraffic> {
   const key = process.env.POSTHOG_API_KEY;
@@ -398,7 +431,7 @@ export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 
     label = `last ${days} days`;
   }
   since += ` AND (lower(properties.$host) = 'bhomes.com' OR lower(properties.$host) LIKE '%.bhomes.com')`;
-  const base: SeoTraffic = { connected: !!key, label, totalPageviews: 0, organicPageviews: 0, aiSessions: 0, totalSessions: 0, byChannel: [], aiBySource: [], propertyLeads: [] };
+  const base: SeoTraffic = { connected: !!key, label, totalPageviews: 0, organicPageviews: 0, aiSessions: 0, totalSessions: 0, byChannel: [], aiBySource: [], propertyViews: [], organicPages: [] };
   if (!key) return base;
 
   // Same bot definition as the Website tab — always on here (the SEO tab has no
@@ -415,26 +448,10 @@ export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 
   const aiRefEvent = `(properties.$referring_domain LIKE '%chatgpt.%' OR properties.$referring_domain LIKE '%openai.%' OR properties.$referring_domain LIKE '%perplexity.%' OR properties.$referring_domain LIKE '%claude.%' OR properties.$referring_domain LIKE '%gemini.google%' OR properties.$referring_domain LIKE '%copilot.%')`;
 
   const organicRef = SEARCH_ENGINES.map((e) => `properties.$referring_domain LIKE '%${e}%'`).join(" OR ");
-  // What counts as a lead action on a property page. `bh_cta_click` is the only
-  // lead-shaped event that fires there — there is no email-form event on
-  // property pages (lead_blog_form is blog-only), so this is WhatsApp and phone.
-  //
-  // click_text is matched case-insensitively because the site emits both
-  // 'Whatsapp' and 'WhatsApp', and falls back to click_classes because
-  // icon-only buttons record click_text as the boolean false rather than a
-  // label — their only identifying mark is the lucide icon class.
-  //
-  // These use the same bot filter as everything else on the tab. Worth knowing:
-  // BOT_EXPR treats desktop Linux as automated, which is sound for pageview
-  // volume but strict for a deliberate button click, so this may undercount by
-  // the small share of genuine Linux users. Kept anyway — one shared definition
-  // of "bot" is worth more than a per-card exception, which is how the Website
-  // and SEO tabs drifted apart before.
-  const ctaText = `lower(toString(properties.click_text))`;
-  const ctaClass = `toString(properties.click_classes)`;
-  const IS_WA = `(${ctaText} LIKE '%whatsapp%' OR ${ctaClass} LIKE '%message-circle%')`;
-  const IS_TEL = `(${ctaText} IN ('call','phone') OR ${ctaClass} LIKE '%lucide-phone%')`;
-  const [chanRows, aiRows, totalRows, propRows] = await Promise.all([
+  // Both page rankings report views alongside unique visitors. Views alone can
+  // be one person reloading; the pair shows which it is, and the ratio is itself
+  // informative on a property listing.
+  const [chanRows, aiRows, totalRows, propRows, pageRows] = await Promise.all([
     // best-effort: per-session channel breakdown (powers the "by channel" chart)
     hogql(`SELECT ${chan} AS channel, sum(pv) AS pageviews, count() AS sessions FROM (${inner}) GROUP BY channel ORDER BY pageviews DESC`, 25000),
     // cheap: AI sessions by LLM referrer
@@ -442,12 +459,19 @@ export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 
     // cheap + GUARANTEED: headline totals in a single scan (no per-session pass),
     // so the KPIs are always populated even if the channel breakdown times out.
     hogql(`SELECT count() AS total, countIf(${organicRef}) AS organic, count(DISTINCT properties.$session_id) AS sessions FROM events WHERE event = '$pageview' AND ${since}${human}`),
-    // cheap: lead actions per individual property page. More than the five shown
-    // are fetched so the buy/rent filter has rows to work with without a refetch.
+    // cheap: views per individual property page. More than the five shown are
+    // fetched so the buy/rent filter has rows to work with without a refetch.
     hogql(
-      `SELECT properties.$pathname AS path, countIf(${IS_WA}) AS wa, countIf(${IS_TEL}) AS tel, count() AS total ` +
-        `FROM events WHERE event = 'bh_cta_click' AND properties.$pathname LIKE '/en/property/%' AND ${since}${human} ` +
-        `GROUP BY path ORDER BY total DESC LIMIT 60`,
+      `SELECT properties.$pathname AS path, count() AS views, count(DISTINCT properties.$session_id) AS visitors ` +
+        `FROM events WHERE event = '$pageview' AND properties.$pathname LIKE '/en/property/%' AND ${since}${human} ` +
+        `GROUP BY path ORDER BY views DESC LIMIT 60`,
+    ),
+    // cheap: organic landing pages. The search-engine referrer restricts this to
+    // entry hits on its own, so no per-session pass is needed.
+    hogql(
+      `SELECT properties.$pathname AS path, count() AS views, count(DISTINCT properties.$session_id) AS visitors ` +
+        `FROM events WHERE event = '$pageview' AND (${organicRef}) AND ${since}${human} ` +
+        `GROUP BY path ORDER BY views DESC LIMIT 80`,
     ),
   ]);
 
@@ -458,17 +482,20 @@ export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 
   }
   base.aiBySource = (aiRows ?? []).map((r) => ({ source: String(r[0] || "(unknown)"), sessions: Number(r[1] || 0) }));
 
-  base.propertyLeads = (propRows ?? []).map((r) => {
+  base.propertyViews = (propRows ?? []).map((r) => {
     const path = String(r[0] || "");
     const slug = path.slice(path.lastIndexOf("/") + 1);
     return {
       slug,
       path,
       kind: slug.startsWith("bh-s-") ? "buy" : slug.startsWith("bh-r-") ? "rent" : "other",
-      whatsapp: Number(r[1] || 0),
-      phone: Number(r[2] || 0),
-      total: Number(r[3] || 0),
-    } satisfies PropertyLead;
+      views: Number(r[1] || 0),
+      visitors: Number(r[2] || 0),
+    } satisfies PropertyView;
+  });
+  base.organicPages = (pageRows ?? []).map((r) => {
+    const path = String(r[0] || "");
+    return { path, category: sectionOf(path), views: Number(r[1] || 0), visitors: Number(r[2] || 0) } satisfies OrganicPage;
   });
 
   // Headline numbers come from the guaranteed cheap query (never 0 when data exists).

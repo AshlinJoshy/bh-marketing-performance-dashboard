@@ -7,7 +7,8 @@ import HelpTip from "@/components/HelpTip";
 import { saveSeoConfigAction } from "@/app/actions";
 import { C } from "@/lib/theme";
 import type { SeoData } from "@/lib/seo";
-import { PAGE_SECTION_LABELS, type LeadsData } from "@/lib/metabase";
+import type { LeadsData } from "@/lib/metabase";
+import { PAGE_SECTION_LABELS } from "@/lib/posthog";
 
 const fmt = (n: number | null | undefined) => (n == null ? "—" : new Intl.NumberFormat("en-US").format(Math.round(n)));
 const fmtK = (n: number | null | undefined) => {
@@ -38,8 +39,7 @@ const STATUS_ORDER = ["Open", "Closed", "Completed"];
 // a stale object literal behind.
 const emptyLeads = (error: string): LeadsData => ({
   connected: true, label: "", aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0,
-  aiBySource: [], stage: [], status: [], sourceAudit: [], topPages: [],
-  pageCoverage: { withPage: 0, organic: 0 }, error,
+  aiBySource: [], stage: [], status: [], sourceAudit: [], error,
 });
 
 function ConnectCard({ title, lines }: { title: string; lines: string[] }) {
@@ -132,36 +132,36 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
    */
   const [propFilter, setPropFilter] = useState<"all" | "buy" | "rent">("all");
   const propCounts = useMemo(() => {
-    const rows = data.traffic.propertyLeads ?? [];
+    const rows = data.traffic.propertyViews ?? [];
     return {
       all: rows.length,
       buy: rows.filter((p) => p.kind === "buy").length,
       rent: rows.filter((p) => p.kind === "rent").length,
     };
-  }, [data.traffic.propertyLeads]);
+  }, [data.traffic.propertyViews]);
   const activeProp = propFilter !== "all" && propCounts[propFilter] === 0 ? "all" : propFilter;
   const topProperties = useMemo(
-    () => (data.traffic.propertyLeads ?? []).filter((p) => activeProp === "all" || p.kind === activeProp).slice(0, 5),
-    [data.traffic.propertyLeads, activeProp],
+    () => (data.traffic.propertyViews ?? []).filter((p) => activeProp === "all" || p.kind === activeProp).slice(0, 5),
+    [data.traffic.propertyViews, activeProp],
   );
 
-  // Landing-page section filter. The rows all arrive with the leads payload, so
+  // Landing-page section filter. Rows arrive with the traffic payload, so
   // switching sections is instant and costs no extra query.
   const [pageFilter, setPageFilter] = useState<string>("all");
   const pageSections = useMemo(() => {
     const acc = new Map<string, number>();
-    for (const p of leads?.topPages ?? []) acc.set(p.category, (acc.get(p.category) ?? 0) + p.n);
-    // Only sections that actually have leads get a chip — an empty "New projects"
-    // filter is just noise.
+    for (const p of data.traffic.organicPages ?? []) acc.set(p.category, (acc.get(p.category) ?? 0) + p.views);
+    // Only sections with views get a chip — an empty "New projects" filter is
+    // just noise.
     return [...acc].map(([key, n]) => ({ key, n })).sort((a, b) => b.n - a.n);
-  }, [leads?.topPages]);
-  // If the chosen section has no leads in the new range, fall back to All rather
+  }, [data.traffic.organicPages]);
+  // If the chosen section has nothing in the new range, fall back to All rather
   // than showing an empty table. Derived from the data instead of synced back
   // into state, so there's no cascading render.
   const activeSection = pageFilter !== "all" && !pageSections.some((s) => s.key === pageFilter) ? "all" : pageFilter;
   const topPages = useMemo(
-    () => (leads?.topPages ?? []).filter((p) => activeSection === "all" || p.category === activeSection).slice(0, 5),
-    [leads?.topPages, activeSection],
+    () => (data.traffic.organicPages ?? []).filter((p) => activeSection === "all" || p.category === activeSection).slice(0, 5),
+    [data.traffic.organicPages, activeSection],
   );
 
   /**
@@ -367,15 +367,54 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
             </div>
           </div>
 
-          {/* Individual property pages by lead action. PostHog, not the CRM —
-              the CRM has no link between a buyer/tenant enquiry and the listing
-              it came from, so the click on the page is the only signal. */}
+          {/* Organic landing pages by views. PostHog, so it sits outside the
+              Metabase block below — it must not disappear when the CRM is down. */}
           <div className="chart-card" style={{ marginTop: 4 }}>
             <div className="chart-title">
-              Top properties by leads <HelpTip text="Individual property pages ranked by lead actions — WhatsApp and call-button clicks on the page. From PostHog, bots excluded. Buy vs rent is read from the listing reference: bh-s- is for sale, bh-r- is to rent." />
+              Top organic landing pages <HelpTip text="The pages search visitors arrived on, ranked by views, with unique visitors alongside. A pageview only carries a search-engine referrer on the entry hit, so these are landing pages by construction. From PostHog, bots excluded." />
             </div>
             <div className="chart-sub">
-              WhatsApp + call clicks · {activeProp === "all" ? "buy and rent" : activeProp === "buy" ? "for sale" : "to rent"} · {traffic.label}
+              Entry views from search · {activeSection === "all" ? "all sections" : PAGE_SECTION_LABELS[activeSection] ?? activeSection} · {traffic.label}
+            </div>
+            {pageSections.length > 1 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, margin: "10px 0 4px" }}>
+                <button className={`filter-btn${activeSection === "all" ? " active" : ""}`} onClick={() => setPageFilter("all")}>All</button>
+                {pageSections.map((s) => (
+                  <button key={s.key} className={`filter-btn${activeSection === s.key ? " active" : ""}`} onClick={() => setPageFilter(s.key)}>
+                    {PAGE_SECTION_LABELS[s.key] ?? s.key} ({fmtK(s.n)})
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="table-scroll">
+              <table className="perf-table">
+                <thead><tr><th>Page</th><th>Section</th><th style={{ textAlign: "right" }}>Visitors</th><th style={{ textAlign: "right" }}>Views</th></tr></thead>
+                <tbody>
+                  {topPages.map((p) => (
+                    <tr key={p.path}>
+                      <td><a href={`https://www.bhomes.com${p.path}`} target="_blank" rel="noopener noreferrer">{p.path}</a></td>
+                      <td className="muted">{PAGE_SECTION_LABELS[p.category] ?? p.category}</td>
+                      <td style={{ textAlign: "right" }}>{fmt(p.visitors)}</td>
+                      <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(p.views)}</td>
+                    </tr>
+                  ))}
+                  {topPages.length === 0 && (
+                    <tr><td colSpan={4} className="muted">No organic entry pageviews in range.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Most-viewed individual property pages. PostHog — the CRM stores no
+              bhomes.com property URL at all, so page-level figures can only come
+              from analytics. */}
+          <div className="chart-card" style={{ marginTop: 4 }}>
+            <div className="chart-title">
+              Top properties by views <HelpTip text="Individual property pages ranked by pageviews, with unique visitors alongside so repeat views are visible. From PostHog, bots excluded. Buy vs rent is read from the listing reference: bh-s- is for sale, bh-r- is to rent." />
+            </div>
+            <div className="chart-sub">
+              Pageviews · {activeProp === "all" ? "buy and rent" : activeProp === "buy" ? "for sale" : "to rent"} · {traffic.label}
             </div>
             {propCounts.all > 0 && (
               <div style={{ display: "flex", flexWrap: "wrap", gap: 6, margin: "10px 0 4px" }}>
@@ -386,26 +425,21 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
             )}
             <div className="table-scroll">
               <table className="perf-table">
-                <thead><tr><th>Property</th><th>For</th><th style={{ textAlign: "right" }}>WhatsApp</th><th style={{ textAlign: "right" }}>Call</th><th style={{ textAlign: "right" }}>Leads</th></tr></thead>
+                <thead><tr><th>Property</th><th>For</th><th style={{ textAlign: "right" }}>Visitors</th><th style={{ textAlign: "right" }}>Views</th></tr></thead>
                 <tbody>
                   {topProperties.map((p) => (
                     <tr key={p.path}>
                       <td><a href={`https://www.bhomes.com${p.path}`} target="_blank" rel="noopener noreferrer">{p.slug}</a></td>
                       <td className="muted">{p.kind === "buy" ? "Sale" : p.kind === "rent" ? "Rent" : "—"}</td>
-                      <td style={{ textAlign: "right" }}>{fmt(p.whatsapp)}</td>
-                      <td style={{ textAlign: "right" }}>{fmt(p.phone)}</td>
-                      <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(p.total)}</td>
+                      <td style={{ textAlign: "right" }}>{fmt(p.visitors)}</td>
+                      <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(p.views)}</td>
                     </tr>
                   ))}
                   {topProperties.length === 0 && (
-                    <tr><td colSpan={5} className="muted">No property-page lead actions in range.</td></tr>
+                    <tr><td colSpan={4} className="muted">No property pageviews in range.</td></tr>
                   )}
                 </tbody>
               </table>
-            </div>
-            <div className="chart-sub" style={{ marginTop: 10 }}>
-              Counts clicks on the WhatsApp and call buttons. Property pages carry no email form, so there is nothing to count there —
-              enquiries submitted by form land in the CRM without the listing attached, and cannot be credited to a property.
             </div>
           </div>
 
@@ -466,48 +500,6 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
                 <div className="kpi-card"><div className="kpi-label">Website · no UTM <HelpTip text="Website enquiries carrying no UTM source — the organic share on its own, excluding pop-up leads. Source: Metabase." /></div><div className="kpi-value">{fmt(leads.websiteNoUtm)}</div></div>
               </div>
 
-              <div className="chart-card">
-                <div className="chart-title">
-                  Top organic landing pages <HelpTip text="Which pages on bhomes.com the organic leads came from, ranked by lead count. Only counts leads whose record carries a landing page — see the note under the table." />
-                </div>
-                <div className="chart-sub">
-                  {activeSection === "all" ? "All sections" : PAGE_SECTION_LABELS[activeSection] ?? activeSection} · {leads.label}
-                </div>
-                {pageSections.length > 1 && (
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, margin: "10px 0 4px" }}>
-                    <button className={`filter-btn${activeSection === "all" ? " active" : ""}`} onClick={() => setPageFilter("all")}>All</button>
-                    {pageSections.map((s) => (
-                      <button key={s.key} className={`filter-btn${activeSection === s.key ? " active" : ""}`} onClick={() => setPageFilter(s.key)}>
-                        {PAGE_SECTION_LABELS[s.key] ?? s.key} ({s.n})
-                      </button>
-                    ))}
-                  </div>
-                )}
-                <div className="table-scroll">
-                  <table className="perf-table">
-                    <thead><tr><th>Page</th><th>Section</th><th style={{ textAlign: "right" }}>Leads</th></tr></thead>
-                    <tbody>
-                      {topPages.map((p) => (
-                        <tr key={p.path}>
-                          <td><a href={`https://www.bhomes.com${p.path}`} target="_blank" rel="noopener noreferrer">{p.path}</a></td>
-                          <td className="muted">{PAGE_SECTION_LABELS[p.category] ?? p.category}</td>
-                          <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(p.n)}</td>
-                        </tr>
-                      ))}
-                      {topPages.length === 0 && (
-                        <tr><td colSpan={3} className="muted">No organic leads carry a landing page in this range.</td></tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-                {leads.pageCoverage.withPage > 0 && (
-                  <div className="chart-sub" style={{ marginTop: 10 }}>
-                    Based on {fmt(leads.pageCoverage.withPage)} of {fmt(leads.pageCoverage.organic)} organic leads
-                    {leads.pageCoverage.organic > 0 && ` (${Math.round((leads.pageCoverage.withPage / leads.pageCoverage.organic) * 100)}%)`}
-                    {" "}— the rest have no landing page recorded in the CRM, so this ranks the pages we can see, not every page that converts.
-                  </div>
-                )}
-              </div>
 
               <div className="charts-grid-2">
                 <div className="chart-card">
