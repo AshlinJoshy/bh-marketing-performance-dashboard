@@ -314,34 +314,28 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
           {/* KPI strip */}
           <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(3,1fr)" }}>
             <div className="kpi-card">
-              <div className="kpi-label">AI referral leads <HelpTip text="Leads whose UTM/source is an LLM (ChatGPT, Perplexity…). From Metabase." /></div>
+              <div className="kpi-label">AI referral leads <HelpTip text={`Leads whose UTM or enquiry source is an LLM (ChatGPT, Perplexity, Claude, Gemini…). Source: Metabase.${!leads ? " Still loading." : leads.connected ? "" : " Metabase is not connected."}`} /></div>
               <div className="kpi-value" style={{ color: C.green }}>{!leads ? "…" : leads.connected ? fmt(leads.aiLeads) : "—"}</div>
-              <div className="kpi-change">{leadsLoading && !leads ? "loading…" : leads?.connected ? "Metabase · LLM sources" : "connect Metabase"}</div>
             </div>
             <div className="kpi-card">
-              <div className="kpi-label">AI sessions <HelpTip text="Website sessions referred by an LLM. From PostHog (humans only)." /></div>
+              <div className="kpi-label">AI sessions <HelpTip text={`Website sessions referred by an LLM. Top referrer in this range: ${aiSources[0]?.source ?? "none"}. Source: PostHog, bots excluded.`} /></div>
               <div className="kpi-value">{fmt(traffic.aiSessions)}</div>
-              <div className="kpi-change">PostHog · {aiSources[0]?.source ?? "—"}</div>
             </div>
             <div className="kpi-card">
-              <div className="kpi-label">Organic clicks <HelpTip text="Google Search Console clicks for the range." /></div>
+              <div className="kpi-label">Organic clicks <HelpTip text={gsc.connected ? `Google Search Console clicks for the range. Click-through rate ${pct1(gsc.totals?.ctr)}. Source: GSC.` : "Google Search Console clicks for the range. Source: GSC — not currently connected."} /></div>
               <div className="kpi-value">{gsc.connected ? fmtK(gsc.totals?.clicks) : "—"}</div>
-              <div className="kpi-change">{gsc.connected ? `GSC · CTR ${pct1(gsc.totals?.ctr)}` : "connect GSC"}</div>
             </div>
             <div className="kpi-card">
-              <div className="kpi-label">Organic impressions <HelpTip text="Google Search Console impressions for the range." /></div>
+              <div className="kpi-label">Organic impressions <HelpTip text={gsc.connected ? `Google Search Console impressions for the range. Average position ${gsc.totals?.position ? gsc.totals.position.toFixed(1) : "—"} (lower is better). Source: GSC.` : "Google Search Console impressions for the range. Source: GSC — not currently connected."} /></div>
               <div className="kpi-value">{gsc.connected ? fmtK(gsc.totals?.impressions) : "—"}</div>
-              <div className="kpi-change">{gsc.connected ? `avg pos ${gsc.totals?.position ? gsc.totals.position.toFixed(1) : "—"}` : "connect GSC"}</div>
             </div>
             <div className="kpi-card">
-              <div className="kpi-label">Organic pageviews <HelpTip text="Pageviews in sessions that arrived from a search engine. PostHog." /></div>
+              <div className="kpi-label">Organic pageviews <HelpTip text="Pageviews in sessions that arrived from a search engine. Source: PostHog, matched on the search referrer, bots excluded." /></div>
               <div className="kpi-value">{fmtK(traffic.organicPageviews)}</div>
-              <div className="kpi-change">PostHog · search referrer</div>
             </div>
             <div className="kpi-card">
-              <div className="kpi-label">Total pageviews</div>
+              <div className="kpi-label">Total pageviews <HelpTip text="Every pageview in the range, across all channels. Source: PostHog, bots excluded." /></div>
               <div className="kpi-value">{fmtK(traffic.totalPageviews)}</div>
-              <div className="kpi-change">PostHog · all channels (humans)</div>
             </div>
           </div>
 
@@ -467,9 +461,9 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
           ) : (
             <>
               <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(3,1fr)" }}>
-                <div className="kpi-card"><div className="kpi-label">AI referral leads</div><div className="kpi-value" style={{ color: C.green }}>{fmt(leads.aiLeads)}</div><div className="kpi-change">LLM UTM source</div></div>
-                <div className="kpi-card"><div className="kpi-label">Organic leads <HelpTip text="Website enquiries with no UTM, plus pop-up leads. The pop-up figure is broken out on the Website tab." /></div><div className="kpi-value">{fmt(leads.organicLeads)}</div><div className="kpi-change">website + pop-up</div></div>
-                <div className="kpi-card"><div className="kpi-label">Website · no UTM</div><div className="kpi-value">{fmt(leads.websiteNoUtm)}</div><div className="kpi-change">enquiries</div></div>
+                <div className="kpi-card"><div className="kpi-label">AI referral leads <HelpTip text="Leads whose UTM source is an LLM domain. Source: Metabase." /></div><div className="kpi-value" style={{ color: C.green }}>{fmt(leads.aiLeads)}</div></div>
+                <div className="kpi-card"><div className="kpi-label">Organic leads <HelpTip text="Website enquiries with no UTM, plus pop-up leads. The pop-up figure is broken out on the Website tab. Source: Metabase." /></div><div className="kpi-value">{fmt(leads.organicLeads)}</div></div>
+                <div className="kpi-card"><div className="kpi-label">Website · no UTM <HelpTip text="Website enquiries carrying no UTM source — the organic share on its own, excluding pop-up leads. Source: Metabase." /></div><div className="kpi-value">{fmt(leads.websiteNoUtm)}</div></div>
               </div>
 
               <div className="chart-card">
