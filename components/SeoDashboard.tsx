@@ -126,6 +126,25 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
     }
   }, []);
 
+  /**
+   * Buy / rent filter for the individual-property card. Rows come from PostHog
+   * with the traffic payload, so switching is instant.
+   */
+  const [propFilter, setPropFilter] = useState<"all" | "buy" | "rent">("all");
+  const propCounts = useMemo(() => {
+    const rows = data.traffic.propertyLeads ?? [];
+    return {
+      all: rows.length,
+      buy: rows.filter((p) => p.kind === "buy").length,
+      rent: rows.filter((p) => p.kind === "rent").length,
+    };
+  }, [data.traffic.propertyLeads]);
+  const activeProp = propFilter !== "all" && propCounts[propFilter] === 0 ? "all" : propFilter;
+  const topProperties = useMemo(
+    () => (data.traffic.propertyLeads ?? []).filter((p) => activeProp === "all" || p.kind === activeProp).slice(0, 5),
+    [data.traffic.propertyLeads, activeProp],
+  );
+
   // Landing-page section filter. The rows all arrive with the leads payload, so
   // switching sections is instant and costs no extra query.
   const [pageFilter, setPageFilter] = useState<string>("all");
@@ -351,6 +370,48 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
                     options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } }, y: { ticks: { autoSkip: false, font: { size: 11 } } } } }} />
                 ) : <div className="empty-state">No AI sessions in range.</div>}
               </div>
+            </div>
+          </div>
+
+          {/* Individual property pages by lead action. PostHog, not the CRM —
+              the CRM has no link between a buyer/tenant enquiry and the listing
+              it came from, so the click on the page is the only signal. */}
+          <div className="chart-card" style={{ marginTop: 4 }}>
+            <div className="chart-title">
+              Top properties by leads <HelpTip text="Individual property pages ranked by lead actions — WhatsApp and call-button clicks on the page. From PostHog, bots excluded. Buy vs rent is read from the listing reference: bh-s- is for sale, bh-r- is to rent." />
+            </div>
+            <div className="chart-sub">
+              WhatsApp + call clicks · {activeProp === "all" ? "buy and rent" : activeProp === "buy" ? "for sale" : "to rent"} · {traffic.label}
+            </div>
+            {propCounts.all > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, margin: "10px 0 4px" }}>
+                <button className={`filter-btn${activeProp === "all" ? " active" : ""}`} onClick={() => setPropFilter("all")}>All ({propCounts.all})</button>
+                <button className={`filter-btn${activeProp === "buy" ? " active" : ""}`} onClick={() => setPropFilter("buy")}>Buy ({propCounts.buy})</button>
+                <button className={`filter-btn${activeProp === "rent" ? " active" : ""}`} onClick={() => setPropFilter("rent")}>Rent ({propCounts.rent})</button>
+              </div>
+            )}
+            <div className="table-scroll">
+              <table className="perf-table">
+                <thead><tr><th>Property</th><th>For</th><th style={{ textAlign: "right" }}>WhatsApp</th><th style={{ textAlign: "right" }}>Call</th><th style={{ textAlign: "right" }}>Leads</th></tr></thead>
+                <tbody>
+                  {topProperties.map((p) => (
+                    <tr key={p.path}>
+                      <td><a href={`https://www.bhomes.com${p.path}`} target="_blank" rel="noopener noreferrer">{p.slug}</a></td>
+                      <td className="muted">{p.kind === "buy" ? "Sale" : p.kind === "rent" ? "Rent" : "—"}</td>
+                      <td style={{ textAlign: "right" }}>{fmt(p.whatsapp)}</td>
+                      <td style={{ textAlign: "right" }}>{fmt(p.phone)}</td>
+                      <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(p.total)}</td>
+                    </tr>
+                  ))}
+                  {topProperties.length === 0 && (
+                    <tr><td colSpan={5} className="muted">No property-page lead actions in range.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div className="chart-sub" style={{ marginTop: 10 }}>
+              Counts clicks on the WhatsApp and call buttons. Property pages carry no email form, so there is nothing to count there —
+              enquiries submitted by form land in the CRM without the listing attached, and cannot be credited to a property.
             </div>
           </div>
 
