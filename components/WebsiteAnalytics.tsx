@@ -67,6 +67,35 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
     return () => clearInterval(id);
   }, [live, qsFor, load]);
 
+  /**
+   * Pop-up lead count, from the CRM via the SEO leads endpoint. Kept in its own
+   * request keyed to the current range: the CRM view is slow and sometimes times
+   * out, and this one number must never be able to delay or blank the PostHog
+   * KPIs it sits beneath.
+   */
+  const [popupRes, setPopupRes] = useState<{ qs: string; n: number | null; err: boolean } | null>(null);
+  const leadsQs = rangeQs();
+  useEffect(() => {
+    let stale = false;
+    (async () => {
+      try {
+        const res = await fetch(`/api/seo/leads?${leadsQs}`, { cache: "no-store" });
+        const json = await res.json();
+        if (stale) return;
+        const ok = res.ok && typeof json?.popup === "number" && !json.error;
+        setPopupRes({ qs: leadsQs, n: ok ? json.popup : null, err: !ok });
+      } catch {
+        if (!stale) setPopupRes({ qs: leadsQs, n: null, err: true });
+      }
+    })();
+    return () => { stale = true; };
+  }, [leadsQs]);
+  // Tagging the result with the range it answers means a result for a range the
+  // user has already moved on from reads as "loading", not as a wrong number.
+  const popupFresh = popupRes?.qs === leadsQs;
+  const popup = popupFresh ? popupRes!.n : null;
+  const popupErr = popupFresh && popupRes!.err;
+
   function pickPreset(d: number) {
     setMode("preset");
     setDays(d);
@@ -243,6 +272,17 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
                   <div className="kpi-label">Organic search <HelpTip text="Sessions that arrived from a search engine (Google, Bing, etc.) — your SEO-driven traffic." /></div>
                   <div className="kpi-value" style={{ color: C.green }}>{fmt(ov!.organic)}</div>
                   <div className="kpi-change up">{organicPct != null ? `${organicPct}% of sessions` : ""}</div>
+                </div>
+              </div>
+
+              {/* Pop-up leads come from the CRM, not PostHog, so this is fetched
+                  separately — a slow or failing CRM query must not hold up or
+                  blank out the traffic KPIs above. */}
+              <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(4,1fr)" }}>
+                <div className="kpi-card">
+                  <div className="kpi-label">Website pop-up leads <HelpTip text="Leads captured by the on-site pop-up, counted in the CRM for this date range. Sourced from Metabase, not PostHog." /></div>
+                  <div className="kpi-value">{popupErr ? "—" : popup == null ? "…" : fmt(popup)}</div>
+                  <div className="kpi-change">{popupErr ? "CRM unavailable" : popup == null ? "loading from CRM" : "pop-up enquiries"}</div>
                 </div>
               </div>
 

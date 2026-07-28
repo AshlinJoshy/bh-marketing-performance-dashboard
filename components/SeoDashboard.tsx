@@ -1,13 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useState, useTransition } from "react";
+import { useCallback, useEffect, useMemo, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import ChartBox from "@/components/Chart";
 import HelpTip from "@/components/HelpTip";
 import { saveSeoConfigAction } from "@/app/actions";
 import { C } from "@/lib/theme";
 import type { SeoData } from "@/lib/seo";
-import type { LeadsData } from "@/lib/metabase";
+import { PAGE_SECTION_LABELS, type LeadsData } from "@/lib/metabase";
 
 const fmt = (n: number | null | undefined) => (n == null ? "—" : new Intl.NumberFormat("en-US").format(Math.round(n)));
 const fmtK = (n: number | null | undefined) => {
@@ -33,6 +33,14 @@ const chColor = (c: string) => CH_COLORS[c] ?? C.mid;
 
 const STAGE_ORDER = ["New", "Qualified", "Viewing", "Listed", "Valuation", "Reserved", "Offer", "Deal"];
 const STATUS_ORDER = ["Open", "Closed", "Completed"];
+
+// One place to build the error state, so adding a field to LeadsData can't leave
+// a stale object literal behind.
+const emptyLeads = (error: string): LeadsData => ({
+  connected: true, label: "", aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0,
+  aiBySource: [], stage: [], status: [], sourceAudit: [], topPages: [],
+  pageCoverage: { withPage: 0, organic: 0 }, error,
+});
 
 function ConnectCard({ title, lines }: { title: string; lines: string[] }) {
   return (
@@ -108,15 +116,34 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
       if (res.ok && json && typeof json.connected === "boolean") setLeads(json as LeadsData);
       else {
         console.error("[seo] leads returned an error", json?.error ?? res.status);
-        setLeads({ connected: true, label: "", aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [], sourceAudit: [], error: json?.error || `HTTP ${res.status}` });
+        setLeads(emptyLeads(json?.error || `HTTP ${res.status}`));
       }
     } catch (e) {
       console.error("[seo] leads fetch failed", e);
-      setLeads({ connected: true, label: "", aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [], sourceAudit: [], error: String(e) });
+      setLeads(emptyLeads(String(e)));
     } finally {
       setLeadsLoading(false);
     }
   }, []);
+
+  // Landing-page section filter. The rows all arrive with the leads payload, so
+  // switching sections is instant and costs no extra query.
+  const [pageFilter, setPageFilter] = useState<string>("all");
+  const pageSections = useMemo(() => {
+    const acc = new Map<string, number>();
+    for (const p of leads?.topPages ?? []) acc.set(p.category, (acc.get(p.category) ?? 0) + p.n);
+    // Only sections that actually have leads get a chip — an empty "New projects"
+    // filter is just noise.
+    return [...acc].map(([key, n]) => ({ key, n })).sort((a, b) => b.n - a.n);
+  }, [leads?.topPages]);
+  // If the chosen section has no leads in the new range, fall back to All rather
+  // than showing an empty table. Derived from the data instead of synced back
+  // into state, so there's no cascading render.
+  const activeSection = pageFilter !== "all" && !pageSections.some((s) => s.key === pageFilter) ? "all" : pageFilter;
+  const topPages = useMemo(
+    () => (leads?.topPages ?? []).filter((p) => activeSection === "all" || p.category === activeSection).slice(0, 5),
+    [leads?.topPages, activeSection],
+  );
 
   /**
    * The audit table costs a second full scan of the slow CRM view, so it's
@@ -378,11 +405,53 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
             <div className="chart-card"><div className="empty-state" style={{ height: "auto", padding: "22px 16px" }}>⚠ {leads.error}</div></div>
           ) : (
             <>
-              <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(4,1fr)" }}>
+              <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(3,1fr)" }}>
                 <div className="kpi-card"><div className="kpi-label">AI referral leads</div><div className="kpi-value" style={{ color: C.green }}>{fmt(leads.aiLeads)}</div><div className="kpi-change">LLM UTM source</div></div>
-                <div className="kpi-card"><div className="kpi-label">Organic leads</div><div className="kpi-value">{fmt(leads.organicLeads)}</div><div className="kpi-change">website + pop-up</div></div>
+                <div className="kpi-card"><div className="kpi-label">Organic leads <HelpTip text="Website enquiries with no UTM, plus pop-up leads. The pop-up figure is broken out on the Website tab." /></div><div className="kpi-value">{fmt(leads.organicLeads)}</div><div className="kpi-change">website + pop-up</div></div>
                 <div className="kpi-card"><div className="kpi-label">Website · no UTM</div><div className="kpi-value">{fmt(leads.websiteNoUtm)}</div><div className="kpi-change">enquiries</div></div>
-                <div className="kpi-card"><div className="kpi-label">Website pop-up</div><div className="kpi-value">{fmt(leads.popup)}</div><div className="kpi-change">pop-up leads</div></div>
+              </div>
+
+              <div className="chart-card">
+                <div className="chart-title">
+                  Top organic landing pages <HelpTip text="Which pages on bhomes.com the organic leads came from, ranked by lead count. Only counts leads whose record carries a landing page — see the note under the table." />
+                </div>
+                <div className="chart-sub">
+                  {activeSection === "all" ? "All sections" : PAGE_SECTION_LABELS[activeSection] ?? activeSection} · {leads.label}
+                </div>
+                {pageSections.length > 1 && (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, margin: "10px 0 4px" }}>
+                    <button className={`filter-btn${activeSection === "all" ? " active" : ""}`} onClick={() => setPageFilter("all")}>All</button>
+                    {pageSections.map((s) => (
+                      <button key={s.key} className={`filter-btn${activeSection === s.key ? " active" : ""}`} onClick={() => setPageFilter(s.key)}>
+                        {PAGE_SECTION_LABELS[s.key] ?? s.key} ({s.n})
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <div className="table-scroll">
+                  <table className="perf-table">
+                    <thead><tr><th>Page</th><th>Section</th><th style={{ textAlign: "right" }}>Leads</th></tr></thead>
+                    <tbody>
+                      {topPages.map((p) => (
+                        <tr key={p.path}>
+                          <td><a href={`https://www.bhomes.com${p.path}`} target="_blank" rel="noopener noreferrer">{p.path}</a></td>
+                          <td className="muted">{PAGE_SECTION_LABELS[p.category] ?? p.category}</td>
+                          <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(p.n)}</td>
+                        </tr>
+                      ))}
+                      {topPages.length === 0 && (
+                        <tr><td colSpan={3} className="muted">No organic leads carry a landing page in this range.</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+                {leads.pageCoverage.withPage > 0 && (
+                  <div className="chart-sub" style={{ marginTop: 10 }}>
+                    Based on {fmt(leads.pageCoverage.withPage)} of {fmt(leads.pageCoverage.organic)} organic leads
+                    {leads.pageCoverage.organic > 0 && ` (${Math.round((leads.pageCoverage.withPage / leads.pageCoverage.organic) * 100)}%)`}
+                    {" "}— the rest have no landing page recorded in the CRM, so this ranks the pages we can see, not every page that converts.
+                  </div>
+                )}
               </div>
 
               <div className="charts-grid-2">
