@@ -36,46 +36,9 @@ export interface LeadsData {
    * and, in particular, what fell into 'other' rather than organic or ai.
    */
   sourceAudit: { enquirySource: string; utmSource: string; utmMedium: string; segment: string; n: number }[];
-  /**
-   * Organic leads by the landing page they came from, biggest first, with the
-   * page's section so the UI can filter to buy / rent / etc.
-   *
-   * `coverage` is the share of organic leads in range that carry a usable page,
-   * and it is low — `tracking_link` is only populated on a minority of leads —
-   * so this ranks the pages we CAN see rather than every page that converts.
-   * Showing it without that caveat would overstate how complete it is.
-   */
-  topPages: { path: string; category: string; n: number }[];
-  pageCoverage: { withPage: number; organic: number };
   error?: string;
 }
 
-/**
- * Landing-page sections, matched against the path in order — first hit wins.
- *
- * Derived from what bhomes.com actually serves, not guessed: the site uses
- * /en/sales/… and /en/rentals/… rather than /buy/ and /rent/, so those are the
- * primary rules and the /buy…, for-sale, off-plan variants are there to catch
- * URL shapes that may appear later. The two prefix rules (blog, area guides)
- * come first deliberately, so a blog post about property management is filed as
- * a blog post rather than by the topic word in its slug.
- */
-const PAGE_SECTIONS: { key: string; label: string; test: (p: string) => boolean }[] = [
-  { key: "blog", label: "Blog", test: (p) => p.startsWith("/en/blog/") },
-  { key: "area", label: "Area guides", test: (p) => p.startsWith("/en/area-guides/") },
-  { key: "buy", label: "Buy", test: (p) => p.startsWith("/en/sales/") || p.startsWith("/en/buy") || p.includes("for-sale") },
-  { key: "rent", label: "Rent", test: (p) => p.startsWith("/en/rentals/") || p.startsWith("/en/rent") || p.includes("for-rent") },
-  { key: "list", label: "List your property", test: (p) => p.includes("list-your-property") },
-  { key: "valuation", label: "Valuation", test: (p) => p.includes("valuation") },
-  { key: "manage", label: "Property management", test: (p) => p.includes("property-management") },
-  { key: "newproj", label: "New projects", test: (p) => p.includes("new-project") || p.includes("off-plan") },
-  { key: "commercial", label: "Commercial", test: (p) => p.includes("commercial") || p.includes("development-sales") },
-];
-export const PAGE_SECTION_LABELS: Record<string, string> = {
-  ...Object.fromEntries(PAGE_SECTIONS.map((s) => [s.key, s.label])),
-  other: "Other",
-};
-const sectionOf = (path: string) => PAGE_SECTIONS.find((s) => s.test(path))?.key ?? "other";
 
 const isDate = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s);
 
@@ -237,7 +200,7 @@ export async function getLeadsData(fromRaw: string, toRaw: string, opts?: { audi
     (process.env.METABASE_API_KEY || (process.env.METABASE_USERNAME && process.env.METABASE_PASSWORD))
   );
   const label = `${fromRaw} → ${toRaw}`;
-  const base: LeadsData = { connected, label, aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [], sourceAudit: [], topPages: [], pageCoverage: { withPage: 0, organic: 0 } };
+  const base: LeadsData = { connected, label, aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [], sourceAudit: [] };
   if (!connected) return base;
   if (!isDate(fromRaw) || !isDate(toRaw)) return { ...base, error: "bad date range" };
   // Precise auth check first, so a login problem reads clearly instead of a
@@ -264,32 +227,20 @@ export async function getLeadsData(fromRaw: string, toRaw: string, opts?: { audi
   // JS below. `aisrc` is NULL for non-AI rows on purpose: it keeps the free-text
   // source out of the grouping key except where it's actually needed, so the
   // result stays a few hundred rows rather than one per campaign.
-  // The landing-page roll-up runs alongside it. `tracking_link` holds the page
-  // the enquiry came from, but only for website-origin leads — for portal leads
-  // it holds the partner's webhook endpoint (ovation-live.bayut.com/ingest/…,
-  // propertyfinder.ae/leads/…), which is not a page anyone visited. Restricting
-  // to our own host is what makes this a page report rather than a mix of pages
-  // and API callbacks.
-  const [scanRes, pageRows] = await Promise.all([
-    mbQueryEx(
-      `SELECT sub, aisrc, stage, st, count(*) n FROM (` +
-        `SELECT ${SUB} sub, ` +
-        `CASE WHEN ${IS_AI} THEN COALESCE(NULLIF(${utmSource}, ''), LOWER(enquiry_source)) END aisrc, ` +
-        `CAST(status AS CHAR) stage, CAST(state AS CHAR) st ` +
-        `FROM leads WHERE ${range}` +
-        `) t GROUP BY 1,2,3,4`,
-      true,
-      35000, // the main scan; the route allows 45s
-    ),
-    mbQuery(
-      `SELECT p, count(*) n FROM (` +
-        `SELECT SUBSTRING(LOWER(SUBSTRING_INDEX(SUBSTRING_INDEX(tracking_link,'?',1),'#',1)), LOCATE('bhomes.com', LOWER(tracking_link)) + 10) p ` +
-        `FROM leads WHERE ${range} AND tracking_link LIKE '%bhomes.com%' AND (${IS_WEB_NOUTM} OR ${IS_POPUP})` +
-        `) t WHERE p <> '' AND p <> '/' GROUP BY p ORDER BY n DESC LIMIT 200`,
-      true,
-      20000,
-    ),
-  ]);
+  //
+  // The landing-page roll-up that used to run alongside this is gone: the card it
+  // fed now reports views from PostHog, which has no coverage gap, so this is
+  // once again a single scan of the view per load.
+  const scanRes = await mbQueryEx(
+    `SELECT sub, aisrc, stage, st, count(*) n FROM (` +
+      `SELECT ${SUB} sub, ` +
+      `CASE WHEN ${IS_AI} THEN COALESCE(NULLIF(${utmSource}, ''), LOWER(enquiry_source)) END aisrc, ` +
+      `CAST(status AS CHAR) stage, CAST(state AS CHAR) st ` +
+      `FROM leads WHERE ${range}` +
+      `) t GROUP BY 1,2,3,4`,
+    true,
+    35000, // the main scan; the route allows 45s
+  );
   if ("error" in scanRes) {
     return { ...base, error: `Metabase reachable, but the leads query failed: ${scanRes.error}` };
   }
@@ -322,11 +273,6 @@ export async function getLeadsData(fromRaw: string, toRaw: string, opts?: { audi
   base.stage = split(stageAcc).map((r) => ({ segment: r.seg, stage: r.label, n: r.n }));
   base.status = split(statusAcc).map((r) => ({ segment: r.seg, status: r.label, n: r.n }));
 
-  base.topPages = (pageRows ?? []).map((r) => {
-    const path = String(r[0] ?? "");
-    return { path, category: sectionOf(path), n: Number(r[1] ?? 0) };
-  });
-  base.pageCoverage = { withPage: base.topPages.reduce((s, p) => s + p.n, 0), organic: base.organicLeads };
 
   // The audit is a second full scan with five JSON extractions per row, so it
   // only runs when the table is actually opened.
