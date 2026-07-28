@@ -29,19 +29,85 @@ export interface LeadsData {
   aiBySource: { source: string; n: number }[];
   stage: { segment: string; stage: string; n: number }[]; // pipeline (status col)
   status: { segment: string; status: string; n: number }[]; // open/closed (state col)
+  /**
+   * Raw enquiry_source × utm.source × utm.medium counts with the bucket each
+   * combination lands in. The classification below is all inference over free
+   * text, so this is the audit trail: it shows what actually exists in the view
+   * and, in particular, what fell into 'other' rather than organic or ai.
+   */
+  sourceAudit: { enquirySource: string; utmSource: string; utmMedium: string; segment: string; n: number }[];
+  /**
+   * Organic leads by the landing page they came from, biggest first, with the
+   * page's section so the UI can filter to buy / rent / etc.
+   *
+   * `coverage` is the share of organic leads in range that carry a usable page,
+   * and it is low — `tracking_link` is only populated on a minority of leads —
+   * so this ranks the pages we CAN see rather than every page that converts.
+   * Showing it without that caveat would overstate how complete it is.
+   */
+  topPages: { path: string; category: string; n: number }[];
+  pageCoverage: { withPage: number; organic: number };
   error?: string;
 }
+
+/**
+ * Landing-page sections, matched against the path in order — first hit wins.
+ *
+ * Derived from what bhomes.com actually serves, not guessed: the site uses
+ * /en/sales/… and /en/rentals/… rather than /buy/ and /rent/, so those are the
+ * primary rules and the /buy…, for-sale, off-plan variants are there to catch
+ * URL shapes that may appear later. The two prefix rules (blog, area guides)
+ * come first deliberately, so a blog post about property management is filed as
+ * a blog post rather than by the topic word in its slug.
+ */
+const PAGE_SECTIONS: { key: string; label: string; test: (p: string) => boolean }[] = [
+  { key: "blog", label: "Blog", test: (p) => p.startsWith("/en/blog/") },
+  { key: "area", label: "Area guides", test: (p) => p.startsWith("/en/area-guides/") },
+  { key: "buy", label: "Buy", test: (p) => p.startsWith("/en/sales/") || p.startsWith("/en/buy") || p.includes("for-sale") },
+  { key: "rent", label: "Rent", test: (p) => p.startsWith("/en/rentals/") || p.startsWith("/en/rent") || p.includes("for-rent") },
+  { key: "list", label: "List your property", test: (p) => p.includes("list-your-property") },
+  { key: "valuation", label: "Valuation", test: (p) => p.includes("valuation") },
+  { key: "manage", label: "Property management", test: (p) => p.includes("property-management") },
+  { key: "newproj", label: "New projects", test: (p) => p.includes("new-project") || p.includes("off-plan") },
+  { key: "commercial", label: "Commercial", test: (p) => p.includes("commercial") || p.includes("development-sales") },
+];
+export const PAGE_SECTION_LABELS: Record<string, string> = {
+  ...Object.fromEntries(PAGE_SECTIONS.map((s) => [s.key, s.label])),
+  other: "Other",
+};
+const sectionOf = (path: string) => PAGE_SECTIONS.find((s) => s.test(path))?.key ?? "other";
 
 const isDate = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s);
 
 // SQL fragments (reused across the queries)
-const utmSource = `LOWER(JSON_UNQUOTE(JSON_EXTRACT(utm,'$.source')))`;
-const utmMedium = `LOWER(JSON_UNQUOTE(JSON_EXTRACT(utm,'$.medium')))`;
+// `utm` is read defensively. JSON_EXTRACT raises "Invalid JSON text" and fails
+// the ENTIRE query if a single row holds something that isn't JSON — which a
+// column fed by web forms eventually will. JSON_VALID gates every access so one
+// bad row yields NULL instead of killing the whole card.
+//
+// The NULLIF is load-bearing, not defensive. `utm` holds all six keys even when
+// empty, so an untagged form submit stores {"source": null, ...}. JSON_UNQUOTE
+// renders that JSON null as the *string* 'null', which is neither SQL NULL nor
+// '' — so "has no utm source" tests silently failed on it. In one sample month
+// 755 of 917 website leads (82%) carried it, and every one was classified
+// 'other' instead of organic. Folding 'null' back to SQL NULL here is what makes
+// IS_WEB_NOUTM below actually mean what it says.
+const utmJson = (key: string) => `NULLIF(CASE WHEN JSON_VALID(utm) THEN LOWER(JSON_UNQUOTE(JSON_EXTRACT(utm,'$.${key}'))) END, 'null')`;
+const utmSource = utmJson("source");
+const utmMedium = utmJson("medium");
 const llmList = LLM_DOMAINS.map((d) => `'${d}'`).join(",");
 const IS_AI = `(${utmSource} IN (${llmList}) OR LOWER(enquiry_source) IN (${llmList}))`;
-const IS_POPUP = `(${utmSource} LIKE '%pop-up%' OR ${utmMedium} LIKE '%pop-up%' OR LOWER(enquiry_source) LIKE '%pop-up%')`;
+// Pop-up tags are hand-written and inconsistent — 'pop-up', 'website_pop-up' and
+// 'website-popup' all occur. Stripping hyphens first collapses every spelling
+// onto one pattern; matching '%pop-up%' alone missed the unhyphenated form.
+const noHyphen = (e: string) => `REPLACE(${e}, '-', '')`;
+const IS_POPUP = `(${noHyphen(utmSource)} LIKE '%popup%' OR ${noHyphen(utmMedium)} LIKE '%popup%' OR ${noHyphen("LOWER(enquiry_source)")} LIKE '%popup%')`;
 const IS_WEB_NOUTM = `(LOWER(enquiry_source) = 'website' AND (utm IS NULL OR ${utmSource} IS NULL OR ${utmSource} = ''))`;
 const SEG = `CASE WHEN ${IS_AI} THEN 'ai' WHEN (${IS_WEB_NOUTM} OR ${IS_POPUP}) THEN 'organic' ELSE 'other' END`;
+// The finer split. `organic` is website+popup, so SEG is derivable from this and
+// only one of the two needs to be computed in SQL.
+const SUB = `CASE WHEN ${IS_AI} THEN 'ai' WHEN ${IS_WEB_NOUTM} THEN 'website' WHEN ${IS_POPUP} THEN 'popup' ELSE 'other' END`;
+const segOf = (sub: string) => (sub === "ai" ? "ai" : sub === "website" || sub === "popup" ? "organic" : "other");
 
 // Session token from username/password, cached in-process, coalesced across
 // concurrent callers, and refreshed on a 401.
@@ -91,17 +157,29 @@ async function mbSessionToken(): Promise<string | null> {
   }
 }
 
-/** Run native SQL against the CRM database. Shared with lib/company.ts. */
-export async function mbQuery(sql: string, retry = true, timeoutMs = 20000): Promise<any[][] | null> {
+export type MbResult = { rows: any[][] } | { error: string };
+
+/**
+ * Run native SQL and return either rows or the reason it failed.
+ *
+ * Metabase answers a FAILED native query with HTTP **202** and a body of
+ * `{status:"failed", error:"<the real message>"}`. 202 is a 2xx, so `res.ok` is
+ * true and the only hint of trouble is a missing `data.rows`. Callers that got
+ * back a bare `null` therefore couldn't tell a broken query from a slow one and
+ * reported everything as a timeout — while discarding the exact message Metabase
+ * had already written down. So the payload is inspected here and the reason is
+ * handed back.
+ */
+export async function mbQueryEx(sql: string, retry = true, timeoutMs = 20000): Promise<MbResult> {
   const url = process.env.METABASE_URL;
-  if (!url) return null;
+  if (!url) return { error: "METABASE_URL is not set" };
   const apiKey = process.env.METABASE_API_KEY;
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (apiKey) {
     headers["x-api-key"] = apiKey;
   } else {
     const token = await mbSessionToken();
-    if (!token) return null;
+    if (!token) return { error: "could not authenticate" };
     headers["X-Metabase-Session"] = token;
   }
   const ctrl = new AbortController();
@@ -117,29 +195,49 @@ export async function mbQuery(sql: string, retry = true, timeoutMs = 20000): Pro
     if (res.status === 401 && !apiKey && retry) {
       mbSession = null; // expired session — re-auth once
       clearTimeout(t);
-      return mbQuery(sql, false, timeoutMs);
+      return mbQueryEx(sql, false, timeoutMs);
     }
     if (!res.ok) {
-      console.error(`[metabase] dataset HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
-      return null;
+      const body = (await res.text().catch(() => "")).slice(0, 300);
+      console.error(`[metabase] dataset HTTP ${res.status}: ${body}`);
+      return { error: `HTTP ${res.status}${body ? ` — ${body}` : ""}` };
     }
     const j = await res.json();
-    return (j?.data?.rows as any[][]) ?? null;
+    // The 202-with-failure case described above.
+    if (j?.status === "failed" || (j?.error && !j?.data)) {
+      const msg = String(j?.error ?? "query failed").slice(0, 300);
+      console.error(`[metabase] query failed: ${msg}`);
+      return { error: msg };
+    }
+    const rows = j?.data?.rows;
+    if (!Array.isArray(rows)) {
+      console.error(`[metabase] unexpected response shape: ${JSON.stringify(j).slice(0, 200)}`);
+      return { error: "Metabase returned no data.rows (unexpected response shape)" };
+    }
+    return { rows };
   } catch (e) {
-    console.error(`[metabase] dataset error: ${e instanceof Error ? e.message : String(e)}`);
-    return null;
+    const aborted = e instanceof Error && e.name === "AbortError";
+    const msg = aborted ? `timed out after ${Math.round(timeoutMs / 1000)}s` : e instanceof Error ? e.message : String(e);
+    console.error(`[metabase] dataset error: ${msg}`);
+    return { error: msg };
   } finally {
     clearTimeout(t);
   }
 }
 
-export async function getLeadsData(fromRaw: string, toRaw: string): Promise<LeadsData> {
+/** Rows, or null when it failed. For callers that only need "did it work". */
+export async function mbQuery(sql: string, retry = true, timeoutMs = 20000): Promise<any[][] | null> {
+  const r = await mbQueryEx(sql, retry, timeoutMs);
+  return "rows" in r ? r.rows : null;
+}
+
+export async function getLeadsData(fromRaw: string, toRaw: string, opts?: { audit?: boolean }): Promise<LeadsData> {
   const connected = !!(
     process.env.METABASE_URL &&
     (process.env.METABASE_API_KEY || (process.env.METABASE_USERNAME && process.env.METABASE_PASSWORD))
   );
   const label = `${fromRaw} → ${toRaw}`;
-  const base: LeadsData = { connected, label, aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [] };
+  const base: LeadsData = { connected, label, aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [], sourceAudit: [], topPages: [], pageCoverage: { withPage: 0, organic: 0 } };
   if (!connected) return base;
   if (!isDate(fromRaw) || !isDate(toRaw)) return { ...base, error: "bad date range" };
   // Precise auth check first, so a login problem reads clearly instead of a
@@ -152,38 +250,102 @@ export async function getLeadsData(fromRaw: string, toRaw: string): Promise<Lead
   }
   const range = `created_at >= '${fromRaw} 00:00:00' AND created_at <= '${toRaw} 23:59:59'`;
 
-  const [segRows, srcRows, stageRows, statusRows] = await Promise.all([
-    // finer segment split: ai / website(no utm) / popup / other
-    mbQuery(
-      `SELECT sub, count(*) n FROM (SELECT CASE WHEN ${IS_AI} THEN 'ai' WHEN ${IS_WEB_NOUTM} THEN 'website' WHEN ${IS_POPUP} THEN 'popup' ELSE 'other' END sub FROM leads WHERE ${range}) t GROUP BY sub`,
+  // JSON_UNQUOTE turns a JSON null into the literal string 'null', so both that
+  // and '' have to be folded to a readable placeholder.
+  const audit = (expr: string) => `COALESCE(NULLIF(NULLIF(${expr}, ''), 'null'), '(none)')`;
+
+  // ONE scan. This used to be four concurrent queries (segment totals, AI by
+  // source, stage, state) plus the audit — five full passes over `leads` in the
+  // same range, each re-evaluating the same per-row JSON extraction, which is
+  // what pushed it past the 20s ceiling.
+  //
+  // They all aggregate the same rows, so a single pass grouped by the four
+  // low-cardinality dimensions carries everything, and the roll-ups are done in
+  // JS below. `aisrc` is NULL for non-AI rows on purpose: it keeps the free-text
+  // source out of the grouping key except where it's actually needed, so the
+  // result stays a few hundred rows rather than one per campaign.
+  // The landing-page roll-up runs alongside it. `tracking_link` holds the page
+  // the enquiry came from, but only for website-origin leads — for portal leads
+  // it holds the partner's webhook endpoint (ovation-live.bayut.com/ingest/…,
+  // propertyfinder.ae/leads/…), which is not a page anyone visited. Restricting
+  // to our own host is what makes this a page report rather than a mix of pages
+  // and API callbacks.
+  const [scanRes, pageRows] = await Promise.all([
+    mbQueryEx(
+      `SELECT sub, aisrc, stage, st, count(*) n FROM (` +
+        `SELECT ${SUB} sub, ` +
+        `CASE WHEN ${IS_AI} THEN COALESCE(NULLIF(${utmSource}, ''), LOWER(enquiry_source)) END aisrc, ` +
+        `CAST(status AS CHAR) stage, CAST(state AS CHAR) st ` +
+        `FROM leads WHERE ${range}` +
+        `) t GROUP BY 1,2,3,4`,
+      true,
+      35000, // the main scan; the route allows 45s
     ),
     mbQuery(
-      `SELECT COALESCE(NULLIF(${utmSource}, ''), LOWER(enquiry_source)) src, count(*) n FROM leads WHERE ${range} AND ${IS_AI} GROUP BY src ORDER BY n DESC`,
-    ),
-    mbQuery(
-      `SELECT seg, CAST(status AS CHAR) stage, count(*) n FROM (SELECT status, ${SEG} seg FROM leads WHERE ${range}) t WHERE seg IN ('ai','organic') GROUP BY seg, stage ORDER BY seg, n DESC`,
-    ),
-    mbQuery(
-      `SELECT seg, CAST(state AS CHAR) st, count(*) n FROM (SELECT state, ${SEG} seg FROM leads WHERE ${range}) t WHERE seg IN ('ai','organic') GROUP BY seg, st ORDER BY seg, n DESC`,
+      `SELECT p, count(*) n FROM (` +
+        `SELECT SUBSTRING(LOWER(SUBSTRING_INDEX(SUBSTRING_INDEX(tracking_link,'?',1),'#',1)), LOCATE('bhomes.com', LOWER(tracking_link)) + 10) p ` +
+        `FROM leads WHERE ${range} AND tracking_link LIKE '%bhomes.com%' AND (${IS_WEB_NOUTM} OR ${IS_POPUP})` +
+        `) t WHERE p <> '' AND p <> '/' GROUP BY p ORDER BY n DESC LIMIT 200`,
+      true,
+      20000,
     ),
   ]);
-
-  // Auth worked but the query didn't come back.
-  if (!segRows) {
-    console.error("[metabase] leads segment query returned no rows (timeout or view error)");
-    return { ...base, error: "Metabase reachable but the leads query failed or timed out (20s) — the view may be slow for this range, or the account can't read it." };
+  if ("error" in scanRes) {
+    return { ...base, error: `Metabase reachable, but the leads query failed: ${scanRes.error}` };
   }
 
-  for (const r of segRows) {
+  const aiSrc = new Map<string, number>();
+  const stageAcc = new Map<string, number>(); // "seg|stage" → n
+  const statusAcc = new Map<string, number>();
+  for (const r of scanRes.rows) {
     const sub = String(r[0] ?? "");
-    const n = Number(r[1] ?? 0);
-    if (sub === "ai") base.aiLeads = n;
-    else if (sub === "website") base.websiteNoUtm = n;
-    else if (sub === "popup") base.popup = n;
+    const src = r[1] == null ? "" : String(r[1]);
+    const stage = String(r[2] ?? "");
+    const st = String(r[3] ?? "");
+    const n = Number(r[4] ?? 0);
+    if (sub === "ai") base.aiLeads += n;
+    else if (sub === "website") base.websiteNoUtm += n;
+    else if (sub === "popup") base.popup += n;
+    const seg = segOf(sub);
+    if (seg === "ai" && src) aiSrc.set(src, (aiSrc.get(src) ?? 0) + n);
+    if (seg === "ai" || seg === "organic") {
+      stageAcc.set(`${seg}|${stage}`, (stageAcc.get(`${seg}|${stage}`) ?? 0) + n);
+      statusAcc.set(`${seg}|${st}`, (statusAcc.get(`${seg}|${st}`) ?? 0) + n);
+    }
   }
   base.organicLeads = base.websiteNoUtm + base.popup;
-  base.aiBySource = (srcRows ?? []).map((r) => ({ source: String(r[0] ?? "(unknown)"), n: Number(r[1] ?? 0) }));
-  base.stage = (stageRows ?? []).map((r) => ({ segment: String(r[0] ?? ""), stage: String(r[1] ?? ""), n: Number(r[2] ?? 0) }));
-  base.status = (statusRows ?? []).map((r) => ({ segment: String(r[0] ?? ""), status: String(r[1] ?? ""), n: Number(r[2] ?? 0) }));
+  base.aiBySource = [...aiSrc].map(([source, n]) => ({ source, n })).sort((a, b) => b.n - a.n);
+  // Same shape and ordering the four separate queries produced (seg, then n desc).
+  const split = (m: Map<string, number>) =>
+    [...m].map(([k, n]) => ({ seg: k.slice(0, k.indexOf("|")), label: k.slice(k.indexOf("|") + 1), n }))
+      .sort((a, b) => (a.seg === b.seg ? b.n - a.n : a.seg < b.seg ? -1 : 1));
+  base.stage = split(stageAcc).map((r) => ({ segment: r.seg, stage: r.label, n: r.n }));
+  base.status = split(statusAcc).map((r) => ({ segment: r.seg, status: r.label, n: r.n }));
+
+  base.topPages = (pageRows ?? []).map((r) => {
+    const path = String(r[0] ?? "");
+    return { path, category: sectionOf(path), n: Number(r[1] ?? 0) };
+  });
+  base.pageCoverage = { withPage: base.topPages.reduce((s, p) => s + p.n, 0), organic: base.organicLeads };
+
+  // The audit is a second full scan with five JSON extractions per row, so it
+  // only runs when the table is actually opened.
+  const auditRows = opts?.audit
+    ? await mbQuery(
+        `SELECT es, us, um, seg, count(*) n FROM (` +
+          `SELECT ${audit(`LOWER(TRIM(enquiry_source))`)} es, ${audit(utmSource)} us, ${audit(utmMedium)} um, ${SEG} seg ` +
+          `FROM leads WHERE ${range}` +
+          `) t GROUP BY 1,2,3,4 ORDER BY n DESC LIMIT 60`,
+        true,
+        35000,
+      )
+    : null;
+  base.sourceAudit = (auditRows ?? []).map((r) => ({
+    enquirySource: String(r[0] ?? "(none)"),
+    utmSource: String(r[1] ?? "(none)"),
+    utmMedium: String(r[2] ?? "(none)"),
+    segment: String(r[3] ?? ""),
+    n: Number(r[4] ?? 0),
+  }));
   return base;
 }

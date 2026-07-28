@@ -38,14 +38,17 @@ const fmtPct = (n: number | null, dp = 1) => (n == null || !Number.isFinite(n) ?
 
 const START_LABEL = "January 2025";
 
+// Portal brands wear their own colours: Property Finder orange, Bayut green,
+// Dubizzle red. Agent External gives up amber so it doesn't read as a second
+// Property Finder, and takes the navy Property Finder vacated.
 const CH_COLOR: Record<string, string> = {
-  "Property Finder": C.dark,
-  Bayut: C.coral,
+  "Property Finder": C.amber,
+  Bayut: C.green,
   "Client Referral": C.sage,
   "Previous Tenant/Buyer": C.blue,
   "Meta/Facebook": "#7c5cbf",
-  "Agent External": C.amber,
-  Dubizzle: C.green,
+  "Agent External": C.dark,
+  Dubizzle: C.red,
   "No Source": C.sand,
   Other: C.mid,
 };

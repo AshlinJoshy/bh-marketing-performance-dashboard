@@ -1,13 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useState, useTransition } from "react";
+import { useCallback, useEffect, useMemo, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import ChartBox from "@/components/Chart";
 import HelpTip from "@/components/HelpTip";
 import { saveSeoConfigAction } from "@/app/actions";
 import { C } from "@/lib/theme";
 import type { SeoData } from "@/lib/seo";
-import type { LeadsData } from "@/lib/metabase";
+import { PAGE_SECTION_LABELS, type LeadsData } from "@/lib/metabase";
 
 const fmt = (n: number | null | undefined) => (n == null ? "—" : new Intl.NumberFormat("en-US").format(Math.round(n)));
 const fmtK = (n: number | null | undefined) => {
@@ -33,6 +33,14 @@ const chColor = (c: string) => CH_COLORS[c] ?? C.mid;
 
 const STAGE_ORDER = ["New", "Qualified", "Viewing", "Listed", "Valuation", "Reserved", "Offer", "Deal"];
 const STATUS_ORDER = ["Open", "Closed", "Completed"];
+
+// One place to build the error state, so adding a field to LeadsData can't leave
+// a stale object literal behind.
+const emptyLeads = (error: string): LeadsData => ({
+  connected: true, label: "", aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0,
+  aiBySource: [], stage: [], status: [], sourceAudit: [], topPages: [],
+  pageCoverage: { withPage: 0, organic: 0 }, error,
+});
 
 function ConnectCard({ title, lines }: { title: string; lines: string[] }) {
   return (
@@ -67,6 +75,7 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
 
   // keyword editor
   const [kwOpen, setKwOpen] = useState(false);
+  const [auditOpen, setAuditOpen] = useState(false);
   const [kwInput, setKwInput] = useState(initial.keywords.join("\n"));
   const [kwMsg, setKwMsg] = useState<string | null>(null);
   const [kwSaving, startKwSave] = useTransition();
@@ -98,21 +107,86 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
   // slow half — Metabase leads (independent request)
   const loadLeads = useCallback(async (qs: string) => {
     setLeadsLoading(true);
+    // A fresh payload carries no audit rows, so collapse the table rather than
+    // leaving it open and empty against the previous range.
+    setAuditOpen(false);
     try {
       const res = await fetch(`/api/seo/leads?${qs}`, { cache: "no-store" });
       const json = await res.json();
       if (res.ok && json && typeof json.connected === "boolean") setLeads(json as LeadsData);
       else {
         console.error("[seo] leads returned an error", json?.error ?? res.status);
-        setLeads({ connected: true, label: "", aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [], error: json?.error || `HTTP ${res.status}` });
+        setLeads(emptyLeads(json?.error || `HTTP ${res.status}`));
       }
     } catch (e) {
       console.error("[seo] leads fetch failed", e);
-      setLeads({ connected: true, label: "", aiLeads: 0, organicLeads: 0, websiteNoUtm: 0, popup: 0, aiBySource: [], stage: [], status: [], error: String(e) });
+      setLeads(emptyLeads(String(e)));
     } finally {
       setLeadsLoading(false);
     }
   }, []);
+
+  /**
+   * Buy / rent filter for the individual-property card. Rows come from PostHog
+   * with the traffic payload, so switching is instant.
+   */
+  const [propFilter, setPropFilter] = useState<"all" | "buy" | "rent">("all");
+  const propCounts = useMemo(() => {
+    const rows = data.traffic.propertyLeads ?? [];
+    return {
+      all: rows.length,
+      buy: rows.filter((p) => p.kind === "buy").length,
+      rent: rows.filter((p) => p.kind === "rent").length,
+    };
+  }, [data.traffic.propertyLeads]);
+  const activeProp = propFilter !== "all" && propCounts[propFilter] === 0 ? "all" : propFilter;
+  const topProperties = useMemo(
+    () => (data.traffic.propertyLeads ?? []).filter((p) => activeProp === "all" || p.kind === activeProp).slice(0, 5),
+    [data.traffic.propertyLeads, activeProp],
+  );
+
+  // Landing-page section filter. The rows all arrive with the leads payload, so
+  // switching sections is instant and costs no extra query.
+  const [pageFilter, setPageFilter] = useState<string>("all");
+  const pageSections = useMemo(() => {
+    const acc = new Map<string, number>();
+    for (const p of leads?.topPages ?? []) acc.set(p.category, (acc.get(p.category) ?? 0) + p.n);
+    // Only sections that actually have leads get a chip — an empty "New projects"
+    // filter is just noise.
+    return [...acc].map(([key, n]) => ({ key, n })).sort((a, b) => b.n - a.n);
+  }, [leads?.topPages]);
+  // If the chosen section has no leads in the new range, fall back to All rather
+  // than showing an empty table. Derived from the data instead of synced back
+  // into state, so there's no cascading render.
+  const activeSection = pageFilter !== "all" && !pageSections.some((s) => s.key === pageFilter) ? "all" : pageFilter;
+  const topPages = useMemo(
+    () => (leads?.topPages ?? []).filter((p) => activeSection === "all" || p.category === activeSection).slice(0, 5),
+    [leads?.topPages, activeSection],
+  );
+
+  /**
+   * The audit table costs a second full scan of the slow CRM view, so it's
+   * fetched on first open rather than with every range change, and kept once
+   * loaded.
+   */
+  const [auditLoading, setAuditLoading] = useState(false);
+  const toggleAudit = useCallback(async () => {
+    const opening = !auditOpen;
+    setAuditOpen(opening);
+    if (!opening || !leads || leads.sourceAudit.length > 0) return;
+    setAuditLoading(true);
+    try {
+      const res = await fetch(`/api/seo/leads?${rangeQs()}&audit=1`, { cache: "no-store" });
+      const json = await res.json();
+      if (res.ok && Array.isArray(json?.sourceAudit)) {
+        setLeads((prev) => (prev ? { ...prev, sourceAudit: json.sourceAudit } : prev));
+      } else console.error("[seo] audit returned an error", json?.error ?? res.status);
+    } catch (e) {
+      console.error("[seo] audit fetch failed", e);
+    } finally {
+      setAuditLoading(false);
+    }
+  }, [auditOpen, leads, rangeQs]);
 
   // Leads are fetched on mount ON PURPOSE: the Metabase CRM view is slow enough
   // that server-rendering it stalls (and used to kill) the PostHog/GSC render, so
@@ -275,11 +349,13 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
           <div className="charts-grid-2">
             <div className="chart-card">
               <div className="chart-title">Traffic by channel</div>
-              <div className="chart-sub">Pageviews by entry source · {traffic.label}</div>
+              <div className="chart-sub">
+                {traffic.approxChannels ? "Entry pageviews by source · approximate" : "Pageviews by entry source"} · {traffic.label}
+              </div>
               <div className="chart-canvas-wrap">
                 {channels.length ? (
                   <ChartBox type="bar"
-                    data={{ labels: channels.map((c) => c.channel), datasets: [{ label: "Pageviews", data: channels.map((c) => c.pageviews), backgroundColor: channels.map((c) => chColor(c.channel)), borderRadius: 5 }] }}
+                    data={{ labels: channels.map((c) => c.channel), datasets: [{ label: traffic.approxChannels ? "Entry pageviews" : "Pageviews", data: channels.map((c) => c.pageviews), backgroundColor: channels.map((c) => chColor(c.channel)), borderRadius: 5 }] }}
                     options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true }, y: { ticks: { autoSkip: false, font: { size: 11 } } } } }} />
                 ) : <div className="empty-state">{traffic.error ? `⚠ ${traffic.error}` : traffic.connected ? "No pageviews in range." : "PostHog not connected."}</div>}
               </div>
@@ -294,6 +370,48 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
                     options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } }, y: { ticks: { autoSkip: false, font: { size: 11 } } } } }} />
                 ) : <div className="empty-state">No AI sessions in range.</div>}
               </div>
+            </div>
+          </div>
+
+          {/* Individual property pages by lead action. PostHog, not the CRM —
+              the CRM has no link between a buyer/tenant enquiry and the listing
+              it came from, so the click on the page is the only signal. */}
+          <div className="chart-card" style={{ marginTop: 4 }}>
+            <div className="chart-title">
+              Top properties by leads <HelpTip text="Individual property pages ranked by lead actions — WhatsApp and call-button clicks on the page. From PostHog, bots excluded. Buy vs rent is read from the listing reference: bh-s- is for sale, bh-r- is to rent." />
+            </div>
+            <div className="chart-sub">
+              WhatsApp + call clicks · {activeProp === "all" ? "buy and rent" : activeProp === "buy" ? "for sale" : "to rent"} · {traffic.label}
+            </div>
+            {propCounts.all > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, margin: "10px 0 4px" }}>
+                <button className={`filter-btn${activeProp === "all" ? " active" : ""}`} onClick={() => setPropFilter("all")}>All ({propCounts.all})</button>
+                <button className={`filter-btn${activeProp === "buy" ? " active" : ""}`} onClick={() => setPropFilter("buy")}>Buy ({propCounts.buy})</button>
+                <button className={`filter-btn${activeProp === "rent" ? " active" : ""}`} onClick={() => setPropFilter("rent")}>Rent ({propCounts.rent})</button>
+              </div>
+            )}
+            <div className="table-scroll">
+              <table className="perf-table">
+                <thead><tr><th>Property</th><th>For</th><th style={{ textAlign: "right" }}>WhatsApp</th><th style={{ textAlign: "right" }}>Call</th><th style={{ textAlign: "right" }}>Leads</th></tr></thead>
+                <tbody>
+                  {topProperties.map((p) => (
+                    <tr key={p.path}>
+                      <td><a href={`https://www.bhomes.com${p.path}`} target="_blank" rel="noopener noreferrer">{p.slug}</a></td>
+                      <td className="muted">{p.kind === "buy" ? "Sale" : p.kind === "rent" ? "Rent" : "—"}</td>
+                      <td style={{ textAlign: "right" }}>{fmt(p.whatsapp)}</td>
+                      <td style={{ textAlign: "right" }}>{fmt(p.phone)}</td>
+                      <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(p.total)}</td>
+                    </tr>
+                  ))}
+                  {topProperties.length === 0 && (
+                    <tr><td colSpan={5} className="muted">No property-page lead actions in range.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div className="chart-sub" style={{ marginTop: 10 }}>
+              Counts clicks on the WhatsApp and call buttons. Property pages carry no email form, so there is nothing to count there —
+              enquiries submitted by form land in the CRM without the listing attached, and cannot be credited to a property.
             </div>
           </div>
 
@@ -348,11 +466,53 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
             <div className="chart-card"><div className="empty-state" style={{ height: "auto", padding: "22px 16px" }}>⚠ {leads.error}</div></div>
           ) : (
             <>
-              <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(4,1fr)" }}>
+              <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(3,1fr)" }}>
                 <div className="kpi-card"><div className="kpi-label">AI referral leads</div><div className="kpi-value" style={{ color: C.green }}>{fmt(leads.aiLeads)}</div><div className="kpi-change">LLM UTM source</div></div>
-                <div className="kpi-card"><div className="kpi-label">Organic leads</div><div className="kpi-value">{fmt(leads.organicLeads)}</div><div className="kpi-change">website + pop-up</div></div>
+                <div className="kpi-card"><div className="kpi-label">Organic leads <HelpTip text="Website enquiries with no UTM, plus pop-up leads. The pop-up figure is broken out on the Website tab." /></div><div className="kpi-value">{fmt(leads.organicLeads)}</div><div className="kpi-change">website + pop-up</div></div>
                 <div className="kpi-card"><div className="kpi-label">Website · no UTM</div><div className="kpi-value">{fmt(leads.websiteNoUtm)}</div><div className="kpi-change">enquiries</div></div>
-                <div className="kpi-card"><div className="kpi-label">Website pop-up</div><div className="kpi-value">{fmt(leads.popup)}</div><div className="kpi-change">pop-up leads</div></div>
+              </div>
+
+              <div className="chart-card">
+                <div className="chart-title">
+                  Top organic landing pages <HelpTip text="Which pages on bhomes.com the organic leads came from, ranked by lead count. Only counts leads whose record carries a landing page — see the note under the table." />
+                </div>
+                <div className="chart-sub">
+                  {activeSection === "all" ? "All sections" : PAGE_SECTION_LABELS[activeSection] ?? activeSection} · {leads.label}
+                </div>
+                {pageSections.length > 1 && (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, margin: "10px 0 4px" }}>
+                    <button className={`filter-btn${activeSection === "all" ? " active" : ""}`} onClick={() => setPageFilter("all")}>All</button>
+                    {pageSections.map((s) => (
+                      <button key={s.key} className={`filter-btn${activeSection === s.key ? " active" : ""}`} onClick={() => setPageFilter(s.key)}>
+                        {PAGE_SECTION_LABELS[s.key] ?? s.key} ({s.n})
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <div className="table-scroll">
+                  <table className="perf-table">
+                    <thead><tr><th>Page</th><th>Section</th><th style={{ textAlign: "right" }}>Leads</th></tr></thead>
+                    <tbody>
+                      {topPages.map((p) => (
+                        <tr key={p.path}>
+                          <td><a href={`https://www.bhomes.com${p.path}`} target="_blank" rel="noopener noreferrer">{p.path}</a></td>
+                          <td className="muted">{PAGE_SECTION_LABELS[p.category] ?? p.category}</td>
+                          <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(p.n)}</td>
+                        </tr>
+                      ))}
+                      {topPages.length === 0 && (
+                        <tr><td colSpan={3} className="muted">No organic leads carry a landing page in this range.</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+                {leads.pageCoverage.withPage > 0 && (
+                  <div className="chart-sub" style={{ marginTop: 10 }}>
+                    Based on {fmt(leads.pageCoverage.withPage)} of {fmt(leads.pageCoverage.organic)} organic leads
+                    {leads.pageCoverage.organic > 0 && ` (${Math.round((leads.pageCoverage.withPage / leads.pageCoverage.organic) * 100)}%)`}
+                    {" "}— the rest have no landing page recorded in the CRM, so this ranks the pages we can see, not every page that converts.
+                  </div>
+                )}
               </div>
 
               <div className="charts-grid-2">
@@ -396,6 +556,47 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
                     </div>
                   )}
                 </div>
+              </div>
+
+              {/* Audit trail. Organic and AI are inferred from free-text
+                  enquiry_source and a JSON utm blob, so this shows every raw
+                  combination and which bucket it landed in — the 'other' rows
+                  are the ones worth reading, because that's where anything the
+                  classifier doesn't recognise ends up. */}
+              <div className="chart-card" style={{ marginTop: 4 }}>
+                <div className="chart-title" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span>Lead source audit <HelpTip text="Every enquiry_source × utm combination in the CRM for this range, and the bucket it classifies into. Organic and AI are inferred from free text, so this is how you verify the classification is right — especially the 'other' rows." /></span>
+                  <button className="filter-btn" onClick={toggleAudit} disabled={auditLoading}>{auditLoading ? "Loading…" : auditOpen ? "Hide" : "Show"}</button>
+                </div>
+                <div className="chart-sub">
+                  {auditLoading
+                    ? "Querying the CRM…"
+                    : leads.sourceAudit.length
+                      ? `${leads.sourceAudit.length} source combinations · ${leads.label}`
+                      : "Loaded on demand — it costs an extra scan of the CRM view."}
+                </div>
+                {auditOpen && leads.sourceAudit.length > 0 && (
+                  <div className="table-scroll" style={{ marginTop: 10, maxHeight: 420 }}>
+                    <table className="perf-table">
+                      <thead><tr><th>enquiry_source</th><th>utm.source</th><th>utm.medium</th><th>bucket</th><th style={{ textAlign: "right" }}>leads</th></tr></thead>
+                      <tbody>
+                        {leads.sourceAudit.map((r, i) => (
+                          <tr key={i}>
+                            <td>{r.enquirySource}</td>
+                            <td className="muted">{r.utmSource}</td>
+                            <td className="muted">{r.utmMedium}</td>
+                            <td>
+                              <span style={{ fontWeight: 600, color: r.segment === "ai" ? C.green : r.segment === "organic" ? C.dark : C.mid }}>
+                                {r.segment}
+                              </span>
+                            </td>
+                            <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(r.n)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             </>
           )}

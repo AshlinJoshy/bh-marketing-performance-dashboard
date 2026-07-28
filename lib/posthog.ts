@@ -17,6 +17,18 @@ const PROJECT = process.env.POSTHOG_PROJECT_ID || "198002";
 // dropping real users — Ashburn (AWS us-east-1) alone was ~92% of bogus US hits.
 const DATACENTER_CITIES = ["Ashburn", "Boardman", "Council Bluffs", "The Dalles"];
 
+/**
+ * A hit is "automated" if PostHog flagged it, OR it came from a cloud datacenter
+ * city, OR it runs desktop Linux. Real consumers are ~98% Windows/Mac/iOS/
+ * Android, so near-100%-Linux traffic (the China / Singapore / Hong Kong /
+ * Netherlands server traffic, each ~1.0 pageviews/session) is crawlers.
+ *
+ * Defined once and shared by the Website and SEO tabs. It used to be written out
+ * twice, which is how the two would eventually disagree about what a bot is
+ * while both claiming to filter them.
+ */
+const BOT_EXPR = `(coalesce(properties.$virt_is_bot, false) = true OR properties.$geoip_city_name IN (${DATACENTER_CITIES.map((c) => `'${c}'`).join(", ")}) OR properties.$os = 'Linux')`;
+
 const SEARCH_ENGINES = ["google.", "bing.", "yahoo.", "duckduckgo.", "ecosia.", "yandex.", "baidu.", "brave."];
 
 async function hogql(sql: string, timeoutMs = Number(process.env.POSTHOG_TIMEOUT_MS || 15000)): Promise<any[][] | null> {
@@ -272,12 +284,7 @@ export async function getWebMetrics(daysRaw = 30, fromRaw?: string, toRaw?: stri
   if (!key) return base;
 
   const pv = `event = '$pageview'`;
-  const dc = DATACENTER_CITIES.map((c) => `'${c}'`).join(", ");
-  // A hit is "automated" if PostHog flagged it, OR it's from a cloud datacenter
-  // city, OR it runs desktop Linux. Real consumers are ~98% Windows/Mac/iOS/
-  // Android; near-100%-Linux traffic (the China / Singapore / Hong Kong /
-  // Netherlands server traffic, each ~1.0 pageviews/session) is bots/crawlers.
-  const botExpr = `(coalesce(properties.$virt_is_bot, false) = true OR properties.$geoip_city_name IN (${dc}) OR properties.$os = 'Linux')`;
+  const botExpr = BOT_EXPR;
   const human = humansOnly ? ` AND NOT ${botExpr}` : "";
   const organic = SEARCH_ENGINES.map((e) => `properties.$referring_domain LIKE '%${e}%'`).join(" OR ");
 
@@ -347,7 +354,33 @@ export interface SeoTraffic {
   totalSessions: number;
   byChannel: { channel: string; pageviews: number; sessions: number }[];
   aiBySource: { source: string; sessions: number }[];
+  /**
+   * Individual property pages ranked by lead actions — a WhatsApp or call-button
+   * click on the page itself.
+   *
+   * This has to come from PostHog rather than the CRM. The CRM records no
+   * bhomes.com property URL at all (its `tracking_link` for these is a portal
+   * webhook endpoint), and its only property link, `leadable_id`, is used
+   * exclusively for listing-side leads — Landlord and Seller, never Buyer or
+   * Tenant. So a buyer's enquiry is not connected to the listing they enquired
+   * about anywhere in the CRM. PostHog sees the click on the page, which is the
+   * one place that connection exists.
+   */
+  propertyLeads: PropertyLead[];
+  /** byChannel came from entry-level attribution, not the per-session pass. */
+  approxChannels?: boolean;
   error?: string;
+}
+
+export interface PropertyLead {
+  /** e.g. bh-s-289607 */
+  slug: string;
+  path: string;
+  /** Read off the slug: bh-s-… is for sale, bh-r-… is to rent. */
+  kind: "buy" | "rent" | "other";
+  whatsapp: number;
+  phone: number;
+  total: number;
 }
 
 export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 30): Promise<SeoTraffic> {
@@ -365,11 +398,12 @@ export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 
     label = `last ${days} days`;
   }
   since += ` AND (lower(properties.$host) = 'bhomes.com' OR lower(properties.$host) LIKE '%.bhomes.com')`;
-  const base: SeoTraffic = { connected: !!key, label, totalPageviews: 0, organicPageviews: 0, aiSessions: 0, totalSessions: 0, byChannel: [], aiBySource: [] };
+  const base: SeoTraffic = { connected: !!key, label, totalPageviews: 0, organicPageviews: 0, aiSessions: 0, totalSessions: 0, byChannel: [], aiBySource: [], propertyLeads: [] };
   if (!key) return base;
 
-  const dc = DATACENTER_CITIES.map((c) => `'${c}'`).join(", ");
-  const human = ` AND NOT (coalesce(properties.$virt_is_bot, false) = true OR properties.$geoip_city_name IN (${dc}) OR properties.$os = 'Linux')`;
+  // Same bot definition as the Website tab — always on here (the SEO tab has no
+  // humans-only toggle), so these figures are bot-filtered by construction.
+  const human = ` AND NOT ${BOT_EXPR}`;
   const chan = channelClassify("ref");
   // HEAVY: one per-session pass (argMin first referrer) → channel pageviews &
   // sessions. Given extra time so a large range isn't cut off (this is the only
@@ -381,7 +415,26 @@ export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 
   const aiRefEvent = `(properties.$referring_domain LIKE '%chatgpt.%' OR properties.$referring_domain LIKE '%openai.%' OR properties.$referring_domain LIKE '%perplexity.%' OR properties.$referring_domain LIKE '%claude.%' OR properties.$referring_domain LIKE '%gemini.google%' OR properties.$referring_domain LIKE '%copilot.%')`;
 
   const organicRef = SEARCH_ENGINES.map((e) => `properties.$referring_domain LIKE '%${e}%'`).join(" OR ");
-  const [chanRows, aiRows, totalRows] = await Promise.all([
+  // What counts as a lead action on a property page. `bh_cta_click` is the only
+  // lead-shaped event that fires there — there is no email-form event on
+  // property pages (lead_blog_form is blog-only), so this is WhatsApp and phone.
+  //
+  // click_text is matched case-insensitively because the site emits both
+  // 'Whatsapp' and 'WhatsApp', and falls back to click_classes because
+  // icon-only buttons record click_text as the boolean false rather than a
+  // label — their only identifying mark is the lucide icon class.
+  //
+  // These use the same bot filter as everything else on the tab. Worth knowing:
+  // BOT_EXPR treats desktop Linux as automated, which is sound for pageview
+  // volume but strict for a deliberate button click, so this may undercount by
+  // the small share of genuine Linux users. Kept anyway — one shared definition
+  // of "bot" is worth more than a per-card exception, which is how the Website
+  // and SEO tabs drifted apart before.
+  const ctaText = `lower(toString(properties.click_text))`;
+  const ctaClass = `toString(properties.click_classes)`;
+  const IS_WA = `(${ctaText} LIKE '%whatsapp%' OR ${ctaClass} LIKE '%message-circle%')`;
+  const IS_TEL = `(${ctaText} IN ('call','phone') OR ${ctaClass} LIKE '%lucide-phone%')`;
+  const [chanRows, aiRows, totalRows, propRows] = await Promise.all([
     // best-effort: per-session channel breakdown (powers the "by channel" chart)
     hogql(`SELECT ${chan} AS channel, sum(pv) AS pageviews, count() AS sessions FROM (${inner}) GROUP BY channel ORDER BY pageviews DESC`, 25000),
     // cheap: AI sessions by LLM referrer
@@ -389,6 +442,13 @@ export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 
     // cheap + GUARANTEED: headline totals in a single scan (no per-session pass),
     // so the KPIs are always populated even if the channel breakdown times out.
     hogql(`SELECT count() AS total, countIf(${organicRef}) AS organic, count(DISTINCT properties.$session_id) AS sessions FROM events WHERE event = '$pageview' AND ${since}${human}`),
+    // cheap: lead actions per individual property page. More than the five shown
+    // are fetched so the buy/rent filter has rows to work with without a refetch.
+    hogql(
+      `SELECT properties.$pathname AS path, countIf(${IS_WA}) AS wa, countIf(${IS_TEL}) AS tel, count() AS total ` +
+        `FROM events WHERE event = 'bh_cta_click' AND properties.$pathname LIKE '/en/property/%' AND ${since}${human} ` +
+        `GROUP BY path ORDER BY total DESC LIMIT 60`,
+    ),
   ]);
 
   for (const r of chanRows ?? []) {
@@ -397,6 +457,19 @@ export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 
     if (ch === "Organic Search") base.organicPageviews = Number(r[1] || 0); // session-attributed (preferred)
   }
   base.aiBySource = (aiRows ?? []).map((r) => ({ source: String(r[0] || "(unknown)"), sessions: Number(r[1] || 0) }));
+
+  base.propertyLeads = (propRows ?? []).map((r) => {
+    const path = String(r[0] || "");
+    const slug = path.slice(path.lastIndexOf("/") + 1);
+    return {
+      slug,
+      path,
+      kind: slug.startsWith("bh-s-") ? "buy" : slug.startsWith("bh-r-") ? "rent" : "other",
+      whatsapp: Number(r[1] || 0),
+      phone: Number(r[2] || 0),
+      total: Number(r[3] || 0),
+    } satisfies PropertyLead;
+  });
 
   // Headline numbers come from the guaranteed cheap query (never 0 when data exists).
   const tr = totalRows?.[0];
@@ -408,6 +481,38 @@ export async function getSeoTraffic(fromRaw?: string, toRaw?: string, daysRaw = 
   const aiNode = base.byChannel.find((c) => c.channel === "AI Assistant");
   base.aiSessions = aiNode ? aiNode.sessions : base.aiBySource.reduce((a, s) => a + s.sessions, 0);
 
-  if (!totalRows && !chanRows) base.error = "PostHog traffic query failed or timed out.";
+  if (!totalRows && !chanRows) {
+    base.error = "PostHog traffic query failed or timed out.";
+    return base;
+  }
+
+  // The per-session pass is the only heavy scan, so it times out on its own over
+  // a long range while the cheap totals still succeed. That used to leave
+  // byChannel empty with no error set, and the card rendered "No pageviews in
+  // range" — reporting a dead query as an absence of traffic.
+  //
+  // Retry at entry level instead: internal navigation carries a bhomes.com
+  // referrer, so excluding it leaves ≈ the entry pageview of each session. That
+  // is first-touch attribution without the GROUP BY, which is the same
+  // reasoning the AI-sessions query above already relies on. Counts are entries
+  // rather than all pageviews, so the caller flags the chart as approximate.
+  const contradiction = base.byChannel.length === 0 && base.totalPageviews > 0;
+  if (!chanRows || contradiction) {
+    const entryRef = `coalesce(properties.$referring_domain, '')`;
+    const entryRows = await hogql(
+      `SELECT ${channelClassify(entryRef)} AS channel, count() AS entries, count(DISTINCT properties.$session_id) AS sessions ` +
+        `FROM events WHERE event = '$pageview' AND ${since}${human} AND NOT (${entryRef} LIKE '%bhomes.com%') ` +
+        `GROUP BY channel ORDER BY entries DESC`,
+    );
+    if (entryRows?.length) {
+      base.byChannel = entryRows.map((r) => ({ channel: String(r[0] || ""), pageviews: Number(r[1] || 0), sessions: Number(r[2] || 0) }));
+      base.approxChannels = true;
+      if (!base.organicPageviews) {
+        base.organicPageviews = base.byChannel.find((c) => c.channel === "Organic Search")?.pageviews ?? 0;
+      }
+    } else {
+      base.error = "Channel breakdown timed out — try a shorter range (7 or 30 days).";
+    }
+  }
   return base;
 }
