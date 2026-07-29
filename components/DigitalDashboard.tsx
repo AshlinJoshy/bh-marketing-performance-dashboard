@@ -41,20 +41,29 @@ const norm = (s: string) => s.toLowerCase().trim();
  * leads — counting them as qualified would flatter every stage — but they are
  * not nothing either, so they get their own bucket rather than being discarded.
  *
- * 'lost' is a lead closed further down (Offer, Reserved, Deal). It is out of the
- * forward funnel but is deliberately NOT folded into 'notq', which is defined
- * only over the three early stages.
+ * 'lost' is a lead closed further down (Valuation, Listed, Offer, Reserved,
+ * Deal). It is out of the forward funnel but deliberately NOT folded into
+ * 'notq', which is defined only over the three early stages.
  *
  * Completed counts as in play — a completed Deal is a won deal, not a lost one.
+ *
+ * Valuation and Listed are the SELLER/LANDLORD path and are as much a
+ * conversion as a Deal is on the buyer side. They were previously missing from
+ * this function, so they fell through to 'other': counted in the lead total but
+ * shown in no stage row, which made the Google listing and valuation campaigns
+ * look like they produced leads and nothing else.
  */
-export type StageBucket = "new" | "qualified" | "viewing" | "offerRes" | "deal" | "notq" | "lost" | "other";
+export type StageBucket = "new" | "qualified" | "viewing" | "valuation" | "listed" | "offerRes" | "deal" | "notq" | "lost" | "other";
 export function bucketOf(stage: string, state: string): StageBucket {
   const st = norm(stage);
+  // The disqualified rule is defined over these three stages only.
   const early = st === "new" || st === "qualified" || st === "viewing";
   if (norm(state) === "closed") return early ? "notq" : "lost";
   if (st === "new") return "new";
   if (st === "qualified") return "qualified";
   if (st === "viewing") return "viewing";
+  if (st === "valuation") return "valuation";
+  if (st === "listed") return "listed";
   if (st === "offer" || st === "reserved") return "offerRes";
   if (st === "deal") return "deal";
   return "other";
@@ -69,6 +78,8 @@ const STAGE_FILTERS: { key: StageFilter; label: string }[] = [
   { key: "new", label: "New" },
   { key: "qualified", label: "Qualified" },
   { key: "viewing", label: "Viewing" },
+  { key: "valuation", label: "Valuation" },
+  { key: "listed", label: "Listed" },
   { key: "offerRes", label: "Offer / Reserved" },
   { key: "deal", label: "Deal" },
   { key: "notq", label: "Not qualified" },
@@ -99,13 +110,17 @@ type StageAgg = {
   newLeads: number;
   qualified: number;
   viewing: number;
+  valuation: number;
+  listed: number;
   offerRes: number;
   deals: number;
   notq: number;
   lost: number;
+  /** In play but at a stage this dashboard doesn't name — surfaced, never hidden. */
+  other: number;
 };
 
-const emptyStages = (): StageAgg => ({ matched: 0, leads: 0, newLeads: 0, qualified: 0, viewing: 0, offerRes: 0, deals: 0, notq: 0, lost: 0 });
+const emptyStages = (): StageAgg => ({ matched: 0, leads: 0, newLeads: 0, qualified: 0, viewing: 0, valuation: 0, listed: 0, offerRes: 0, deals: 0, notq: 0, lost: 0, other: 0 });
 function addStage(a: StageAgg, stage: string, state: string, n: number) {
   const b = bucketOf(stage, state);
   a.matched += n;
@@ -113,10 +128,13 @@ function addStage(a: StageAgg, stage: string, state: string, n: number) {
   if (b === "new") a.newLeads += n;
   else if (b === "qualified") a.qualified += n;
   else if (b === "viewing") a.viewing += n;
+  else if (b === "valuation") a.valuation += n;
+  else if (b === "listed") a.listed += n;
   else if (b === "offerRes") a.offerRes += n;
   else if (b === "deal") a.deals += n;
   else if (b === "notq") a.notq += n;
   else if (b === "lost") a.lost += n;
+  else a.other += n;
 }
 
 // ─── Trend bucketing ─────────────────────────────────────────────────────────
@@ -734,20 +752,31 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   );
 
   // ── Funnel ──────────────────────────────────────────────────────────────────
+  /**
+   * Two paths out of one lead pool, because Engage runs two.
+   *
+   * A Buyer or Tenant progresses Viewing → Offer/Reserved → Deal. A Seller or
+   * Landlord progresses Valuation → Listed, and a listing IS that lead's
+   * conversion — it will never reach a Deal stage. Showing only the buyer path
+   * made the listing and valuation campaigns read as producing leads and
+   * nothing else.
+   */
   const funnel = useMemo(
     () => [
-      { key: "leads" as const, label: "Leads", n: crmAgg.leads, note: "campaign-tagged, still live", lost: false },
-      { key: "qualified" as const, label: "Qualified", n: crmAgg.qualified, note: "at Qualified now", lost: false },
-      { key: "viewing" as const, label: "Viewing", n: crmAgg.viewing, note: "at Viewing now", lost: false },
-      { key: "offerRes" as const, label: "Offer / Reserved", n: crmAgg.offerRes, note: "in negotiation", lost: false },
-      { key: "deal" as const, label: "Deal", n: crmAgg.deals, note: "reached Deal stage", lost: false },
-      { key: "notq" as const, label: "Not qualified", n: crmAgg.notq, note: "closed at New / Qualified / Viewing", lost: true },
+      { key: "leads" as const, label: "Leads", n: crmAgg.leads, note: "campaign-tagged, still live", group: "top" as const },
+      { key: "qualified" as const, label: "Qualified", n: crmAgg.qualified, note: "at Qualified now", group: "top" as const },
+      { key: "viewing" as const, label: "Viewing", n: crmAgg.viewing, note: "buyer / tenant path", group: "buy" as const },
+      { key: "offerRes" as const, label: "Offer / Reserved", n: crmAgg.offerRes, note: "in negotiation", group: "buy" as const },
+      { key: "deal" as const, label: "Deal", n: crmAgg.deals, note: "reached Deal stage", group: "buy" as const },
+      { key: "valuation" as const, label: "Valuation", n: crmAgg.valuation, note: "seller / landlord path", group: "sell" as const },
+      { key: "listed" as const, label: "Listed", n: crmAgg.listed, note: "property listed — the seller-side conversion", group: "sell" as const },
+      { key: "notq" as const, label: "Not qualified", n: crmAgg.notq, note: "closed at New / Qualified / Viewing", group: "lost" as const },
     ],
     [crmAgg],
   );
   // Scale on the live funnel only: a big disqualified count would otherwise
   // flatten every bar above it.
-  const funnelMax = Math.max(...funnel.filter((s) => !s.lost).map((s) => s.n), 1);
+  const funnelMax = Math.max(...funnel.filter((s) => s.group !== "lost").map((s) => s.n), 1);
   const [hoverStage, setHoverStage] = useState<string | null>(null);
 
   // With a stage filter on, "Leads" would read 0 for a disqualified-only view,
@@ -939,12 +968,14 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
       <td style={{ textAlign: "right" }}>{fmt(a.viewing)}</td>
       <td style={{ textAlign: "right" }}>{fmt(a.offerRes)}</td>
       <td style={{ textAlign: "right" }}>{fmt(a.deals)}</td>
+      <td style={{ textAlign: "right", color: a.valuation ? C.blue : undefined }}>{fmt(a.valuation)}</td>
+      <td style={{ textAlign: "right", color: a.listed ? C.blue : undefined }}>{fmt(a.listed)}</td>
       <td style={{ textAlign: "right", color: a.notq ? C.coral : undefined }}>{fmt(a.notq)}</td>
     </>
   );
   const emptyStageCells = (
     <>
-      {Array.from({ length: 6 }).map((_, i) => (
+      {Array.from({ length: 8 }).map((_, i) => (
         <td key={i} style={{ textAlign: "right" }} className="muted">—</td>
       ))}
     </>
@@ -1093,7 +1124,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
           </div>
 
           {/* ── KPIs ─────────────────────────────────────────────────────────── */}
-          <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(4,1fr)" }}>
+          <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(5,1fr)" }}>
             <div className="kpi-card">
               <div className="kpi-label">Spend <HelpTip text={totals.singleCurrency ? `Media spend for the current filters, in ${totals.singleCurrency}.` : "The filtered accounts bill in more than one currency; the split is shown below and nothing is summed across currencies."} /></div>
               <div className="kpi-value">{totals.singleCurrency ? money(totals.spend, cur) : <span style={{ fontSize: 15 }}>Mixed currency</span>}</div>
@@ -1113,8 +1144,16 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
               <div className="kpi-value">{fmt(crmAgg.viewing)}</div>
             </div>
             <div className="kpi-card">
-              <div className="kpi-label">Offer / Reserved <HelpTip text="Leads in negotiation — at the Offer or Reserved stage, still open." /></div>
+              <div className="kpi-label">Offer / Reserved <HelpTip text="Leads in negotiation — at the Offer or Reserved stage, still open. Buyer / tenant path." /></div>
               <div className="kpi-value">{fmt(crmAgg.offerRes)}</div>
+            </div>
+            <div className="kpi-card">
+              <div className="kpi-label">Valuation <HelpTip text="Leads at the Valuation stage — the seller / landlord path. A valuation campaign's leads progress here, not to Viewing." /></div>
+              <div className="kpi-value" style={{ color: C.blue }}>{fmt(crmAgg.valuation)}</div>
+            </div>
+            <div className="kpi-card">
+              <div className="kpi-label">Listed <HelpTip text="Leads whose property is now Listed — the seller-side conversion, the equivalent of a Deal on the buyer side. Listing and valuation campaigns convert here and will never reach a Deal stage." /></div>
+              <div className="kpi-value" style={{ color: C.blue }}>{fmt(crmAgg.listed)}</div>
             </div>
             <div className="kpi-card">
               <div className="kpi-label">Deal stage <HelpTip text="Leads currently at the Deal stage of the pipeline. A stage snapshot — not the same as a signed transaction in the deals table." /></div>
@@ -1156,7 +1195,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
               Lead funnel <HelpTip text="Campaign-tagged CRM leads by the pipeline stage they sit at today, closed leads dropped. Each stage shows its share of leads." />
             </div>
             <div className="chart-sub">
-              {crm?.error && !crm.rows.length ? `CRM unavailable: ${crm.error}` : `${fmt(crmAgg.leads)} open leads${activeCodes.length === 1 ? ` · code ${activeCodes[0]}` : activeCodes.length > 1 ? ` · ${activeCodes.length} codes` : ""} · ${crm?.label ?? ""}${crmAgg.lost ? ` · ${fmt(crmAgg.lost)} closed later in the pipeline (lost)` : ""}${crm?.truncated ? " · largest groups only (row cap hit)" : ""}${crm?.error ? ` · ${crm.error}` : ""}`}
+              {crm?.error && !crm.rows.length ? `CRM unavailable: ${crm.error}` : `${fmt(crmAgg.leads)} open leads${activeCodes.length === 1 ? ` · code ${activeCodes[0]}` : activeCodes.length > 1 ? ` · ${activeCodes.length} codes` : ""} · ${crm?.label ?? ""}${crmAgg.lost ? ` · ${fmt(crmAgg.lost)} closed later in the pipeline (lost)` : ""}${crmAgg.other ? ` · ${fmt(crmAgg.other)} at a stage not shown above` : ""}${crm?.truncated ? " · largest groups only (row cap hit)" : ""}${crm?.error ? ` · ${crm.error}` : ""}`}
             </div>
             {codesOverlap && (
               <div className="chart-sub" style={{ marginTop: 8, color: C.coral }}>
@@ -1167,12 +1206,24 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
             )}
             <div style={{ display: "grid", gap: 6, marginTop: 12 }}>
               {funnel.map((st, i) => {
-                const colour = st.lost ? C.coral : C.green;
+                const colour = st.group === "lost" ? C.coral : st.group === "sell" ? C.blue : C.green;
                 const top = funnelTop[st.key] ?? [];
+                // A rule and a caption wherever the path changes, so the two
+                // flows can't be misread as one sequence.
+                const newGroup = i > 0 && funnel[i - 1].group !== st.group;
+                const caption =
+                  st.group === "buy" ? "Buyer / tenant path"
+                    : st.group === "sell" ? "Seller / landlord path — a listing is this lead's conversion"
+                      : st.group === "lost" ? "Disqualified" : null;
                 return (
+                  <div key={st.key}>
+                    {newGroup && caption && (
+                      <div style={{ borderTop: "1px dashed var(--border)", marginTop: 8, paddingTop: 8, fontSize: 10, fontWeight: 700, letterSpacing: 0.4, textTransform: "uppercase", color: colour }}>
+                        {caption}
+                      </div>
+                    )}
                   <div
-                    key={st.key}
-                    style={{ display: "grid", gridTemplateColumns: "minmax(120px,150px) 1fr minmax(130px,170px)", alignItems: "center", gap: 10, position: "relative", borderTop: st.lost ? "1px dashed var(--border)" : undefined, paddingTop: st.lost ? 8 : 0, marginTop: st.lost ? 4 : 0 }}
+                    style={{ display: "grid", gridTemplateColumns: "minmax(120px,150px) 1fr minmax(130px,170px)", alignItems: "center", gap: 10, position: "relative" }}
                     onMouseEnter={() => setHoverStage(st.key)}
                     onMouseLeave={() => setHoverStage(null)}
                   >
@@ -1224,8 +1275,9 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
                     </div>
                     <div style={{ fontSize: 12, textAlign: "right" }}>
                       <strong>{fmt(st.n)}</strong>
-                      {!st.lost && i > 0 && funnel[0].n > 0 && <span className="muted"> · {pct0(st.n / funnel[0].n)} of leads</span>}
-                      {st.lost && crmAgg.matched > 0 && <span className="muted"> · {pct0(st.n / crmAgg.matched)} of all</span>}
+                      {st.group !== "lost" && i > 0 && funnel[0].n > 0 && <span className="muted"> · {pct0(st.n / funnel[0].n)} of leads</span>}
+                      {st.group === "lost" && crmAgg.matched > 0 && <span className="muted"> · {pct0(st.n / crmAgg.matched)} of all</span>}
+                    </div>
                     </div>
                   </div>
                 );
@@ -1256,6 +1308,8 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
                       <th style={{ textAlign: "right" }}>Viewing</th>
                       <th style={{ textAlign: "right" }}>Offer/Res.</th>
                       <th style={{ textAlign: "right" }}>Deal</th>
+                      <th style={{ textAlign: "right" }}>Valuation</th>
+                      <th style={{ textAlign: "right" }}>Listed</th>
                       <th style={{ textAlign: "right" }}>Not qual.</th>
                     </tr>
                   </thead>
@@ -1349,7 +1403,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
                       );
                     })}
                     {!tree.length && (
-                      <tr><td colSpan={10} className="muted">No campaign codes match the filters.</td></tr>
+                      <tr><td colSpan={12} className="muted">No campaign codes match the filters.</td></tr>
                     )}
                   </tbody>
                 </table>
@@ -1663,7 +1717,7 @@ function DigitalSkeleton() {
   return (
     <div aria-busy="true" aria-label="Loading paid media data…">
       <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(3,1fr)" }}>
-        {Array.from({ length: 6 }).map((_, i) => (
+        {Array.from({ length: 8 }).map((_, i) => (
           <div key={i} className="kpi-card">
             <div className="skeleton sk-line short" />
             <div className="skeleton sk-big" />
@@ -1690,7 +1744,7 @@ function DigitalSkeleton() {
       </div>
       <div className="chart-card" style={{ marginTop: 4 }}>
         <div className="skeleton sk-line" style={{ width: "25%" }} />
-        {Array.from({ length: 6 }).map((_, i) => (
+        {Array.from({ length: 8 }).map((_, i) => (
           <div key={i} className="skeleton sk-line" style={{ width: `${95 - i * 6}%` }} />
         ))}
       </div>
