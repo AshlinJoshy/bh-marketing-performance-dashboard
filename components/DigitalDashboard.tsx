@@ -212,8 +212,23 @@ function FilterSelect({
   onClear: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [dropUp, setDropUp] = useState(false);
   const [search, setSearch] = useState("");
   const boxRef = useRef<HTMLDivElement>(null);
+  const PANEL_H = 330;
+
+  /**
+   * Open upward when there isn't room below. #main is the scrolling container,
+   * so a panel opening downward near the bottom of the viewport is cut off at
+   * its edge — measured on open rather than guessed, because the control's
+   * position depends on how far the page is scrolled.
+   */
+  const place = useCallback(() => {
+    const r = boxRef.current?.getBoundingClientRect();
+    if (!r) return;
+    const below = window.innerHeight - r.bottom;
+    setDropUp(below < PANEL_H && r.top > below);
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -237,13 +252,29 @@ function FilterSelect({
       <button
         className={`search-box${selected.length ? " active" : ""}`}
         style={{ width: "100%", minWidth: 0, textAlign: "left", cursor: "pointer", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: selected.length ? 600 : 400 }}
-        onClick={() => { setOpen((v) => !v); setSearch(""); }}
+        onClick={() => { if (!open) place(); setOpen((v) => !v); setSearch(""); }}
         title={selected.length ? `${label}: ${selected.join(", ")}` : `${label}: all`}
       >
         {summary} <span className="muted">▾</span>
       </button>
       {open && (
-        <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 40, width: 320, maxWidth: "90vw", maxHeight: 320, overflowY: "auto", background: "#fff", border: "1px solid var(--border)", borderRadius: 8, boxShadow: "0 6px 18px rgba(0,0,0,.08)", padding: 6 }}>
+        <div
+          style={{
+            position: "absolute",
+            ...(dropUp ? { bottom: "100%", marginBottom: 4 } : { top: "100%", marginTop: 4 }),
+            left: 0,
+            zIndex: 60,
+            width: 320,
+            maxWidth: "90vw",
+            maxHeight: PANEL_H - 20,
+            overflowY: "auto",
+            background: "#fff",
+            border: "1px solid var(--border)",
+            borderRadius: 8,
+            boxShadow: "0 6px 18px rgba(0,0,0,.12)",
+            padding: 6,
+          }}
+        >
           <input
             autoFocus
             className="search-box"
@@ -504,13 +535,16 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   }, [crm?.codeRows, codes]);
 
   const crmBase = useCallback(
-    (skip: "campaign" | "source" | "medium" | "content" | null) => {
+    (skip: "campaign" | "source" | "medium" | "content" | "code" | null) => {
       const rows = crm?.rows ?? [];
       const needle = norm(q);
       return rows.filter(
         (r) =>
           (platformFilter === "all" || srcMatches(platformFilter, r.source)) &&
-          (!campaignsUnderCode || campaignsUnderCode.has(norm(r.campaign))) &&
+          (skip === "code" || !campaignsUnderCode || campaignsUnderCode.has(norm(r.campaign))) &&
+          // The stage filter narrows every facet: picking Deal must leave only
+          // the utm values that actually appear on Deal-stage leads.
+          (stageFilter === "all" || bucketOf(r.stage, r.state) === stageFilter) &&
           (skip === "campaign" || !utmCamps.length || utmCamps.includes(norm(r.campaign))) &&
           (skip === "source" || !utmSrcs.length || utmSrcs.includes(norm(r.source))) &&
           (skip === "medium" || !utmMeds.length || utmMeds.includes(norm(r.medium))) &&
@@ -518,7 +552,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
           (!needle || norm(r.campaign).includes(needle)),
       );
     },
-    [crm?.rows, platformFilter, campaignsUnderCode, utmCamps, utmSrcs, utmMeds, utmContents, q],
+    [crm?.rows, platformFilter, campaignsUnderCode, utmCamps, utmSrcs, utmMeds, utmContents, q, stageFilter],
   );
 
   const facetOf = (rows: { campaign: string; source: string; medium: string; content: string; n: number }[], key: "campaign" | "source" | "medium" | "content") => {
@@ -536,16 +570,34 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   const contentOptions = useMemo(() => facetOf(crmBase("content"), "content"), [crmBase]);
 
   /** Code options, narrowed by the campaign facet when one is chosen. */
+  /**
+   * Campaigns still visible under every filter except the code selection —
+   * used to narrow the code facet without it narrowing itself.
+   */
+  const campaignsForCodes = useMemo(() => new Set(crmBase("code").map((r) => norm(r.campaign))), [crmBase]);
+  /**
+   * True when something other than the code selection is narrowing campaigns.
+   *
+   * The guard matters: the utm query only returns leads that HAVE a
+   * utm_campaign, so a code whose leads are all untagged (the WhatsApp/email
+   * button leads) has no campaign in that set. Intersecting unconditionally
+   * would erase those codes from the list even with no filters on.
+   */
+  const narrowingCampaigns =
+    platformFilter !== "all" || utmCamps.length > 0 || utmSrcs.length > 0 || utmMeds.length > 0 || utmContents.length > 0 || !!q.trim();
+
   const codeOptions = useMemo(() => {
     const acc = new Map<string, number>();
     for (const r of crm?.codeRows ?? []) {
+      if (stageFilter !== "all" && bucketOf(r.stage, r.state) !== stageFilter) continue;
       if (utmCamps.length && !utmCamps.includes(norm(r.campaign))) continue;
+      if (narrowingCampaigns && !campaignsForCodes.has(norm(r.campaign))) continue;
       const v = norm(r.code);
       if (v === "(unlinked)") continue;
       acc.set(v, (acc.get(v) ?? 0) + r.n);
     }
     return [...acc].sort((a, b) => b[1] - a[1]);
-  }, [crm?.codeRows, utmCamps]);
+  }, [crm?.codeRows, utmCamps, stageFilter, narrowingCampaigns, campaignsForCodes]);
 
   // A value that an upstream filter has made impossible is pruned rather than
   // left in place to zero the page. Prune to empty = back to "all".
@@ -568,11 +620,10 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
           (!activeCamps.length || activeCamps.includes(norm(r.campaign))) &&
           (!activeSrcs.length || activeSrcs.includes(norm(r.source))) &&
           (!activeMeds.length || activeMeds.includes(norm(r.medium))) &&
-          (!activeContents.length || activeContents.includes(norm(r.content))) &&
-          (stageFilter === "all" || bucketOf(r.stage, r.state) === stageFilter),
+          (!activeContents.length || activeContents.includes(norm(r.content))),
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [crmBase, campsKey, srcsKey, medsKey, contentsKey, stageFilter],
+    [crmBase, campsKey, srcsKey, medsKey, contentsKey],
   );
 
   const utmFiltersIdle =
@@ -1025,7 +1076,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8 }}>
               <span className="muted" style={{ fontSize: 11, whiteSpace: "nowrap" }}>
-                Engage <HelpTip text="Straight from Engage: campaign_code is the campaign entity's reference (a code groups several utm_campaigns); the four utm_* fields are what each lead's record carries. All five are multi-select, searchable and interlinked — each offers only values that exist under the other active filters." />
+                Engage <HelpTip text="Straight from Engage: campaign_code is the campaign entity's reference (a code groups several utm_campaigns); the four utm_* fields are what each lead's record carries. All five are multi-select, searchable and faceted: each dropdown offers only the values that still exist under every other active filter, including the lead stage — so picking Deal leaves only the utm values that appear on Deal-stage leads, with counts to match." />
               </span>
             </div>
             {/* A wrapping grid, not a flex row: `.search-box` carries a 240px
@@ -1129,34 +1180,53 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
                       {st.label}
                       <div className="muted" style={{ fontSize: 10, fontWeight: 400 }}>{st.note}</div>
                     </div>
-                    <div style={{ background: "var(--warm-white)", borderRadius: 5, height: 26, position: "relative", overflow: "hidden", cursor: top.length ? "help" : "default" }}>
-                      <div style={{ width: `${Math.max((st.n / funnelMax) * 100, st.n > 0 ? 1.5 : 0)}%`, background: colour, opacity: i === 0 ? 0.9 : 0.7, height: "100%", borderRadius: 5, transition: "width .3s" }} />
+                    {/* The popover lives in this cell, not the row, so it lines
+                        up with the bar whatever width the label column takes. */}
+                    <div style={{ position: "relative", minWidth: 0 }}>
+                      <div style={{ background: "var(--warm-white)", borderRadius: 5, height: 26, position: "relative", overflow: "hidden", cursor: top.length ? "help" : "default" }}>
+                        <div style={{ width: `${Math.max((st.n / funnelMax) * 100, st.n > 0 ? 1.5 : 0)}%`, background: colour, opacity: i === 0 ? 0.9 : 0.7, height: "100%", borderRadius: 5, transition: "width .3s" }} />
+                      </div>
+                      {hoverStage === st.key && top.length > 0 && (
+                        <div
+                          style={{
+                            position: "absolute",
+                            // The lower rows open upward: below them is the card
+                            // edge and then the next card.
+                            ...(i >= funnel.length - 2 ? { bottom: "100%", marginBottom: 6 } : { top: "100%", marginTop: 6 }),
+                            left: 0,
+                            zIndex: 60,
+                            minWidth: 260,
+                            maxWidth: "min(460px, 90vw)",
+                            background: "#fff",
+                            border: "1px solid var(--border)",
+                            borderRadius: 8,
+                            boxShadow: "0 8px 22px rgba(0,0,0,.12)",
+                            padding: "8px 10px",
+                            pointerEvents: "none",
+                          }}
+                        >
+                          <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6, color: colour }}>
+                            Top campaigns · {st.label}
+                          </div>
+                          {top.map((t) => (
+                            <div key={t.campaign} style={{ display: "flex", gap: 10, fontSize: 11, padding: "2px 0" }}>
+                              <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={t.campaign}>{t.campaign}</span>
+                              <strong>{fmt(t.n)}</strong>
+                            </div>
+                          ))}
+                          {st.n > top.reduce((a, t) => a + t.n, 0) && (
+                            <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
+                              + {fmt(st.n - top.reduce((a, t) => a + t.n, 0))} across other campaigns
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                     <div style={{ fontSize: 12, textAlign: "right" }}>
                       <strong>{fmt(st.n)}</strong>
                       {!st.lost && i > 0 && funnel[0].n > 0 && <span className="muted"> · {pct0(st.n / funnel[0].n)} of leads</span>}
                       {st.lost && crmAgg.matched > 0 && <span className="muted"> · {pct0(st.n / crmAgg.matched)} of all</span>}
                     </div>
-                    {/* Top campaigns behind this bar, from the same rows that set
-                        its height — so the breakdown always reconciles. */}
-                    {hoverStage === st.key && top.length > 0 && (
-                      <div style={{ position: "absolute", left: 150, top: "100%", zIndex: 30, minWidth: 300, maxWidth: 460, background: "#fff", border: "1px solid var(--border)", borderRadius: 8, boxShadow: "0 8px 22px rgba(0,0,0,.10)", padding: "8px 10px", pointerEvents: "none" }}>
-                        <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6, color: colour }}>
-                          Top campaigns · {st.label}
-                        </div>
-                        {top.map((t) => (
-                          <div key={t.campaign} style={{ display: "flex", gap: 10, fontSize: 11, padding: "2px 0" }}>
-                            <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={t.campaign}>{t.campaign}</span>
-                            <strong>{fmt(t.n)}</strong>
-                          </div>
-                        ))}
-                        {st.n > top.reduce((a, t) => a + t.n, 0) && (
-                          <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
-                            + {fmt(st.n - top.reduce((a, t) => a + t.n, 0))} across other campaigns
-                          </div>
-                        )}
-                      </div>
-                    )}
                   </div>
                 );
               })}

@@ -128,7 +128,12 @@ body {
    card instead. Letting these shrink is what keeps charts inside their cards at
    any zoom level. */
 .chart-canvas-wrap, .charts-grid-2 > *, .charts-grid-3 > * { min-width: 0; }
-.chart-card { overflow: hidden; }
+/* Belt to the min-width braces above: a canvas never exceeds its wrapper.
+   NOTE: deliberately not `overflow: hidden` on .chart-card — cards host
+   absolutely-positioned popovers (filter dropdowns, the funnel's hover
+   breakdown) that must be free to escape the card's bounds. Clipping the card
+   silently cropped them. */
+.chart-canvas-wrap > canvas { max-width: 100%; }
 /* A row of filter controls that must be free to wrap. `.search-box` carries a
    240px floor for the page-wide search boxes it was written for; inside a filter
    bar that floor forces every control onto one 1200px line, overflowing the card
