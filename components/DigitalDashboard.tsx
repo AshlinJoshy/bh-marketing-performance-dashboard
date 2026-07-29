@@ -596,7 +596,12 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
                       <tr key={`${f.platform}|${f.accountId}`}>
                         <td>{f.accountName}</td>
                         <td className="muted">{PLATFORMS[f.platform].label}</td>
-                        <td style={{ fontSize: 11 }}>{f.reason}</td>
+                        {/* title carries the untouched response — the summary is
+                            what belongs in the cell, but the raw body is still
+                            one hover away when it isn't enough. */}
+                        <td style={{ fontSize: 11, maxWidth: 520, whiteSpace: "normal" }} title={f.raw}>
+                          {f.reason}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -607,6 +612,25 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
                   Supermetrics only licenses a subset of ad accounts for querying. To change which ones, edit the prioritised
                   accounts on the{" "}
                   <a href="https://hub.supermetrics.com/token-management" target="_blank" rel="noopener noreferrer">Supermetrics hub</a>.
+                </div>
+              )}
+              {/* An auth failure is a deployment variable, not a data problem, so
+                  it gets told apart from everything else and names the fix. */}
+              {data.failures.some((f) => f.authProblem) && (
+                <div className="chart-sub" style={{ marginTop: 10 }}>
+                  <strong>This is a configuration fix, not missing data.</strong> Supermetrics authorises each source to the person
+                  who connected it, so every platform needs the login that authorised it:
+                  {[...new Set(data.failures.filter((f) => f.authProblem).map((f) => f.platform))].map((p) => (
+                    <div key={p} style={{ marginTop: 4 }}>
+                      <code style={{ background: "var(--warm-white)", padding: "1px 6px", borderRadius: 4 }}>{PLATFORMS[p].dsUserEnv}</code>{" "}
+                      → {PLATFORMS[p].dsUserHint}
+                    </div>
+                  ))}
+                  <div style={{ marginTop: 6 }}>
+                    Confirm who owns each connection under{" "}
+                    <a href="https://hub.supermetrics.com/token-management" target="_blank" rel="noopener noreferrer">token management</a>, then
+                    add those variables to the deployment.
+                  </div>
                 </div>
               )}
             </div>

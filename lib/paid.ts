@@ -2,9 +2,16 @@
 // through Supermetrics. Server-only.
 //
 // Uses the same Supermetrics Data Fetching API as lib/gsc.ts:
-//   SUPERMETRICS_API_KEY   the Data Fetching API key (hub.supermetrics.com)
-//   SUPERMETRICS_DS_USER   the Supermetrics login that authorized the sources
-//   SUPERMETRICS_API_URL   override the endpoint if your plan differs
+//   SUPERMETRICS_API_KEY           the Data Fetching API key (hub.supermetrics.com)
+//   SUPERMETRICS_API_URL           override the endpoint if your plan differs
+//   SUPERMETRICS_DS_USER_GOOGLE    ─┐ the login that authorised each source.
+//   SUPERMETRICS_DS_USER_META       │ Per source, NOT per key: sending the wrong
+//   SUPERMETRICS_DS_USER_LINKEDIN  ─┘ one returns 403 QUERY_AUTH_UNAVAILABLE.
+//
+// SUPERMETRICS_DS_USER is deliberately NOT read here. It holds the login that
+// authorised Search Console, which is authorised for nothing else, so falling
+// back to it made every ad platform fail with a 403 that read like a data
+// problem.
 //
 // Every field ID below was verified against the live account, not taken from
 // documentation — Supermetrics field IDs are per-source and inconsistent in case
@@ -60,9 +67,14 @@ export interface AccountFailure {
   platform: PaidPlatform;
   accountId: string;
   accountName: string;
+  /** Plain-language cause, suitable for showing in a table cell. */
   reason: string;
   /** Supermetrics licenses a subset of ad accounts; this one is outside it. */
   notPrioritised: boolean;
+  /** Wrong or missing ds_user for this source — a config fix, not a data one. */
+  authProblem: boolean;
+  /** The untouched response, for when the summary is not enough. */
+  raw?: string;
 }
 
 export interface PaidData {
@@ -112,12 +124,25 @@ interface PlatformSpec {
   dsId: string;
   label: string;
   fields: FieldMap;
+  /**
+   * Env var naming the Supermetrics login that authorised THIS source.
+   *
+   * Authorisation is per source and per user, not per API key: each connection
+   * is owned by whoever linked it. Sending the wrong login returns HTTP 403
+   * QUERY_AUTH_UNAVAILABLE, which is what happened when this reused the GSC
+   * client's user for the ad platforms.
+   */
+  dsUserEnv: string;
+  /** Who Supermetrics reports as having connected this source, for the error. */
+  dsUserHint: string;
 }
 
 export const PLATFORMS: Record<PaidPlatform, PlatformSpec> = {
   google: {
     dsId: "AW",
     label: "Google Ads",
+    dsUserEnv: "SUPERMETRICS_DS_USER_GOOGLE",
+    dsUserHint: "alina.osmanli@bhomes.com, marketing@bhomes.com or digital@bhomes.com",
     // Verified live: returned BH-Search-UAE-EN-Valuation, GGL_SEARCH_CT1_BRAND.
     fields: {
       date: "Date",
@@ -132,6 +157,8 @@ export const PLATFORMS: Record<PaidPlatform, PlatformSpec> = {
   meta: {
     dsId: "FA",
     label: "Meta Ads",
+    dsUserEnv: "SUPERMETRICS_DS_USER_META",
+    dsUserHint: "Ashlin Cheeran — try the Facebook user id 122111799831053725",
     fields: {
       date: "Date",
       campaign: "adcampaign_name",
@@ -148,6 +175,8 @@ export const PLATFORMS: Record<PaidPlatform, PlatformSpec> = {
   linkedin: {
     dsId: "LIA",
     label: "LinkedIn Ads",
+    dsUserEnv: "SUPERMETRICS_DS_USER_LINKEDIN",
+    dsUserHint: "Qaswa Kamran",
     // Verified live: returned Spotlight, InMail. `cost` canonicalises to
     // `spend`, so the canonical ID is used directly.
     fields: {
@@ -205,6 +234,7 @@ async function smQuery(
   fields: string[],
   from: string,
   to: string,
+  dsUser: string | undefined,
   timeoutMs = 25000,
 ): Promise<SmResult> {
   const key = process.env.SUPERMETRICS_API_KEY;
@@ -220,13 +250,16 @@ async function smQuery(
   const payload: Record<string, unknown> = {
     ds_id: dsId,
     ds_accounts: [account],
-    ds_user: process.env.SUPERMETRICS_DS_USER || "zahra.firouzi@bhomes.com",
     date_range_type: "custom",
     start_date: from,
     end_date: to,
     fields: fields.join(","),
     max_rows: 10000,
   };
+  // Omitted when unconfigured rather than defaulted. There is no sensible
+  // fallback: the GSC client's login is authorised for Search Console and
+  // nothing else, so borrowing it guarantees a 403 on every ad platform.
+  if (dsUser) payload.ds_user = dsUser;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -258,6 +291,34 @@ async function smQuery(
   } finally {
     clearTimeout(t);
   }
+}
+
+/**
+ * Turn a Supermetrics failure into something a reader can act on.
+ *
+ * The raw body is a JSON envelope whose one useful token is buried among request
+ * ids, so printing it into a table cell fills the column and communicates
+ * nothing. The two failures that actually occur are told apart because they need
+ * opposite responses: an unlicensed account is a subscription change, a bad
+ * ds_user is a deployment variable.
+ */
+function explain(raw: string, platform: PaidPlatform): { reason: string; notPrioritised: boolean; authProblem: boolean; raw: string } {
+  const spec = PLATFORMS[platform];
+  const base = { notPrioritised: false, authProblem: false, raw };
+  if (/prioritis|prioritiz/i.test(raw)) {
+    return { ...base, notPrioritised: true, reason: "Not a prioritised account on this Supermetrics subscription, so its data cannot be pulled." };
+  }
+  if (/QUERY_AUTH_UNAVAILABLE|not authori[sz]ed|invalid[_ ]?grant/i.test(raw)) {
+    return {
+      ...base,
+      authProblem: true,
+      reason: `Supermetrics has no ${spec.label} authorisation for the login being used. Set ${spec.dsUserEnv} to the account that connected it (${spec.dsUserHint}).`,
+    };
+  }
+  if (/timed out/i.test(raw)) return { ...base, reason: `${raw} — try a shorter date range.` };
+  // Unrecognised: surface the message but keep it to a readable length.
+  const m = /"description"\s*:\s*"([^"]{4,300})"/.exec(raw) || /"message"\s*:\s*"([^"]{4,300})"/.exec(raw);
+  return { ...base, reason: m ? m[1] : raw.slice(0, 240) };
 }
 
 const num = (v: unknown): number => {
@@ -313,21 +374,9 @@ async function fetchAccount(platform: PaidPlatform, acct: PaidAccount, from: str
   }
   const fieldIds = order.map((k) => f[k] as string);
 
-  const res = await smQuery(spec.dsId, acct.id, fieldIds, from, to);
+  const res = await smQuery(spec.dsId, acct.id, fieldIds, from, to, process.env[spec.dsUserEnv]);
   if ("error" in res) {
-    const notPrioritised = /prioritis|prioritiz/i.test(res.error);
-    return {
-      rows: [],
-      failure: {
-        platform,
-        accountId: acct.id,
-        accountName: acct.name,
-        reason: notPrioritised
-          ? "Not a prioritised account on this Supermetrics subscription, so its data cannot be pulled."
-          : res.error,
-        notPrioritised,
-      },
-    };
+    return { rows: [], failure: { platform, accountId: acct.id, accountName: acct.name, ...explain(res.error, platform) } };
   }
 
   const at = (row: any[], k: keyof FieldMap): unknown => {
