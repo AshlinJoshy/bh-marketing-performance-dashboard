@@ -53,13 +53,22 @@ const LEVEL_LABEL: Record<PaidLevel, string> = { campaign: "Campaigns", adset: "
 
 type CrmJoin = { leads: number; qualified: number; deals: number };
 
-export default function DigitalDashboard({ initial, config }: { initial: PaidData; config: PaidConfig }) {
-  const [data, setData] = useState<PaidData>(initial);
+// Default custom-range inputs. Evaluated once at module load, so the clock read
+// never happens during render.
+const ymdOf = (t: number) => new Date(t).toISOString().slice(0, 10);
+const DEFAULT_TO = ymdOf(Date.now());
+const DEFAULT_FROM = ymdOf(Date.now() - 29 * 864e5);
+
+export default function DigitalDashboard({ initial, config }: { initial: PaidData | null; config: PaidConfig }) {
+  // `initial` is null on purpose: the server renders the shell without waiting
+  // on Supermetrics (up to 25s per account), and the media numbers stream in
+  // here behind a skeleton instead of blocking the navigation.
+  const [data, setData] = useState<PaidData | null>(initial);
   const [level, setLevel] = useState<PaidLevel>("campaign");
   const [days, setDays] = useState(30);
   const [mode, setMode] = useState<"preset" | "custom">("preset");
-  const [from, setFrom] = useState(initial.from);
-  const [to, setTo] = useState(initial.to);
+  const [from, setFrom] = useState(initial?.from ?? DEFAULT_FROM);
+  const [to, setTo] = useState(initial?.to ?? DEFAULT_TO);
   const [loading, setLoading] = useState(false);
 
   // CRM half — fetched separately so the slow CRM view can never delay the
@@ -76,7 +85,11 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     }),
     [config],
   );
-  const [cfgOpen, setCfgOpen] = useState(initial.unconfigured);
+  // With no server-side data the "should the picker auto-open" signal comes
+  // from the config itself: zero selected accounts means there is nothing to
+  // load until the user picks some.
+  const nothingSelected = PLATFORM_ORDER.every((p) => (config.accounts[p] ?? []).length === 0);
+  const [cfgOpen, setCfgOpen] = useState(initial ? initial.unconfigured : nothingSelected);
   const [sel, setSel] = useState<Record<PaidPlatform, string[]>>(initialSel);
   const [savedSel, setSavedSel] = useState<Record<PaidPlatform, string[]>>(initialSel);
   const [showHidden, setShowHidden] = useState(false);
@@ -125,13 +138,14 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     }
   }, []);
 
-  // CRM loads on mount ON PURPOSE — the Metabase view is slow enough that
-  // server-rendering it would stall the media numbers, so it stays a client
-  // load. Flipping the loading flag during the mount effect is the intended
-  // behaviour here, not a cascading render. Level changes don't refetch it:
-  // the join key is the campaign either way.
+  // Both halves load on mount ON PURPOSE — media because the server no longer
+  // blocks navigation on Supermetrics, CRM because the Metabase view is slow.
+  // Flipping loading flags during the mount effect is the intended behaviour
+  // here, not a cascading render. Level changes refetch media only; the CRM
+  // join key is the campaign either way.
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (!initial) loadMedia(rangeQs(), "campaign");
     loadCrm(rangeQs());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -190,7 +204,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   // ── Media side, filtered ────────────────────────────────────────────────────
   const mediaRows = useMemo(() => {
     const needle = norm(q);
-    return data.rows.filter(
+    return (data?.rows ?? []).filter(
       (r) =>
         (platformFilter === "all" || r.platform === platformFilter) &&
         (goalFilter === "all" || r.goal === goalFilter) &&
@@ -200,7 +214,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
           norm(r.ad ?? "").includes(needle) ||
           norm(r.accountName).includes(needle)),
     );
-  }, [data.rows, platformFilter, goalFilter, q]);
+  }, [data?.rows, platformFilter, goalFilter, q]);
 
   const totals = useMemo(() => {
     const byCur = new Map<string, number>();
@@ -281,7 +295,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   /** CRM campaigns that matched nothing on the media side — the tagging gaps. */
   const unmatchedCrm = useMemo(() => {
     const mediaKeys = new Set<string>();
-    for (const r of data.rows) {
+    for (const r of data?.rows ?? []) {
       mediaKeys.add(norm(r.campaign));
       if (r.campaignId) mediaKeys.add(norm(r.campaignId));
     }
@@ -294,7 +308,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
       acc.set(k, cur);
     }
     return [...acc.values()].sort((a, b) => b.leads - a.leads).slice(0, 10);
-  }, [crmFiltered, data.rows]);
+  }, [crmFiltered, data?.rows]);
 
   const utmSources = useMemo(() => {
     const acc = new Map<string, number>();
@@ -323,8 +337,8 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   const cpl = crmAgg.total > 0 && totals.singleCurrency ? totals.spend / crmAgg.total : null;
   const cpql = crmAgg.qualified > 0 && totals.singleCurrency ? totals.spend / crmAgg.qualified : null;
   const selectedCount = PLATFORM_ORDER.reduce((n, p) => n + sel[p].length, 0);
-  const goalsPresent = useMemo(() => [...new Set(data.rows.map((r) => r.goal))], [data.rows]);
-  const platformsPresent = useMemo(() => PLATFORM_ORDER.filter((p) => data.rows.some((r) => r.platform === p)), [data.rows]);
+  const goalsPresent = useMemo(() => [...new Set((data?.rows ?? []).map((r) => r.goal))], [data?.rows]);
+  const platformsPresent = useMemo(() => PLATFORM_ORDER.filter((p) => (data?.rows ?? []).some((r) => r.platform === p)), [data?.rows]);
 
   const byGoal = useMemo(() => {
     const acc = new Map<CampaignGoal, number>();
@@ -355,8 +369,8 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
         <div>
           <h1>Digital Performance</h1>
           <p className="page-sub">
-            Paid media · Google, Meta &amp; LinkedIn via Supermetrics · CRM funnel via Metabase · {data.label}
-            {loading ? " · refreshing…" : ""}
+            Paid media · Google, Meta &amp; LinkedIn via Supermetrics · CRM funnel via Metabase · {data ? data.label : "loading…"}
+            {data && loading ? " · refreshing…" : ""}
           </p>
         </div>
         <div className="filter-row" style={{ flexWrap: "wrap" }}>
@@ -422,7 +436,20 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
         </div>
       )}
 
-      {!data.connected ? (
+      {!data ? (
+        nothingSelected && !loading ? (
+          <div className="chart-card">
+            <div className="empty-state" style={{ height: "auto", padding: "26px 20px", display: "block", textAlign: "center" }}>
+              <div style={{ fontWeight: 600, color: C.dark, marginBottom: 8 }}>No accounts selected yet</div>
+              <div style={{ fontSize: 12, color: C.mid, lineHeight: 1.7, maxWidth: 520, margin: "0 auto" }}>
+                Open <strong>⚙</strong> above and tick the ad accounts you want on this dashboard.
+              </div>
+            </div>
+          </div>
+        ) : (
+          <DigitalSkeleton />
+        )
+      ) : !data.connected ? (
         <div className="chart-card">
           <div className="empty-state" style={{ height: "auto", padding: "26px 20px", display: "block", textAlign: "center" }}>
             <div style={{ fontWeight: 600, color: C.dark, marginBottom: 8 }}>Supermetrics not connected</div>
@@ -882,6 +909,49 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+/**
+ * Placeholder mirroring the real layout — KPI strip, funnel, charts, table — so
+ * the page keeps its shape while Supermetrics answers (up to ~25s per account).
+ */
+function DigitalSkeleton() {
+  return (
+    <div aria-busy="true" aria-label="Loading paid media data…">
+      <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(3,1fr)" }}>
+        {Array.from({ length: 6 }).map((_, i) => (
+          <div key={i} className="kpi-card">
+            <div className="skeleton sk-line short" />
+            <div className="skeleton sk-big" />
+          </div>
+        ))}
+      </div>
+      <div className="chart-card" style={{ marginBottom: 16 }}>
+        <div className="skeleton sk-line" style={{ width: "30%" }} />
+        {Array.from({ length: 5 }).map((_, i) => (
+          <div key={i} style={{ display: "grid", gridTemplateColumns: "150px 1fr 170px", alignItems: "center", gap: 10, margin: "10px 0" }}>
+            <div className="skeleton sk-line" style={{ margin: 0 }} />
+            <div className="skeleton" style={{ height: 26, width: `${90 - i * 18}%` }} />
+            <div className="skeleton sk-line short" style={{ margin: 0, justifySelf: "end" }} />
+          </div>
+        ))}
+      </div>
+      <div className="charts-grid-2">
+        {Array.from({ length: 2 }).map((_, i) => (
+          <div key={i} className="chart-card">
+            <div className="skeleton sk-line" style={{ width: "40%" }} />
+            <div className="skeleton sk-block" />
+          </div>
+        ))}
+      </div>
+      <div className="chart-card" style={{ marginTop: 4 }}>
+        <div className="skeleton sk-line" style={{ width: "25%" }} />
+        {Array.from({ length: 6 }).map((_, i) => (
+          <div key={i} className="skeleton sk-line" style={{ width: `${95 - i * 6}%` }} />
+        ))}
+      </div>
     </div>
   );
 }
