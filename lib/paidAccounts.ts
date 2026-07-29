@@ -84,15 +84,18 @@ export const ACCOUNT_CATALOG: Record<PaidPlatform, CatalogAccount[]> = {
 };
 
 /**
- * Accounts confirmed readable during discovery. Supermetrics licenses only a
- * subset of ad accounts for querying, and an account being listed above says
- * nothing about whether it is licensed — two of the three Meta accounts tried
- * were rejected as "not a prioritised account". This is what was actually
- * verified, so the picker can mark it.
+ * Accounts confirmed readable by actually querying them. Supermetrics licenses
+ * only a subset of ad accounts for querying, and an account being listed above
+ * says nothing about whether it is licensed — so this records what was actually
+ * verified, and when.
+ *
+ * Last re-verified 2026-07-29, after the prioritised list was edited on the
+ * hub: betterhomes marketing and Betterhomes Secondary now return live campaign
+ * rows (BH-Future-Living-Survey…, BH-Leasing-C1-Tower…, OUTCOME_LEADS, AED).
  */
 export const VERIFIED_READABLE: Record<PaidPlatform, string[]> = {
   google: ["5063000241"],
-  meta: ["act_418631585177618"],
+  meta: ["act_418631585177618", "act_873275145025438", "act_9508663712551146"],
   linkedin: ["504276125"],
 };
 
@@ -109,9 +112,12 @@ export const SUPERMETRICS_SUBSCRIPTION_URL = "https://hub.supermetrics.com/subsc
  * Supermetrics hub API and rejected as "not a prioritised account". The live
  * dashboard sees these as a bare QUERY_ERROR; this list is what lets that
  * generic code be reported as its verified meaning.
+ *
+ * Re-probed 2026-07-29 after the prioritised list was edited: marketing and
+ * Secondary moved to VERIFIED_READABLE above; offplan 2 was rejected again.
  */
 export const VERIFIED_BLOCKED: Record<PaidPlatform, string[]> = {
   google: [],
-  meta: ["act_873275145025438", "act_9508663712551146", "act_10091300310884299"],
+  meta: ["act_10091300310884299"],
   linkedin: [],
 };
