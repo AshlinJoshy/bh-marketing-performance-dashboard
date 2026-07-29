@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useState, useTransition } from "react";
+import { useCallback, useEffect, useRef, useState, useTransition } from "react";
 import ChartBox from "@/components/Chart";
 import HelpTip from "@/components/HelpTip";
+import DateRangePicker from "@/components/DateRangePicker";
 import Sankey from "@/components/Sankey";
 import { receiveWebInsightsAction } from "@/app/actions";
 import { C } from "@/lib/theme";
@@ -13,13 +14,13 @@ function insightColor(kind: string) {
 }
 
 const fmt = (n: number) => new Intl.NumberFormat("en-US").format(Math.round(n || 0));
-const ymd = (d: Date) => d.toISOString().slice(0, 10);
 
 const legendBottom = { legend: { position: "bottom" as const, labels: { font: { size: 10 } } } };
 
 export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
   const [data, setData] = useState<WebMetrics>(initial);
-  const [mode, setMode] = useState<"preset" | "custom">("preset");
+  // Day-count of the current range, kept only because the insights action wants
+  // a rough window size alongside the concrete dates.
   const [days, setDays] = useState<number>(initial.days || 30);
   const [from, setFrom] = useState<string>(initial.from);
   const [to, setTo] = useState<string>(initial.to);
@@ -49,10 +50,7 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
   }, []);
 
   // range query string (range only)
-  const rangeQs = useCallback(
-    () => (mode === "custom" && from && to && from <= to ? `from=${from}&to=${to}` : `days=${days}`),
-    [mode, from, to, days],
-  );
+  const rangeQs = useCallback(() => `from=${from}&to=${to}`, [from, to]);
   // humans + journey-page-filter suffix shared by every load
   const tail = useCallback(
     (h = humansOnly) => `&humans=${h ? 1 : 0}${flowPages.trim() ? `&flowPages=${encodeURIComponent(flowPages.trim())}${flowExact ? "&flowMatch=exact" : ""}` : ""}`,
@@ -68,41 +66,56 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
   }, [live, qsFor, load]);
 
   /**
-   * Pop-up lead count, from the CRM via the SEO leads endpoint. Kept in its own
-   * request keyed to the current range: the CRM view is slow and sometimes times
-   * out, and this one number must never be able to delay or blank the PostHog
-   * KPIs it sits beneath.
+   * Pop-up lead count, from the CRM. Fetched alongside the PostHog metrics and
+   * committed with them rather than on its own: landing separately made the
+   * page fill in in stages, with this number appearing seconds after the
+   * traffic KPIs it sits beside.
    */
-  const [popupRes, setPopupRes] = useState<{ qs: string; n: number | null; err: boolean } | null>(null);
-  const leadsQs = rangeQs();
-  useEffect(() => {
-    let stale = false;
-    (async () => {
-      try {
-        const res = await fetch(`/api/seo/leads?${leadsQs}`, { cache: "no-store" });
-        const json = await res.json();
-        if (stale) return;
-        const ok = res.ok && typeof json?.popup === "number" && !json.error;
-        setPopupRes({ qs: leadsQs, n: ok ? json.popup : null, err: !ok });
-      } catch {
-        if (!stale) setPopupRes({ qs: leadsQs, n: null, err: true });
-      }
-    })();
-    return () => { stale = true; };
-  }, [leadsQs]);
-  // Tagging the result with the range it answers means a result for a range the
-  // user has already moved on from reads as "loading", not as a wrong number.
-  const popupFresh = popupRes?.qs === leadsQs;
-  const popup = popupFresh ? popupRes!.n : null;
-  const popupErr = popupFresh && popupRes!.err;
+  const [popup, setPopup] = useState<number | null>(null);
+  const [popupErr, setPopupErr] = useState(false);
+  const fetchPopup = useCallback(async (f: string, t: string): Promise<{ n: number | null; err: boolean }> => {
+    try {
+      const res = await fetch(`/api/seo/leads?from=${f}&to=${t}`, { cache: "no-store" });
+      const json = await res.json();
+      const ok = res.ok && typeof json?.popup === "number" && !json.error;
+      return { n: ok ? json.popup : null, err: !ok };
+    } catch {
+      return { n: null, err: true };
+    }
+  }, []);
 
-  function pickPreset(d: number) {
-    setMode("preset");
-    setDays(d);
-    load(`days=${d}${tail()}`, false);
-  }
-  function applyCustom() {
-    if (from && to && from <= to) load(`from=${from}&to=${to}${tail()}`, false);
+  /**
+   * Both sources for a range, committed together. The sequence guard stops an
+   * older in-flight load from overwriting a newer one.
+   */
+  const seq = useRef(0);
+  const loadAll = useCallback(
+    async (f: string, t: string, suffix: string) => {
+      const mine = ++seq.current;
+      setLoading(true);
+      const [, pop] = await Promise.all([load(`from=${f}&to=${t}${suffix}`, true), fetchPopup(f, t)]);
+      if (mine !== seq.current) return;
+      setPopup(pop.n);
+      setPopupErr(pop.err);
+      setLoading(false);
+    },
+    [load, fetchPopup],
+  );
+
+  // Both sources load on mount ON PURPOSE: the server renders PostHog metrics,
+  // but the CRM pop-up figure is client-side, and it should appear with the rest
+  // rather than after it.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    loadAll(from, to, tail());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function applyRange(f: string, t: string) {
+    setFrom(f);
+    setTo(t);
+    setDays(Math.max(1, Math.round((new Date(t).getTime() - new Date(f).getTime()) / 864e5) + 1));
+    loadAll(f, t, tail());
   }
   function toggleHumans() {
     const next = !humansOnly;
@@ -131,8 +144,7 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
   function getInsights() {
     setInsErr(null);
     startInsights(async () => {
-      const custom = mode === "custom" && from && to && from <= to;
-      const r = custom ? await receiveWebInsightsAction(days, from, to) : await receiveWebInsightsAction(days);
+      const r = await receiveWebInsightsAction(days, from, to);
       if (r.ok) setInsights(r.insights);
       else setInsErr(r.error);
     });
@@ -162,37 +174,11 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
       {/* controls */}
       <div className="controls-bar">
         <div className="field">
-          <label>Range <HelpTip text="Time window for every metric on this page. Use a preset or pick a custom From/To range." /></label>
+          <label>Range <HelpTip text="Time window for every metric on this page." /></label>
           <div className="ps-platforms">
-            {[7, 30, 90].map((d) => (
-              <button key={d} className={`filter-btn${mode === "preset" && days === d ? " active" : ""}`} onClick={() => pickPreset(d)}>
-                {d}d
-              </button>
-            ))}
-            <button className={`filter-btn${mode === "custom" ? " active" : ""}`} onClick={() => setMode("custom")}>
-              Custom
-            </button>
+            <DateRangePicker initialFrom={initial.from} initialTo={initial.to} onApply={applyRange} />
           </div>
         </div>
-
-        {mode === "custom" && (
-          <>
-            <div className="field">
-              <label>From</label>
-              <input type="date" className="ps-select" value={from} max={to} onChange={(e) => setFrom(e.target.value)} />
-            </div>
-            <div className="field">
-              <label>To</label>
-              <input type="date" className="ps-select" value={to} min={from} max={ymd(new Date())} onChange={(e) => setTo(e.target.value)} />
-            </div>
-            <div className="field">
-              <label>&nbsp;</label>
-              <button className="filter-btn" onClick={applyCustom} disabled={loading || !(from && to && from <= to)}>
-                Apply
-              </button>
-            </div>
-          </>
-        )}
 
         <div className="field">
           <label>Traffic <HelpTip text="Humans only excludes bots/crawlers — PostHog-flagged bots, traffic from cloud datacenters (e.g. AWS Ashburn), and desktop-Linux/server traffic (the China/Singapore/Hong Kong server bots). Switch to All traffic to see the raw, bot-inflated numbers." /></label>

@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, useTransition } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import ChartBox from "@/components/Chart";
 import HelpTip from "@/components/HelpTip";
+import DateRangePicker from "@/components/DateRangePicker";
 import { saveSeoConfigAction } from "@/app/actions";
 import { C } from "@/lib/theme";
 import type { SeoData } from "@/lib/seo";
@@ -18,10 +19,6 @@ const fmtK = (n: number | null | undefined) => {
   return new Intl.NumberFormat("en-US").format(Math.round(n));
 };
 const pct1 = (n: number | null | undefined) => (n == null ? "—" : `${(n * 100).toFixed(1)}%`);
-const ymd = (d: Date) => d.toISOString().slice(0, 10);
-/** from/to for a "last N days" preset. Module scope so the clock read is not
- *  analysed as render-time work. */
-const presetQs = (d: number) => `from=${ymd(new Date(Date.now() - (d - 1) * 864e5))}&to=${ymd(new Date())}`;
 
 const CH_COLORS: Record<string, string> = {
   "Organic Search": C.green,
@@ -62,14 +59,14 @@ function ConnectCard({ title, lines }: { title: string; lines: string[] }) {
 export default function SeoDashboard({ initial }: { initial: SeoData }) {
   const router = useRouter();
   const [data, setData] = useState<SeoData>(initial);
-  const [mode, setMode] = useState<"preset" | "custom">("preset");
-  const [days, setDays] = useState<number>(30);
   const [from, setFrom] = useState<string>(initial.from);
   const [to, setTo] = useState<string>(initial.to);
   const [loading, setLoading] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
 
-  // Leads load SEPARATELY (slow Metabase view) so it can't stall PostHog/GSC.
+  // Leads come from the slow Metabase view, but are committed together with the
+  // PostHog/GSC half so the page never paints one range's traffic beside another
+  // range's leads. See loadAll below.
   const [leads, setLeads] = useState<LeadsData | null>(null);
   const [leadsLoading, setLeadsLoading] = useState(true);
 
@@ -80,51 +77,66 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
   const [kwMsg, setKwMsg] = useState<string | null>(null);
   const [kwSaving, startKwSave] = useTransition();
 
-  const rangeQs = useCallback(() => {
-    if (mode === "custom" && from && to && from <= to) return `from=${from}&to=${to}`;
-    return presetQs(days);
-  }, [mode, from, to, days]);
+  const rangeQs = useCallback(() => `from=${from}&to=${to}`, [from, to]);
 
-  // fast half — PostHog + GSC
-  const load = useCallback(async (qs: string) => {
-    setLoading(true);
+  // Pure fetchers — no state writes, so the caller controls when data appears.
+  const fetchTraffic = useCallback(async (qs: string): Promise<SeoData | null> => {
     try {
       const res = await fetch(`/api/seo?${qs}`, { cache: "no-store" });
       const json = await res.json();
-      if (res.ok && json && json.traffic) {
-        setData(json as SeoData);
-        setUpdatedAt(new Date().toLocaleTimeString());
-      } else {
-        console.error("[seo] refresh returned an error", json?.error ?? res.status);
-      }
+      if (res.ok && json && json.traffic) return json as SeoData;
+      console.error("[seo] refresh returned an error", json?.error ?? res.status);
+      return null;
     } catch (e) {
       console.error("[seo] refresh failed", e);
-    } finally {
-      setLoading(false);
+      return null;
     }
   }, []);
 
-  // slow half — Metabase leads (independent request)
-  const loadLeads = useCallback(async (qs: string) => {
-    setLeadsLoading(true);
-    // A fresh payload carries no audit rows, so collapse the table rather than
-    // leaving it open and empty against the previous range.
-    setAuditOpen(false);
+  const fetchLeads = useCallback(async (qs: string): Promise<LeadsData> => {
     try {
       const res = await fetch(`/api/seo/leads?${qs}`, { cache: "no-store" });
       const json = await res.json();
-      if (res.ok && json && typeof json.connected === "boolean") setLeads(json as LeadsData);
-      else {
-        console.error("[seo] leads returned an error", json?.error ?? res.status);
-        setLeads(emptyLeads(json?.error || `HTTP ${res.status}`));
-      }
+      if (res.ok && json && typeof json.connected === "boolean") return json as LeadsData;
+      console.error("[seo] leads returned an error", json?.error ?? res.status);
+      return emptyLeads(json?.error || `HTTP ${res.status}`);
     } catch (e) {
       console.error("[seo] leads fetch failed", e);
-      setLeads(emptyLeads(String(e)));
-    } finally {
-      setLeadsLoading(false);
+      return emptyLeads(String(e));
     }
   }, []);
+
+  /**
+   * Fetch the fast half (PostHog + GSC) and the slow half (the Metabase leads
+   * view) concurrently, then commit both at once.
+   *
+   * They used to land independently, so a refresh repainted the traffic numbers
+   * and left the lead numbers to arrive seconds later — the page filled in in
+   * stages and looked, briefly, like it was reporting a different range for each
+   * half. The sequence guard stops an older in-flight load from overwriting a
+   * newer one when the range is changed twice quickly.
+   */
+  const seq = useRef(0);
+  const loadAll = useCallback(
+    async (qs: string) => {
+      const mine = ++seq.current;
+      setLoading(true);
+      setLeadsLoading(true);
+      // A fresh payload carries no audit rows, so collapse the table rather than
+      // leaving it open and empty against the previous range.
+      setAuditOpen(false);
+      const [traffic, leadRows] = await Promise.all([fetchTraffic(qs), fetchLeads(qs)]);
+      if (mine !== seq.current) return; // superseded
+      if (traffic) {
+        setData(traffic);
+        setUpdatedAt(new Date().toLocaleTimeString());
+      }
+      setLeads(leadRows);
+      setLeadsLoading(false);
+      setLoading(false);
+    },
+    [fetchTraffic, fetchLeads],
+  );
 
   /**
    * Buy / rent filter for the individual-property card. Rows come from PostHog
@@ -194,28 +206,17 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
   // mount effect, which is the intended behaviour here, not a cascading render.
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    loadLeads(rangeQs());
+    loadAll(rangeQs());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function pickPreset(d: number) {
-    setMode("preset");
-    setDays(d);
-    const qs = presetQs(d);
-    load(qs);
-    loadLeads(qs);
-  }
-  function applyCustom() {
-    if (from && to && from <= to) {
-      const qs = `from=${from}&to=${to}`;
-      load(qs);
-      loadLeads(qs);
-    }
+  function applyRange(f: string, t: string) {
+    setFrom(f);
+    setTo(t);
+    loadAll(`from=${f}&to=${t}`);
   }
   function refresh() {
-    const qs = rangeQs();
-    load(qs);
-    loadLeads(qs);
+    loadAll(rangeQs());
   }
   function saveKeywords() {
     setKwMsg(null);
@@ -225,7 +226,7 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
       setKwMsg(r.ok ? "Saved — refreshing rankings…" : r.error);
       if (r.ok) {
         router.refresh();
-        load(rangeQs());
+        loadAll(rangeQs());
       }
     });
   }
@@ -283,19 +284,9 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
         <div className="field">
           <label>Range <HelpTip text="Window for every metric. GSC data lags ~2–3 days, so the last couple of days may be partial." /></label>
           <div className="ps-platforms">
-            {[7, 30, 90].map((d) => (
-              <button key={d} className={`filter-btn${mode === "preset" && days === d ? " active" : ""}`} onClick={() => pickPreset(d)}>{d}d</button>
-            ))}
-            <button className={`filter-btn${mode === "custom" ? " active" : ""}`} onClick={() => setMode("custom")}>Custom</button>
+            <DateRangePicker initialFrom={initial.from} initialTo={initial.to} onApply={applyRange} />
           </div>
         </div>
-        {mode === "custom" && (
-          <>
-            <div className="field"><label>From</label><input type="date" className="ps-select" value={from} max={to} onChange={(e) => setFrom(e.target.value)} /></div>
-            <div className="field"><label>To</label><input type="date" className="ps-select" value={to} min={from} max={ymd(new Date())} onChange={(e) => setTo(e.target.value)} /></div>
-            <div className="field"><label>&nbsp;</label><button className="filter-btn" onClick={applyCustom} disabled={loading || !(from && to && from <= to)}>Apply</button></div>
-          </>
-        )}
         <div className="field" style={{ marginLeft: "auto" }}>
           <label>&nbsp;</label>
           <button className="filter-btn" onClick={refresh} disabled={loading}>{loading ? "Refreshing…" : "↻ Refresh"}</button>
