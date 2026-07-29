@@ -44,16 +44,26 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   const [to, setTo] = useState(initial.to);
   const [loading, setLoading] = useState(false);
 
-  // Config editor
+  // Config editor. `sel` is the working copy and `savedSel` is what is actually
+  // persisted, so closing without saving reverts rather than leaving the panel
+  // showing ticks that no query will honour.
+  const initialSel = useMemo<Record<PaidPlatform, string[]>>(
+    () => ({
+      google: config.accounts.google.map((a) => a.id),
+      meta: config.accounts.meta.map((a) => a.id),
+      linkedin: config.accounts.linkedin.map((a) => a.id),
+    }),
+    [config],
+  );
   const [cfgOpen, setCfgOpen] = useState(initial.unconfigured);
-  const [sel, setSel] = useState<Record<PaidPlatform, string[]>>({
-    google: config.accounts.google.map((a) => a.id),
-    meta: config.accounts.meta.map((a) => a.id),
-    linkedin: config.accounts.linkedin.map((a) => a.id),
-  });
+  const [sel, setSel] = useState<Record<PaidPlatform, string[]>>(initialSel);
+  const [savedSel, setSavedSel] = useState<Record<PaidPlatform, string[]>>(initialSel);
   const [showHidden, setShowHidden] = useState(false);
   const [cfgMsg, setCfgMsg] = useState<string | null>(null);
   const [saving, startSave] = useTransition();
+
+  const key = (s: Record<PaidPlatform, string[]>) => PLATFORM_ORDER.map((p) => [...s[p]].sort().join(",")).join("|");
+  const dirty = key(sel) !== key(savedSel);
 
   // View filters
   const [platformFilter, setPlatformFilter] = useState<"all" | PaidPlatform>("all");
@@ -85,9 +95,21 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   }
 
   function toggleAccount(p: PaidPlatform, id: string) {
+    setCfgMsg(null);
     setSel((s) => ({ ...s, [p]: s[p].includes(id) ? s[p].filter((x) => x !== id) : [...s[p], id] }));
   }
-  function saveConfig() {
+  /** Tick or clear a whole platform — 41 Meta accounts is a lot of clicking. */
+  function setPlatformAll(p: PaidPlatform, on: boolean, visible: CatalogAccount[]) {
+    setCfgMsg(null);
+    setSel((s) => ({ ...s, [p]: on ? [...new Set([...s[p], ...visible.map((a) => a.id)])] : s[p].filter((id) => !visible.some((a) => a.id === id)) }));
+  }
+  function closeConfig(revert: boolean) {
+    if (revert) setSel(savedSel);
+    setCfgMsg(null);
+    setCfgOpen(false);
+  }
+  /** Save, refresh the data for the new selection, then close. */
+  function saveAndClose() {
     setCfgMsg(null);
     startSave(async () => {
       const payload: Record<string, { id: string; name: string }[]> = {};
@@ -96,12 +118,14 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
       }
       const r = await savePaidConfigAction(payload);
       if (!r.ok) {
+        // Stay open on failure — closing would imply the selection stuck.
         setCfgMsg(r.error || "Could not save.");
         return;
       }
-      setCfgMsg("Saved — reloading data…");
+      setSavedSel(sel);
+      setCfgMsg(null);
+      setCfgOpen(false);
       await load(mode === "custom" ? `from=${from}&to=${to}` : `days=${days}`);
-      setCfgMsg("Saved.");
     });
   }
 
@@ -199,8 +223,13 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
           <input type="date" className="search-box" style={{ width: 140 }} value={from} onChange={(e) => setFrom(e.target.value)} />
           <input type="date" className="search-box" style={{ width: 140 }} value={to} onChange={(e) => setTo(e.target.value)} />
           <button className="filter-btn" onClick={applyCustom}>Apply</button>
-          <button className={`filter-btn${cfgOpen ? " active" : ""}`} onClick={() => setCfgOpen((v) => !v)}>
-            Accounts ({selectedCount})
+          <button
+            className={`filter-btn${cfgOpen ? " active" : ""}`}
+            onClick={() => (cfgOpen ? closeConfig(true) : setCfgOpen(true))}
+            title={`Choose which ad accounts appear — ${selectedCount} selected`}
+            aria-label="Account settings"
+          >
+            ⚙ <span className="muted">{selectedCount}</span>
           </button>
         </div>
       </div>
@@ -214,23 +243,36 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
           <div className="chart-sub">
             Pick the accounts that represent live activity. Closed, disabled and messaging-integration accounts are hidden by default.
           </div>
-          <div style={{ display: "flex", gap: 6, margin: "10px 0" }}>
+          <div style={{ display: "flex", gap: 6, margin: "10px 0", alignItems: "center", flexWrap: "wrap" }}>
+            <button className="filter-btn" onClick={saveAndClose} disabled={saving}>
+              {saving ? "Saving…" : "Save & close"}
+            </button>
+            <button className="filter-btn" onClick={() => closeConfig(true)} disabled={saving}>
+              {dirty ? "Discard changes" : "Close"}
+            </button>
             <button className="filter-btn" onClick={() => setShowHidden((v) => !v)}>
               {showHidden ? "Hide closed & integration accounts" : "Show all accounts"}
             </button>
-            <button className="filter-btn" onClick={saveConfig} disabled={saving}>
-              {saving ? "Saving…" : "Save selection"}
-            </button>
-            {cfgMsg && <span className="ps-save-msg">{cfgMsg}</span>}
+            {dirty && !cfgMsg && <span className="muted" style={{ fontSize: 11 }}>Unsaved changes</span>}
+            {cfgMsg && <span className="ps-save-msg" style={{ color: C.coral }}>{cfgMsg}</span>}
           </div>
           <div className="charts-grid-2">
             {PLATFORM_ORDER.map((p) => {
               const all = ACCOUNT_CATALOG[p];
               const visible = showHidden ? all : all.filter((a) => !a.disabled && !a.readOnly);
+              const allOn = visible.length > 0 && visible.every((a) => sel[p].includes(a.id));
               return (
                 <div key={p}>
-                  <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6, color: PLATFORM_COLOR[p] }}>
-                    {PLATFORMS[p].label} <span className="muted">({sel[p].length}/{all.length} selected)</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                    <span style={{ fontWeight: 600, fontSize: 12, color: PLATFORM_COLOR[p] }}>{PLATFORMS[p].label}</span>
+                    <span className="muted" style={{ fontSize: 11 }}>{sel[p].length}/{all.length} selected</span>
+                    <button
+                      className="filter-btn"
+                      style={{ fontSize: 10, padding: "1px 7px", marginLeft: "auto" }}
+                      onClick={() => setPlatformAll(p, !allOn, visible)}
+                    >
+                      {allOn ? "None" : "All shown"}
+                    </button>
                   </div>
                   <div style={{ maxHeight: 220, overflowY: "auto", border: "1px solid var(--border)", borderRadius: 8, padding: 8 }}>
                     {visible.map((a) => (
@@ -271,6 +313,17 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
         </div>
       ) : (
         <>
+          {/* An empty tab is never left to speak for itself — the reason comes
+              from the data layer, which distinguishes "nothing spent" from
+              "nothing readable". */}
+          {data.error && (
+            <div className="chart-card" style={{ marginBottom: 16 }}>
+              <div className="empty-state" style={{ height: "auto", padding: "18px 16px", display: "block" }}>
+                ⚠ {data.error}
+              </div>
+            </div>
+          )}
+
           {/* ── KPIs ────────────────────────────────────────────────────────── */}
           <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(3,1fr)" }}>
             <div className="kpi-card">
@@ -560,7 +613,8 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
           )}
 
           <div className="chart-sub" style={{ marginTop: 14 }}>
-            Sources: {data.accountsUsed.length} ad account{data.accountsUsed.length === 1 ? "" : "s"} via Supermetrics
+            Sources: {data.accountsUsed.length} ad account{data.accountsUsed.length === 1 ? "" : "s"} with data via Supermetrics
+            {data.emptyAccounts.length ? ` · ${data.emptyAccounts.length} read but had no activity in range (${data.emptyAccounts.map((a) => a.name).join(", ")})` : ""}
             {data.failures.length ? ` · ${data.failures.length} unavailable` : ""} · rates are derived from raw totals, never
             averaged from the platforms&apos; own pre-aggregated rate fields.
           </div>

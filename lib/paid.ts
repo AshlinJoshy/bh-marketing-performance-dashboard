@@ -75,6 +75,12 @@ export interface PaidData {
   /** Distinct currencies present. More than one means spend must not be summed. */
   currencies: string[];
   accountsUsed: PaidAccount[];
+  /**
+   * Accounts that answered fine but had nothing in range. Tracked separately
+   * from failures because otherwise they vanish: an account with no spend
+   * appears in neither list and the reader cannot tell it was even asked.
+   */
+  emptyAccounts: PaidAccount[];
   failures: AccountFailure[];
   /** True when no account was selected yet — the UI prompts for config instead. */
   unconfigured: boolean;
@@ -394,7 +400,7 @@ export async function getPaidData(fromRaw?: string, toRaw?: string, days = 30): 
   const connected = !!process.env.SUPERMETRICS_API_KEY;
   const base: PaidData = {
     connected, label, from, to, rows: [], byDate: [], currencies: [],
-    accountsUsed: [], failures: [], unconfigured: false,
+    accountsUsed: [], emptyAccounts: [], failures: [], unconfigured: false,
   };
   if (!connected) return base;
 
@@ -412,10 +418,15 @@ export async function getPaidData(fromRaw?: string, toRaw?: string, days = 30): 
   const rows: CampaignRow[] = [];
   for (let i = 0; i < settled.length; i++) {
     const r = settled[i];
-    if (r.failure) base.failures.push(r.failure);
+    if (r.failure) {
+      base.failures.push(r.failure);
+      continue;
+    }
     if (r.rows.length) {
       rows.push(...r.rows);
       base.accountsUsed.push(selected[i]);
+    } else {
+      base.emptyAccounts.push(selected[i]);
     }
   }
 
@@ -454,8 +465,16 @@ export async function getPaidData(fromRaw?: string, toRaw?: string, days = 30): 
   base.byDate = [...dayAcc].map(([date, v]) => ({ date, ...v })).sort((a, b) => a.date.localeCompare(b.date));
   base.currencies = [...new Set(base.rows.map((r) => r.currency).filter((c) => c && c !== "—"))].sort();
 
-  if (!base.rows.length && base.failures.length) {
-    base.error = `No data returned. ${base.failures.length} of ${selected.length} selected account(s) could not be read — see below.`;
+  // An empty tab has three quite different causes and they need different
+  // responses from the reader, so they are never collapsed into one blank state.
+  if (!base.rows.length) {
+    if (base.failures.length === selected.length) {
+      base.error = `None of the ${selected.length} selected account(s) could be read — see the list below for why.`;
+    } else if (base.failures.length) {
+      base.error = `No spend in this range. ${base.failures.length} of ${selected.length} selected account(s) also could not be read — see below.`;
+    } else {
+      base.error = `The ${selected.length} selected account(s) were read successfully but had no activity between ${from} and ${to}. Try a longer range or a different account.`;
+    }
   }
   return base;
 }
