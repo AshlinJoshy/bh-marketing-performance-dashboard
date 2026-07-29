@@ -391,6 +391,33 @@ export interface SeoConfig {
   keywords: string[];
 }
 
+export type PaidAccountRef = { id: string; name: string };
+export type PaidConfig = { accounts: Record<"google" | "meta" | "linkedin", PaidAccountRef[]> };
+const EMPTY_PAID: PaidConfig = { accounts: { google: [], meta: [], linkedin: [] } };
+
+/**
+ * Which ad accounts the Digital Performance tab shows.
+ *
+ * Defaults to empty rather than to "everything": the connected platforms expose
+ * 41 Meta accounts alone, most of them closed, disabled, or read-only messaging
+ * integrations. An empty selection makes the tab ask which accounts matter,
+ * which is cheaper and more honest than guessing and rendering noise.
+ */
+export async function getPaidConfig(): Promise<PaidConfig> {
+  const db = readClient();
+  if (!db) return EMPTY_PAID;
+  try {
+    const { data } = await db.from("paid_config").select("payload").eq("id", 1).maybeSingle();
+    const acc = (data?.payload as PaidConfig | null)?.accounts;
+    if (!acc) return EMPTY_PAID;
+    const pick = (k: "google" | "meta" | "linkedin") =>
+      (Array.isArray(acc[k]) ? acc[k] : []).filter((a) => a && typeof a.id === "string" && a.id).map((a) => ({ id: a.id, name: String(a.name || a.id) }));
+    return { accounts: { google: pick("google"), meta: pick("meta"), linkedin: pick("linkedin") } };
+  } catch {
+    return EMPTY_PAID;
+  }
+}
+
 /** The editable SEO config (target keywords tracked in GSC). */
 export async function getSeoConfig(): Promise<SeoConfig> {
   const db = readClient();

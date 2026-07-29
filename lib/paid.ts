@@ -1,0 +1,461 @@
+// Paid media (Digital Performance) — Google Ads, Meta and LinkedIn, all pulled
+// through Supermetrics. Server-only.
+//
+// Uses the same Supermetrics Data Fetching API as lib/gsc.ts:
+//   SUPERMETRICS_API_KEY   the Data Fetching API key (hub.supermetrics.com)
+//   SUPERMETRICS_DS_USER   the Supermetrics login that authorized the sources
+//   SUPERMETRICS_API_URL   override the endpoint if your plan differs
+//
+// Every field ID below was verified against the live account, not taken from
+// documentation — Supermetrics field IDs are per-source and inconsistent in case
+// and naming (Google `Campaignname`, LinkedIn `campaignName`, Meta
+// `adcampaign_name`), so guessing them yields a silent empty card.
+import { getPaidConfig } from "@/lib/data";
+
+const SM_ENDPOINT = process.env.SUPERMETRICS_API_URL || "https://api.supermetrics.com/enterprise/v2/query/data/json";
+
+export type PaidPlatform = "google" | "meta" | "linkedin";
+
+/**
+ * What a campaign was actually trying to achieve. Campaigns are not comparable
+ * on one number — a reach campaign has no leads and a lead campaign's link
+ * clicks are beside the point — so each row carries its goal and the dashboard
+ * reports the outcome that matches it.
+ */
+export type CampaignGoal = "leads" | "traffic" | "conversions" | "awareness" | "engagement" | "other";
+
+export interface CampaignRow {
+  platform: PaidPlatform;
+  accountId: string;
+  accountName: string;
+  campaign: string;
+  /** Raw platform objective, where the platform exposes one (Meta does). */
+  objective: string | null;
+  goal: CampaignGoal;
+  currency: string;
+  impressions: number;
+  clicks: number;
+  cost: number;
+  /** The outcome that matches `goal` — what this campaign should be judged on. */
+  result: number;
+  /** Human label for `result`, e.g. "Leads", "Link clicks". */
+  resultLabel: string;
+  // Meta reports several outcomes at once and the ask was to see all of them.
+  // Null on platforms that do not break them out this way.
+  linkClicks: number | null;
+  websiteConversions: number | null;
+  websiteLeads: number | null;
+  facebookLeads: number | null;
+  conversions: number | null;
+}
+
+export interface PaidAccount {
+  platform: PaidPlatform;
+  id: string;
+  name: string;
+}
+
+/** An account that was selected but could not be read, and why. */
+export interface AccountFailure {
+  platform: PaidPlatform;
+  accountId: string;
+  accountName: string;
+  reason: string;
+  /** Supermetrics licenses a subset of ad accounts; this one is outside it. */
+  notPrioritised: boolean;
+}
+
+export interface PaidData {
+  connected: boolean;
+  label: string;
+  from: string;
+  to: string;
+  rows: CampaignRow[];
+  byDate: { date: string; cost: number; result: number; impressions: number }[];
+  /** Distinct currencies present. More than one means spend must not be summed. */
+  currencies: string[];
+  accountsUsed: PaidAccount[];
+  failures: AccountFailure[];
+  /** True when no account was selected yet — the UI prompts for config instead. */
+  unconfigured: boolean;
+  error?: string;
+}
+
+// ─── Platform registry ────────────────────────────────────────────────────────
+// One place per platform: its Supermetrics ds_id and the field IDs to request.
+// Adding a platform means adding an entry here plus its accounts to the config.
+// Snapchat (ds_id SCM) is also authenticated on this subscription but is left
+// out until its field IDs are verified the same way these were.
+type FieldMap = {
+  date: string;
+  campaign: string;
+  currency: string;
+  impressions: string;
+  cost: string;
+  /** Total clicks. Meta has no equivalent in this set, so it uses link clicks. */
+  clicks?: string;
+  objective?: string;
+  conversions?: string;
+  linkClicks?: string;
+  websiteConversions?: string;
+  websiteLeads?: string;
+  facebookLeads?: string;
+};
+
+interface PlatformSpec {
+  dsId: string;
+  label: string;
+  fields: FieldMap;
+}
+
+export const PLATFORMS: Record<PaidPlatform, PlatformSpec> = {
+  google: {
+    dsId: "AW",
+    label: "Google Ads",
+    // Verified live: returned BH-Search-UAE-EN-Valuation, GGL_SEARCH_CT1_BRAND.
+    fields: {
+      date: "Date",
+      campaign: "Campaignname",
+      currency: "Currencycode",
+      impressions: "Impressions",
+      clicks: "Clicks",
+      cost: "Cost",
+      conversions: "Conversions",
+    },
+  },
+  meta: {
+    dsId: "FA",
+    label: "Meta Ads",
+    fields: {
+      date: "Date",
+      campaign: "adcampaign_name",
+      currency: "currency",
+      objective: "campaignobjective",
+      impressions: "impressions",
+      cost: "cost",
+      linkClicks: "action_link_click",
+      websiteConversions: "offsite_conversions",
+      websiteLeads: "offsite_conversions_fb_pixel_lead",
+      facebookLeads: "onsite_conversion.lead_grouped",
+    },
+  },
+  linkedin: {
+    dsId: "LIA",
+    label: "LinkedIn Ads",
+    // Verified live: returned Spotlight, InMail. `cost` canonicalises to
+    // `spend`, so the canonical ID is used directly.
+    fields: {
+      date: "Date",
+      campaign: "campaignName",
+      currency: "accountCurrencyCode",
+      impressions: "impressions",
+      clicks: "clicks",
+      cost: "spend",
+      conversions: "conversions",
+    },
+  },
+};
+
+// ─── Goal mapping ─────────────────────────────────────────────────────────────
+/**
+ * Meta objective → goal. Objectives come in an older (`LINK_CLICKS`) and a newer
+ * Outcome-Driven (`OUTCOME_TRAFFIC`) vocabulary and both still appear on live
+ * accounts, so both are matched. Anything unrecognised falls through to
+ * 'other' and is reported on its raw counts rather than being forced into a
+ * bucket it may not belong in.
+ */
+function metaGoal(objective: string | null): CampaignGoal {
+  const o = (objective || "").toUpperCase();
+  if (!o) return "other";
+  if (o.includes("LEAD")) return "leads";
+  if (o.includes("SALES") || o.includes("CONVERSION") || o.includes("PURCHASE")) return "conversions";
+  if (o.includes("TRAFFIC") || o.includes("LINK_CLICK")) return "traffic";
+  if (o.includes("AWARENESS") || o.includes("REACH") || o.includes("BRAND") || o.includes("VIDEO_VIEW")) return "awareness";
+  if (o.includes("ENGAGEMENT") || o.includes("MESSAGE") || o.includes("POST")) return "engagement";
+  return "other";
+}
+
+export const GOAL_LABELS: Record<CampaignGoal, string> = {
+  leads: "Leads",
+  traffic: "Traffic",
+  conversions: "Conversions",
+  awareness: "Awareness",
+  engagement: "Engagement",
+  other: "Other",
+};
+
+// ─── Supermetrics client ──────────────────────────────────────────────────────
+type SmResult = { rows: any[][] } | { error: string };
+
+/**
+ * One Supermetrics query. Returns the reason on failure rather than null,
+ * because the two failures that actually happen here need different responses
+ * from the reader: an unlicensed account is a subscription change, a timeout is
+ * a shorter range.
+ */
+async function smQuery(
+  dsId: string,
+  account: string,
+  fields: string[],
+  from: string,
+  to: string,
+  timeoutMs = 25000,
+): Promise<SmResult> {
+  const key = process.env.SUPERMETRICS_API_KEY;
+  if (!key) return { error: "SUPERMETRICS_API_KEY is not set" };
+  // Payload shape is kept identical to the working GSC client in lib/gsc.ts.
+  //
+  // Deliberately no `settings` key: the per-source settings (exclude_invalid_
+  // accounts and friends) are documented on Supermetrics' hub and MCP surfaces,
+  // and whether this Data Fetching endpoint accepts them here is unverified — an
+  // endpoint that rejects unknown keys would fail every query for a setting that
+  // is close to redundant anyway, since accounts are queried one at a time and a
+  // bad one is already isolated and reported rather than poisoning the request.
+  const payload: Record<string, unknown> = {
+    ds_id: dsId,
+    ds_accounts: [account],
+    ds_user: process.env.SUPERMETRICS_DS_USER || "zahra.firouzi@bhomes.com",
+    date_range_type: "custom",
+    start_date: from,
+    end_date: to,
+    fields: fields.join(","),
+    max_rows: 10000,
+  };
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(SM_ENDPOINT, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+      body: JSON.stringify(payload),
+      cache: "no-store",
+      signal: ctrl.signal,
+    });
+    const text = await res.text().catch(() => "");
+    if (!res.ok) return { error: `HTTP ${res.status}: ${text.slice(0, 200)}` };
+    let j: any;
+    try {
+      j = JSON.parse(text);
+    } catch {
+      return { error: `non-JSON response: ${text.slice(0, 160)}` };
+    }
+    if (j?.error) {
+      const msg = typeof j.error === "string" ? j.error : j.error?.message || JSON.stringify(j.error);
+      return { error: String(msg).slice(0, 300) };
+    }
+    let rows: any = j?.data;
+    if (rows && !Array.isArray(rows) && Array.isArray(rows.data)) rows = rows.data;
+    return { rows: Array.isArray(rows) ? rows : [] };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { error: msg.includes("abort") ? `timed out after ${Math.round(timeoutMs / 1000)}s` : msg };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+const num = (v: unknown): number => {
+  const n = typeof v === "string" ? parseFloat(v.replace(/[^0-9.eE+-]/g, "")) : Number(v);
+  return Number.isFinite(n) ? n : 0;
+};
+
+const isDate = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s);
+
+/**
+ * Drop Supermetrics' leading header row of display names.
+ *
+ * The test is "first cell is not a date", which works because every query here
+ * requests the date dimension first, so a data row always starts with one. The
+ * obvious alternative — "all cells are strings and one contains letters" —
+ * silently eats the first real row if the API stringifies its numbers, since a
+ * campaign name contains letters too. This also disposes of the single-cell
+ * "No data found" row, whose first cell is not a date either.
+ */
+function stripHeader(rows: any[][]): any[][] {
+  if (!rows.length) return [];
+  return isDate(String(rows[0]?.[0] ?? "")) ? rows : rows.slice(1);
+}
+const ymd = (d: Date) => d.toISOString().slice(0, 10);
+
+export function paidRange(fromRaw?: string, toRaw?: string, days = 30): { from: string; to: string; label: string } {
+  if (fromRaw && toRaw && isDate(fromRaw) && isDate(toRaw) && fromRaw <= toRaw) {
+    return { from: fromRaw, to: toRaw, label: `${fromRaw} → ${toRaw}` };
+  }
+  const d = Math.max(1, Math.min(365, Math.round(days || 30)));
+  const to = new Date();
+  const from = new Date(Date.now() - (d - 1) * 864e5);
+  return { from: ymd(from), to: ymd(to), label: `last ${d} days` };
+}
+
+// ─── Per-account fetch ────────────────────────────────────────────────────────
+/**
+ * Accounts are queried one at a time on purpose. Supermetrics fails the ENTIRE
+ * request if any one account in it is outside the subscription's prioritised
+ * list — verified against this account, where two of three Meta accounts tried
+ * were unlicensed. Batching them would mean one unlicensed account blanking the
+ * whole dashboard, so each is isolated and its failure reported individually.
+ */
+async function fetchAccount(platform: PaidPlatform, acct: PaidAccount, from: string, to: string): Promise<{ rows: CampaignRow[]; failure?: AccountFailure }> {
+  const spec = PLATFORMS[platform];
+  const f = spec.fields;
+  // Order matters: the response columns come back in the order requested.
+  const order: (keyof FieldMap)[] = ["date", "campaign", "currency"];
+  if (f.objective) order.push("objective");
+  order.push("impressions", "cost");
+  for (const k of ["clicks", "conversions", "linkClicks", "websiteConversions", "websiteLeads", "facebookLeads"] as (keyof FieldMap)[]) {
+    if (f[k]) order.push(k);
+  }
+  const fieldIds = order.map((k) => f[k] as string);
+
+  const res = await smQuery(spec.dsId, acct.id, fieldIds, from, to);
+  if ("error" in res) {
+    const notPrioritised = /prioritis|prioritiz/i.test(res.error);
+    return {
+      rows: [],
+      failure: {
+        platform,
+        accountId: acct.id,
+        accountName: acct.name,
+        reason: notPrioritised
+          ? "Not a prioritised account on this Supermetrics subscription, so its data cannot be pulled."
+          : res.error,
+        notPrioritised,
+      },
+    };
+  }
+
+  const at = (row: any[], k: keyof FieldMap): unknown => {
+    const i = order.indexOf(k);
+    return i === -1 ? undefined : row[i];
+  };
+  const out: CampaignRow[] = [];
+  for (const row of stripHeader(res.rows)) {
+    const objective = f.objective ? String(at(row, "objective") ?? "") || null : null;
+    const linkClicks = f.linkClicks ? num(at(row, "linkClicks")) : null;
+    const websiteConversions = f.websiteConversions ? num(at(row, "websiteConversions")) : null;
+    const websiteLeads = f.websiteLeads ? num(at(row, "websiteLeads")) : null;
+    const facebookLeads = f.facebookLeads ? num(at(row, "facebookLeads")) : null;
+    const conversions = f.conversions ? num(at(row, "conversions")) : null;
+    const impressions = num(at(row, "impressions"));
+    const clicks = f.clicks ? num(at(row, "clicks")) : (linkClicks ?? 0);
+
+    // Meta declares its objective, so the goal is read from it. Google and
+    // LinkedIn expose no objective in this field set; they are conversion-led by
+    // configuration here, so they are reported on conversions and labelled as
+    // such rather than having a goal invented for them.
+    const goal: CampaignGoal = platform === "meta" ? metaGoal(objective) : "conversions";
+    const leads = (websiteLeads ?? 0) + (facebookLeads ?? 0);
+    let result = conversions ?? 0;
+    let resultLabel = "Conversions";
+    if (platform === "meta") {
+      if (goal === "leads") { result = leads; resultLabel = "Leads"; }
+      else if (goal === "traffic") { result = linkClicks ?? 0; resultLabel = "Link clicks"; }
+      else if (goal === "conversions") { result = websiteConversions ?? 0; resultLabel = "Website conversions"; }
+      else if (goal === "awareness") { result = impressions; resultLabel = "Impressions"; }
+      else if (goal === "engagement") { result = linkClicks ?? 0; resultLabel = "Link clicks"; }
+      else {
+        // Unknown objective: report whichever outcome actually registered rather
+        // than a zero that reads as failure.
+        result = leads || websiteConversions || linkClicks || 0;
+        resultLabel = leads ? "Leads" : websiteConversions ? "Website conversions" : "Link clicks";
+      }
+    }
+
+    const dateVal = String(at(row, "date") ?? "");
+    out.push({
+      platform,
+      accountId: acct.id,
+      accountName: acct.name,
+      campaign: String(at(row, "campaign") ?? "(unnamed)"),
+      objective,
+      goal,
+      currency: String(at(row, "currency") ?? "") || "—",
+      impressions,
+      clicks,
+      cost: num(at(row, "cost")),
+      result,
+      resultLabel,
+      linkClicks,
+      websiteConversions,
+      websiteLeads,
+      facebookLeads,
+      conversions,
+      // `date` is carried on the row only to build the trend; it is not part of
+      // the campaign identity, so it lives in a non-enumerable slot.
+      ...(isDate(dateVal) ? { _date: dateVal } : {}),
+    } as CampaignRow & { _date?: string });
+  }
+  return { rows: out };
+}
+
+// ─── Public entry point ───────────────────────────────────────────────────────
+export async function getPaidData(fromRaw?: string, toRaw?: string, days = 30): Promise<PaidData> {
+  const { from, to, label } = paidRange(fromRaw, toRaw, days);
+  const connected = !!process.env.SUPERMETRICS_API_KEY;
+  const base: PaidData = {
+    connected, label, from, to, rows: [], byDate: [], currencies: [],
+    accountsUsed: [], failures: [], unconfigured: false,
+  };
+  if (!connected) return base;
+
+  const cfg = await getPaidConfig();
+  const selected: PaidAccount[] = [];
+  for (const p of Object.keys(PLATFORMS) as PaidPlatform[]) {
+    for (const a of cfg.accounts?.[p] ?? []) selected.push({ platform: p, id: a.id, name: a.name });
+  }
+  if (!selected.length) return { ...base, unconfigured: true };
+
+  // Accounts are independent queries, so they run concurrently. A slow or
+  // unlicensed one degrades its own row rather than the whole tab.
+  const settled = await Promise.all(selected.map((a) => fetchAccount(a.platform, a, from, to)));
+
+  const rows: CampaignRow[] = [];
+  for (let i = 0; i < settled.length; i++) {
+    const r = settled[i];
+    if (r.failure) base.failures.push(r.failure);
+    if (r.rows.length) {
+      rows.push(...r.rows);
+      base.accountsUsed.push(selected[i]);
+    }
+  }
+
+  // Roll the per-day rows up to one row per campaign, and build the trend from
+  // the same data before collapsing it.
+  const dayAcc = new Map<string, { cost: number; result: number; impressions: number }>();
+  const campAcc = new Map<string, CampaignRow>();
+  for (const r of rows) {
+    const d = (r as CampaignRow & { _date?: string })._date;
+    if (d) {
+      const cur = dayAcc.get(d) ?? { cost: 0, result: 0, impressions: 0 };
+      cur.cost += r.cost;
+      cur.result += r.result;
+      cur.impressions += r.impressions;
+      dayAcc.set(d, cur);
+    }
+    const key = `${r.platform}|${r.accountId}|${r.campaign}`;
+    const prev = campAcc.get(key);
+    if (!prev) {
+      campAcc.set(key, { ...r });
+      continue;
+    }
+    prev.impressions += r.impressions;
+    prev.clicks += r.clicks;
+    prev.cost += r.cost;
+    prev.result += r.result;
+    const add = (a: number | null, b: number | null) => (a == null && b == null ? null : (a ?? 0) + (b ?? 0));
+    prev.linkClicks = add(prev.linkClicks, r.linkClicks);
+    prev.websiteConversions = add(prev.websiteConversions, r.websiteConversions);
+    prev.websiteLeads = add(prev.websiteLeads, r.websiteLeads);
+    prev.facebookLeads = add(prev.facebookLeads, r.facebookLeads);
+    prev.conversions = add(prev.conversions, r.conversions);
+  }
+
+  base.rows = [...campAcc.values()].sort((a, b) => b.cost - a.cost);
+  base.byDate = [...dayAcc].map(([date, v]) => ({ date, ...v })).sort((a, b) => a.date.localeCompare(b.date));
+  base.currencies = [...new Set(base.rows.map((r) => r.currency).filter((c) => c && c !== "—"))].sort();
+
+  if (!base.rows.length && base.failures.length) {
+    base.error = `No data returned. ${base.failures.length} of ${selected.length} selected account(s) could not be read — see below.`;
+  }
+  return base;
+}

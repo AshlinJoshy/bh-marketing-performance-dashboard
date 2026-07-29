@@ -389,3 +389,40 @@ export async function saveSeoConfigAction(keywords: unknown) {
     return { ok: false as const, error: e instanceof Error ? e.message : String(e) };
   }
 }
+
+/**
+ * Save which ad accounts the Digital Performance tab shows.
+ *
+ * Accepts { google: [{id,name}], meta: [...], linkedin: [...] }. Only the id and
+ * name are stored — everything else about an account is read live, so persisting
+ * more would just go stale.
+ */
+export async function savePaidConfigAction(accounts: unknown) {
+  const db = adminClient();
+  if (!db) return { ok: false as const, error: "SUPABASE_SERVICE_ROLE_KEY not set" };
+  try {
+    const src = (accounts ?? {}) as Record<string, unknown>;
+    const clean = (k: string) =>
+      (Array.isArray(src[k]) ? (src[k] as unknown[]) : [])
+        .map((a) => {
+          const o = (a ?? {}) as { id?: unknown; name?: unknown };
+          return { id: String(o.id ?? "").trim(), name: String(o.name ?? "").trim() };
+        })
+        .filter((a) => a.id)
+        .slice(0, 50);
+    const payload = { accounts: { google: clean("google"), meta: clean("meta"), linkedin: clean("linkedin") } };
+    const { error } = await db
+      .from("paid_config")
+      .upsert({ id: 1, payload, updated_at: new Date().toISOString() }, { onConflict: "id" });
+    if (error) {
+      const hint = /relation .*paid_config.* does not exist/i.test(error.message)
+        ? "The paid_config table isn't created yet — apply migration 0012."
+        : error.message;
+      return { ok: false as const, error: hint };
+    }
+    revalidatePath("/digital");
+    return { ok: true as const };
+  } catch (e) {
+    return { ok: false as const, error: e instanceof Error ? e.message : String(e) };
+  }
+}
