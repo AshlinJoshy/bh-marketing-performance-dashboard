@@ -85,19 +85,6 @@ const STAGE_FILTERS: { key: StageFilter; label: string }[] = [
   { key: "notq", label: "Not qualified" },
 ];
 
-/**
- * Does a utm_source spelling belong to a platform? Matches the spellings seen
- * live in Engage — 'Facebook', 'meta-retargeting-static', 'meta-lal-static',
- * 'google' — as substrings, since the tags are free text. A heuristic, and
- * labelled as such where it's used.
- */
-function srcMatches(platform: PaidPlatform, src: string): boolean {
-  const s = norm(src);
-  if (platform === "google") return s.includes("google") || s.includes("adwords");
-  if (platform === "meta") return s.includes("facebook") || s.includes("meta") || s.includes("instagram") || s === "fb" || s === "ig";
-  return s.includes("linkedin") || s === "li";
-}
-
 const LEVEL_LABEL: Record<PaidLevel, string> = { campaign: "Campaigns", adset: "Ad sets", ad: "Ads" };
 const DEPTH: Record<PaidLevel, number> = { campaign: 0, adset: 1, ad: 2 };
 
@@ -544,6 +531,26 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
 
   // ── CRM facets: five interlinked, searchable filters ───────────────────────
   /** utm_campaigns living under ANY selected campaign_code (from Engage). */
+  /**
+   * campaign name (and Meta campaign id) → the platform it actually ran on,
+   * taken from the ad-platform data itself.
+   *
+   * This replaces matching leads by utm_source spelling, which was wrong in a
+   * way that mattered: a lead that arrived from a Google ad and then converted
+   * on a website pop-up carries utm_source=google, so a pop-up campaign appeared
+   * under the Google Ads filter. A campaign's platform is a property of the
+   * campaign, not of a lead's last touch — so it comes from the platform that
+   * actually reports the campaign.
+   */
+  const campaignPlatform = useMemo(() => {
+    const m = new Map<string, PaidPlatform>();
+    for (const r of data?.rows ?? []) {
+      m.set(norm(r.campaign), r.platform);
+      if (r.campaignId) m.set(norm(r.campaignId), r.platform);
+    }
+    return m;
+  }, [data?.rows]);
+
   const campaignsUnderCode = useMemo(() => {
     if (!codes.length) return null;
     const chosen = new Set(codes);
@@ -558,7 +565,10 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
       const needle = norm(q);
       return rows.filter(
         (r) =>
-          (platformFilter === "all" || srcMatches(platformFilter, r.source)) &&
+          // Only campaigns the platform itself reports. A lead whose campaign
+          // isn't in that platform's data is excluded rather than guessed at;
+          // how many that is gets reported below the funnel.
+          (platformFilter === "all" || campaignPlatform.get(norm(r.campaign)) === platformFilter) &&
           (skip === "code" || !campaignsUnderCode || campaignsUnderCode.has(norm(r.campaign))) &&
           // The stage filter narrows every facet: picking Deal must leave only
           // the utm values that actually appear on Deal-stage leads.
@@ -570,7 +580,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
           (!needle || norm(r.campaign).includes(needle)),
       );
     },
-    [crm?.rows, platformFilter, campaignsUnderCode, utmCamps, utmSrcs, utmMeds, utmContents, q, stageFilter],
+    [crm?.rows, platformFilter, campaignPlatform, campaignsUnderCode, utmCamps, utmSrcs, utmMeds, utmContents, q, stageFilter],
   );
 
   const facetOf = (rows: { campaign: string; source: string; medium: string; content: string; n: number }[], key: "campaign" | "source" | "medium" | "content") => {
@@ -644,6 +654,17 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     [crmBase, campsKey, srcsKey, medsKey, contentsKey],
   );
 
+  /**
+   * Campaign-tagged leads whose campaign appears in NO platform's data, so a
+   * platform filter cannot place them. Counted so the exclusion is visible.
+   */
+  const unattributableLeads = useMemo(() => {
+    if (platformFilter === "all") return 0;
+    let n = 0;
+    for (const r of crm?.rows ?? []) if (!campaignPlatform.has(norm(r.campaign))) n += r.n;
+    return n;
+  }, [crm?.rows, campaignPlatform, platformFilter]);
+
   const utmFiltersIdle =
     !activeCamps.length && !activeSrcs.length && !activeMeds.length && !activeContents.length && platformFilter === "all" && !q.trim();
 
@@ -683,8 +704,8 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
    * same rows as the bar heights, so a bar of 14 always breaks down to 14.
    */
   const funnelTop = useMemo(() => {
-    const acc = new Map<StageBucket | "leads", Map<string, number>>();
-    const bump = (k: StageBucket | "leads", camp: string, n: number) => {
+    const acc = new Map<StageBucket | "leads" | "live", Map<string, number>>();
+    const bump = (k: StageBucket | "leads" | "live", camp: string, n: number) => {
       const m = acc.get(k) ?? new Map<string, number>();
       m.set(camp, (m.get(camp) ?? 0) + n);
       acc.set(k, m);
@@ -693,7 +714,8 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
       const b = bucketOf(r.stage, r.state);
       const camp = r.campaign || "(none)";
       bump(b, camp, r.n);
-      if (isOpen(b)) bump("leads", camp, r.n);
+      bump("leads", camp, r.n);            // the whole pool
+      if (isOpen(b)) bump("live", camp, r.n); // still in play
     }
     const out = {} as Record<string, { campaign: string; n: number }[]>;
     for (const [k, m] of acc) {
@@ -763,7 +785,12 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
    */
   const funnel = useMemo(
     () => [
-      { key: "leads" as const, label: "Leads", n: crmAgg.leads, note: "campaign-tagged, still live", group: "top" as const },
+      // The top of the funnel is the whole pool. It used to be the LIVE count,
+      // which made "Leads 384" sit above "Not qualified 422" and read as a
+      // contradiction — you cannot disqualify more leads than you received. The
+      // pool is the honest denominator, and every stage below is a share of it.
+      { key: "leads" as const, label: "Leads", n: crmAgg.matched, note: "every campaign-tagged lead", group: "top" as const },
+      { key: "live" as const, label: "Still live", n: crmAgg.leads, note: "not disqualified or lost", group: "top" as const },
       { key: "qualified" as const, label: "Qualified", n: crmAgg.qualified, note: "at Qualified now", group: "top" as const },
       { key: "viewing" as const, label: "Viewing", n: crmAgg.viewing, note: "buyer / tenant path", group: "buy" as const },
       { key: "offerRes" as const, label: "Offer / Reserved", n: crmAgg.offerRes, note: "in negotiation", group: "buy" as const },
@@ -783,10 +810,12 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   // so the card names what it is actually counting.
   const stageLabel = STAGE_FILTERS.find((f) => f.key === stageFilter)?.label ?? "All stages";
   const leadLabel = stageFilter === "all" ? "Leads" : `${stageLabel} leads`;
-  const leadCount = stageFilter === "all" ? crmAgg.leads : crmAgg.matched;
+  const leadCount = crmAgg.matched;
 
   const cur = totals.singleCurrency ?? "—";
-  const cpl = crmAgg.leads > 0 && totals.singleCurrency ? totals.spend / crmAgg.leads : null;
+  // Cost per lead divides by every lead the spend produced, including the ones
+  // later disqualified — they were paid for too.
+  const cpl = crmAgg.matched > 0 && totals.singleCurrency ? totals.spend / crmAgg.matched : null;
   const cpql = crmAgg.qualified > 0 && totals.singleCurrency ? totals.spend / crmAgg.qualified : null;
   const selectedCount = PLATFORM_ORDER.reduce((n, p) => n + sel[p].length, 0);
 
@@ -1081,7 +1110,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
           <div className="chart-card" style={{ marginBottom: 16 }}>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
               <button className={`filter-btn${platformFilter === "all" ? " active" : ""}`} onClick={() => setPlatformFilter("all")}>All platforms</button>
-              {PLATFORM_ORDER.filter((p) => (data.rows.some((r) => r.platform === p) || (crm?.rows ?? []).some((r) => srcMatches(p, r.source)))).map((p) => (
+              {PLATFORM_ORDER.filter((p) => data.rows.some((r) => r.platform === p)).map((p) => (
                 <button key={p} className={`filter-btn${platformFilter === p ? " active" : ""}`} onClick={() => setPlatformFilter(p)} style={platformFilter === p ? { background: PLATFORM_COLOR[p], borderColor: PLATFORM_COLOR[p] } : undefined}>
                   {PLATFORMS[p].label}
                 </button>
@@ -1131,9 +1160,12 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
             </div>
             <div className="kpi-card">
               <div className="kpi-label">
-                {leadLabel} <HelpTip text="Campaign-tagged leads created in the CRM in this range, excluding disqualified and lost ones. With only a campaign_code selected this includes the code's untagged leads (WhatsApp/email buttons); UTM filters narrow to tagged leads. Source: Engage via Metabase." />
+                {leadLabel} <HelpTip text="Every campaign-tagged lead created in the CRM in this range, including ones since disqualified or lost — the pool the spend bought. The split is shown beneath, and each funnel stage is a share of this number. With only a campaign_code selected this includes the code's untagged leads (WhatsApp/email buttons); UTM filters narrow to tagged leads. Source: Engage via Metabase." />
               </div>
               <div className="kpi-value" style={{ color: C.green }}>{crm?.error && !crm.rows.length ? "—" : fmt(leadCount)}</div>
+              {stageFilter === "all" && crmAgg.matched > 0 && (
+                <div className="kpi-change">{fmt(crmAgg.leads)} still live · {fmt(crmAgg.notq + crmAgg.lost)} closed</div>
+              )}
             </div>
             <div className="kpi-card">
               <div className="kpi-label">Qualified <HelpTip text="Leads sitting at the Qualified stage right now, still open." /></div>
@@ -1197,6 +1229,13 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
             <div className="chart-sub">
               {crm?.error && !crm.rows.length ? `CRM unavailable: ${crm.error}` : `${fmt(crmAgg.leads)} open leads${activeCodes.length === 1 ? ` · code ${activeCodes[0]}` : activeCodes.length > 1 ? ` · ${activeCodes.length} codes` : ""} · ${crm?.label ?? ""}${crmAgg.lost ? ` · ${fmt(crmAgg.lost)} closed later in the pipeline (lost)` : ""}${crmAgg.other ? ` · ${fmt(crmAgg.other)} at a stage not shown above` : ""}${crm?.truncated ? " · largest groups only (row cap hit)" : ""}${crm?.error ? ` · ${crm.error}` : ""}`}
             </div>
+            {platformFilter !== "all" && unattributableLeads > 0 && (
+              <div className="chart-sub" style={{ marginTop: 8 }}>
+                {fmt(unattributableLeads)} campaign-tagged lead{unattributableLeads === 1 ? "" : "s"} excluded: their utm_campaign matches
+                no campaign in any selected ad account, so no platform can be attributed to them. Clear the platform filter to include
+                them, or check the naming — the Explorer&apos;s dashes show the same mismatch from the ads side.
+              </div>
+            )}
             {codesOverlap && (
               <div className="chart-sub" style={{ marginTop: 8, color: C.coral }}>
                 ⚠ Two or more of the selected codes share leads — Engage links a lead to its own campaign entity <em>and</em> to any
@@ -1276,7 +1315,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
                     <div style={{ fontSize: 12, textAlign: "right" }}>
                       <strong>{fmt(st.n)}</strong>
                       {st.group !== "lost" && i > 0 && funnel[0].n > 0 && <span className="muted"> · {pct0(st.n / funnel[0].n)} of leads</span>}
-                      {st.group === "lost" && crmAgg.matched > 0 && <span className="muted"> · {pct0(st.n / crmAgg.matched)} of all</span>}
+                      {st.group === "lost" && funnel[0].n > 0 && <span className="muted"> · {pct0(st.n / funnel[0].n)} of leads</span>}
                     </div>
                     </div>
                   </div>
