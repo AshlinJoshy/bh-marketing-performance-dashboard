@@ -65,6 +65,69 @@ function addStage(a: StageAgg, stage: string, state: string, n: number) {
   else if (st === "deal") a.deals += n;
 }
 
+// ─── Trend bucketing ─────────────────────────────────────────────────────────
+// A 7-month range plotted daily is 200 unreadable ticks; a 7-day range plotted
+// monthly is one. Granularity follows the range length, and the axis is labelled
+// in the unit it actually shows.
+type Bucket = "day" | "week" | "month";
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const DAY_MS = 864e5;
+const parseYmd = (s: string) => new Date(`${s}T00:00:00Z`);
+const toYmd = (d: Date) => d.toISOString().slice(0, 10);
+/** Monday of the week containing d (UTC, so bucketing can't drift on DST). */
+function mondayOf(d: Date): Date {
+  const dow = (d.getUTCDay() + 6) % 7;
+  return new Date(d.getTime() - dow * DAY_MS);
+}
+export function pickBucket(from: string, to: string): Bucket {
+  const days = Math.round((parseYmd(to).getTime() - parseYmd(from).getTime()) / DAY_MS) + 1;
+  if (days <= 31) return "day";   // a month or less: every day fits
+  if (days <= 120) return "week"; // a quarter: ~17 ticks
+  return "month";                 // longer: month names, as asked
+}
+function bucketKey(ymd: string, b: Bucket): string {
+  if (b === "day") return ymd;
+  if (b === "week") return toYmd(mondayOf(parseYmd(ymd)));
+  return ymd.slice(0, 7);
+}
+function bucketLabel(key: string, b: Bucket, multiYear: boolean): string {
+  if (b === "month") {
+    const [y, m] = key.split("-");
+    return multiYear ? `${MONTHS[+m - 1]} ${y.slice(2)}` : MONTHS[+m - 1];
+  }
+  const d = parseYmd(key);
+  const day = `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`;
+  return b === "week" ? `w/c ${day}` : day;
+}
+/**
+ * Every bucket in the range, including empty ones. Zero-filling matters: the
+ * series only contains days that had spend, so a fortnight of nothing used to be
+ * drawn as a straight line between the two dates either side of it — implying
+ * spend that never happened.
+ */
+function enumerateBuckets(from: string, to: string, b: Bucket): string[] {
+  const out: string[] = [];
+  if (b === "month") {
+    let y = +from.slice(0, 4), m = +from.slice(5, 7);
+    const endY = +to.slice(0, 4), endM = +to.slice(5, 7);
+    while (y < endY || (y === endY && m <= endM)) {
+      out.push(`${y}-${String(m).padStart(2, "0")}`);
+      if (++m > 12) { m = 1; y++; }
+    }
+    return out;
+  }
+  const step = b === "week" ? 7 : 1;
+  let cur = b === "week" ? mondayOf(parseYmd(from)) : parseYmd(from);
+  const end = parseYmd(to);
+  while (cur.getTime() <= end.getTime()) {
+    out.push(toYmd(cur));
+    cur = new Date(cur.getTime() + step * DAY_MS);
+  }
+  return out;
+}
+
+const BUCKET_LABEL: Record<Bucket, string> = { day: "Daily", week: "Weekly", month: "Monthly" };
+
 // Default range = this month, resolved once at module load (never during render).
 const INIT_RANGE = rangeFor("this_month");
 
@@ -82,15 +145,18 @@ const failedPaid = (from: string, to: string, error: string): PaidData => ({
 // ─── Searchable filter dropdown ───────────────────────────────────────────────
 function FilterSelect({
   label,
-  value,
+  selected,
   options,
-  onChange,
+  onToggle,
+  onClear,
   width = 190,
 }: {
   label: string;
-  value: string; // "all" or a concrete value
+  /** Empty means "all" — no narrowing on this dimension. */
+  selected: string[];
   options: [string, number][];
-  onChange: (v: string) => void;
+  onToggle: (v: string) => void;
+  onClear: () => void;
   width?: number;
 }) {
   const [open, setOpen] = useState(false);
@@ -108,19 +174,24 @@ function FilterSelect({
 
   const needle = norm(search);
   const shown = needle ? options.filter(([v]) => v.includes(needle)) : options;
+  const chosen = new Set(selected);
+  const summary =
+    selected.length === 0 ? `${label}: all`
+      : selected.length === 1 ? `${label}: ${selected[0].length > 22 ? selected[0].slice(0, 22) + "…" : selected[0]}`
+        : `${label}: ${selected.length} selected`;
 
   return (
     <div ref={boxRef} style={{ position: "relative", width }}>
       <button
-        className="search-box"
-        style={{ width: "100%", textAlign: "left", cursor: "pointer", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+        className={`search-box${selected.length ? " active" : ""}`}
+        style={{ width: "100%", textAlign: "left", cursor: "pointer", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: selected.length ? 600 : 400 }}
         onClick={() => { setOpen((v) => !v); setSearch(""); }}
-        title={value === "all" ? `${label}: all` : `${label}: ${value}`}
+        title={selected.length ? `${label}: ${selected.join(", ")}` : `${label}: all`}
       >
-        {value === "all" ? `${label}: all` : `${label}: ${value.length > 24 ? value.slice(0, 24) + "…" : value}`} <span className="muted">▾</span>
+        {summary} <span className="muted">▾</span>
       </button>
       {open && (
-        <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 40, width: Math.max(width, 260), maxHeight: 300, overflowY: "auto", background: "#fff", border: "1px solid var(--border)", borderRadius: 8, boxShadow: "0 6px 18px rgba(0,0,0,.08)", padding: 6 }}>
+        <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 40, width: Math.max(width, 300), maxHeight: 320, overflowY: "auto", background: "#fff", border: "1px solid var(--border)", borderRadius: 8, boxShadow: "0 6px 18px rgba(0,0,0,.08)", padding: 6 }}>
           <input
             autoFocus
             className="search-box"
@@ -129,22 +200,25 @@ function FilterSelect({
             value={search}
             onChange={(e) => setSearch(e.target.value)}
           />
-          <div
-            style={{ padding: "4px 8px", fontSize: 12, cursor: "pointer", borderRadius: 5, fontWeight: value === "all" ? 700 : 400 }}
-            onMouseDown={() => { onChange("all"); setOpen(false); }}
-          >
-            all
+          <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "2px 8px 6px", borderBottom: "1px solid var(--border)", marginBottom: 4 }}>
+            <span className="muted" style={{ fontSize: 11, flex: 1 }}>
+              {selected.length ? `${selected.length} selected` : "none selected — showing all"}
+            </span>
+            {/* Stays open on clear so several can be picked in one visit. */}
+            <button className="filter-btn" style={{ fontSize: 10, padding: "1px 7px" }} onMouseDown={onClear} disabled={!selected.length}>
+              Clear
+            </button>
           </div>
-          {shown.slice(0, 200).map(([v, n]) => (
-            <div
+          {shown.slice(0, 300).map(([v, n]) => (
+            <label
               key={v}
               title={v}
-              style={{ padding: "4px 8px", fontSize: 12, cursor: "pointer", borderRadius: 5, display: "flex", gap: 8, fontWeight: value === v ? 700 : 400 }}
-              onMouseDown={() => { onChange(v); setOpen(false); }}
+              style={{ padding: "4px 8px", fontSize: 12, cursor: "pointer", borderRadius: 5, display: "flex", gap: 8, alignItems: "center", fontWeight: chosen.has(v) ? 700 : 400 }}
             >
+              <input type="checkbox" checked={chosen.has(v)} onChange={() => onToggle(v)} />
               <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{v}</span>
               <span className="muted">{n}</span>
-            </div>
+            </label>
           ))}
           {!shown.length && <div className="muted" style={{ padding: "4px 8px", fontSize: 12 }}>No matches.</div>}
         </div>
@@ -192,12 +266,15 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
 
   // ── Dashboard-level filters ─────────────────────────────────────────────────
   const [platformFilter, setPlatformFilter] = useState<"all" | PaidPlatform>("all");
-  const [goalFilter, setGoalFilter] = useState<"all" | CampaignGoal>("all");
-  const [code, setCode] = useState("all");
-  const [utmCamp, setUtmCamp] = useState("all");
-  const [utmSrc, setUtmSrc] = useState("all");
-  const [utmMed, setUtmMed] = useState("all");
-  const [utmContent, setUtmContent] = useState("all");
+  // Each facet holds a SET of chosen values; empty means "all". Multi-select
+  // throughout, so several codes (or sources, mediums…) can be compared at once.
+  const [codes, setCodes] = useState<string[]>([]);
+  const [utmCamps, setUtmCamps] = useState<string[]>([]);
+  const [utmSrcs, setUtmSrcs] = useState<string[]>([]);
+  const [utmMeds, setUtmMeds] = useState<string[]>([]);
+  const [utmContents, setUtmContents] = useState<string[]>([]);
+  const toggleIn = (setter: (f: (prev: string[]) => string[]) => void) => (v: string) =>
+    setter((prev) => (prev.includes(v) ? prev.filter((x) => x !== v) : [...prev, v]));
   const [q, setQ] = useState("");
   const [explorerOpen, setExplorerOpen] = useState(true);
   const [explorerQ, setExplorerQ] = useState("");
@@ -335,14 +412,13 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     return (data?.rows ?? []).filter(
       (r) =>
         (platformFilter === "all" || r.platform === platformFilter) &&
-        (goalFilter === "all" || r.goal === goalFilter) &&
         (!needle ||
           norm(r.campaign).includes(needle) ||
           norm(r.adset ?? "").includes(needle) ||
           norm(r.ad ?? "").includes(needle) ||
           norm(r.accountName).includes(needle)),
     );
-  }, [data?.rows, platformFilter, goalFilter, q]);
+  }, [data?.rows, platformFilter, q]);
 
   const mediaRows = useMemo(() => regroup(mediaFiltered, viewLevel), [mediaFiltered, viewLevel, regroup]);
 
@@ -365,13 +441,14 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   }, [mediaFiltered, regroup]);
 
   // ── CRM facets: five interlinked, searchable filters ───────────────────────
-  /** utm_campaigns that live under the selected campaign_code (from Engage). */
+  /** utm_campaigns living under ANY selected campaign_code (from Engage). */
   const campaignsUnderCode = useMemo(() => {
-    if (code === "all") return null;
+    if (!codes.length) return null;
+    const chosen = new Set(codes);
     const set = new Set<string>();
-    for (const r of crm?.codeRows ?? []) if (norm(r.code) === code) set.add(norm(r.campaign));
+    for (const r of crm?.codeRows ?? []) if (chosen.has(norm(r.code))) set.add(norm(r.campaign));
     return set;
-  }, [crm?.codeRows, code]);
+  }, [crm?.codeRows, codes]);
 
   const crmBase = useCallback(
     (skip: "campaign" | "source" | "medium" | "content" | null) => {
@@ -381,14 +458,14 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
         (r) =>
           (platformFilter === "all" || srcMatches(platformFilter, r.source)) &&
           (!campaignsUnderCode || campaignsUnderCode.has(norm(r.campaign))) &&
-          (skip === "campaign" || utmCamp === "all" || norm(r.campaign) === utmCamp) &&
-          (skip === "source" || utmSrc === "all" || norm(r.source) === utmSrc) &&
-          (skip === "medium" || utmMed === "all" || norm(r.medium) === utmMed) &&
-          (skip === "content" || utmContent === "all" || norm(r.content) === utmContent) &&
+          (skip === "campaign" || !utmCamps.length || utmCamps.includes(norm(r.campaign))) &&
+          (skip === "source" || !utmSrcs.length || utmSrcs.includes(norm(r.source))) &&
+          (skip === "medium" || !utmMeds.length || utmMeds.includes(norm(r.medium))) &&
+          (skip === "content" || !utmContents.length || utmContents.includes(norm(r.content))) &&
           (!needle || norm(r.campaign).includes(needle)),
       );
     },
-    [crm?.rows, platformFilter, campaignsUnderCode, utmCamp, utmSrc, utmMed, utmContent, q],
+    [crm?.rows, platformFilter, campaignsUnderCode, utmCamps, utmSrcs, utmMeds, utmContents, q],
   );
 
   const facetOf = (rows: { campaign: string; source: string; medium: string; content: string; n: number }[], key: "campaign" | "source" | "medium" | "content") => {
@@ -409,33 +486,43 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   const codeOptions = useMemo(() => {
     const acc = new Map<string, number>();
     for (const r of crm?.codeRows ?? []) {
-      if (utmCamp !== "all" && norm(r.campaign) !== utmCamp) continue;
+      if (utmCamps.length && !utmCamps.includes(norm(r.campaign))) continue;
       const v = norm(r.code);
       if (v === "(unlinked)") continue;
       acc.set(v, (acc.get(v) ?? 0) + r.n);
     }
     return [...acc].sort((a, b) => b[1] - a[1]);
-  }, [crm?.codeRows, utmCamp]);
+  }, [crm?.codeRows, utmCamps]);
 
-  // Stale selections degrade to "all" instead of zeroing the page.
-  const activeCamp = utmCamp !== "all" && !campOptions.some(([v]) => v === utmCamp) ? "all" : utmCamp;
-  const activeSrc = utmSrc !== "all" && !srcOptions.some(([v]) => v === utmSrc) ? "all" : utmSrc;
-  const activeMed = utmMed !== "all" && !medOptions.some(([v]) => v === utmMed) ? "all" : utmMed;
-  const activeContent = utmContent !== "all" && !contentOptions.some(([v]) => v === utmContent) ? "all" : utmContent;
+  // A value that an upstream filter has made impossible is pruned rather than
+  // left in place to zero the page. Prune to empty = back to "all".
+  const keep = (chosen: string[], opts: [string, number][]) => chosen.filter((v) => opts.some(([o]) => o === v));
+  const activeCamps = keep(utmCamps, campOptions);
+  const activeSrcs = keep(utmSrcs, srcOptions);
+  const activeMeds = keep(utmMeds, medOptions);
+  const activeContents = keep(utmContents, contentOptions);
+  const activeCodes = keep(codes, codeOptions);
+  const codesKey = activeCodes.join("|");
+  const campsKey = activeCamps.join("|");
+  const srcsKey = activeSrcs.join("|");
+  const medsKey = activeMeds.join("|");
+  const contentsKey = activeContents.join("|");
 
   const crmFiltered = useMemo(
     () =>
       crmBase(null).filter(
         (r) =>
-          (activeCamp === "all" || norm(r.campaign) === activeCamp) &&
-          (activeSrc === "all" || norm(r.source) === activeSrc) &&
-          (activeMed === "all" || norm(r.medium) === activeMed) &&
-          (activeContent === "all" || norm(r.content) === activeContent),
+          (!activeCamps.length || activeCamps.includes(norm(r.campaign))) &&
+          (!activeSrcs.length || activeSrcs.includes(norm(r.source))) &&
+          (!activeMeds.length || activeMeds.includes(norm(r.medium))) &&
+          (!activeContents.length || activeContents.includes(norm(r.content))),
       ),
-    [crmBase, activeCamp, activeSrc, activeMed, activeContent],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [crmBase, campsKey, srcsKey, medsKey, contentsKey],
   );
 
-  const utmFiltersIdle = activeCamp === "all" && activeSrc === "all" && activeMed === "all" && activeContent === "all" && platformFilter === "all" && !q.trim();
+  const utmFiltersIdle =
+    !activeCamps.length && !activeSrcs.length && !activeMeds.length && !activeContents.length && platformFilter === "all" && !q.trim();
 
   /**
    * Funnel aggregation. With ONLY a campaign code selected, the stage counts
@@ -445,13 +532,39 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
    */
   const crmAgg = useMemo(() => {
     const agg = emptyStages();
-    if (code !== "all" && utmFiltersIdle) {
-      for (const r of crm?.codeRows ?? []) if (norm(r.code) === code) addStage(agg, r.stage, r.state, r.n);
+    if (activeCodes.length && utmFiltersIdle) {
+      const chosen = new Set(activeCodes);
+      for (const r of crm?.codeRows ?? []) if (chosen.has(norm(r.code))) addStage(agg, r.stage, r.state, r.n);
     } else {
       for (const r of crmFiltered) addStage(agg, r.stage, r.state, r.n);
     }
     return agg;
-  }, [crm?.codeRows, code, utmFiltersIdle, crmFiltered]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [crm?.codeRows, codesKey, utmFiltersIdle, crmFiltered]);
+
+  /**
+   * Do the selected codes share leads?
+   *
+   * Engage links a lead to several campaign entities at once — typically its own
+   * utm_campaign entity AND an umbrella project code — so summing membership
+   * rows across codes double-counts any lead they have in common. There is no
+   * lead id in the grouped rows to dedupe by, so rather than quietly overstate
+   * the funnel this detects the collision (the same campaign+stage+state
+   * appearing under more than one selected code) and the card says so.
+   */
+  const codesOverlap = useMemo(() => {
+    if (activeCodes.length < 2 || !utmFiltersIdle) return false;
+    const chosen = new Set(activeCodes);
+    const seen = new Set<string>();
+    for (const r of crm?.codeRows ?? []) {
+      if (!chosen.has(norm(r.code))) continue;
+      const k = `${norm(r.campaign)}|${r.stage}|${r.state}`;
+      if (seen.has(k)) return true;
+      seen.add(k);
+    }
+    return false;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [crm?.codeRows, codesKey, utmFiltersIdle]);
 
   const crmByCampaign = useMemo(() => {
     const m = new Map<string, CrmJoin>();
@@ -495,35 +608,44 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   const cpl = crmAgg.leads > 0 && totals.singleCurrency ? totals.spend / crmAgg.leads : null;
   const cpql = crmAgg.qualified > 0 && totals.singleCurrency ? totals.spend / crmAgg.qualified : null;
   const selectedCount = PLATFORM_ORDER.reduce((n, p) => n + sel[p].length, 0);
-  const goalsPresent = useMemo(() => [...new Set((data?.rows ?? []).map((r) => r.goal))], [data?.rows]);
 
   // ── Trends (platform + goal aware) ──────────────────────────────────────────
+  // Granularity and labels follow the selected range: days for a month or less,
+  // weeks up to a quarter, month names beyond that.
+  const bucket = useMemo(() => pickBucket(from, to), [from, to]);
+  const bucketKeys = useMemo(() => enumerateBuckets(from, to, bucket), [from, to, bucket]);
+  const bucketLabels = useMemo(() => {
+    const multiYear = from.slice(0, 4) !== to.slice(0, 4);
+    return bucketKeys.map((k) => bucketLabel(k, bucket, multiYear));
+  }, [bucketKeys, bucket, from, to]);
+
   const trend = useMemo(() => {
-    const acc = new Map<string, { cost: number; leads: number }>();
+    const acc = new Map(bucketKeys.map((k) => [k, { cost: 0, leads: 0 }]));
     for (const d of data?.byDateFine ?? []) {
       if (platformFilter !== "all" && d.platform !== platformFilter) continue;
-      if (goalFilter !== "all" && d.goal !== goalFilter) continue;
-      const cur = acc.get(d.date) ?? { cost: 0, leads: 0 };
+      const cur = acc.get(bucketKey(d.date, bucket));
+      if (!cur) continue; // outside the requested range
       cur.cost += d.cost;
       cur.leads += d.leads;
-      acc.set(d.date, cur);
     }
-    return [...acc].map(([date, v]) => ({ date, ...v })).sort((a, b) => a.date.localeCompare(b.date));
-  }, [data?.byDateFine, platformFilter, goalFilter]);
+    return bucketKeys.map((k) => acc.get(k)!);
+  }, [data?.byDateFine, platformFilter, bucketKeys, bucket]);
 
   const platformTrend = useMemo(() => {
-    const dates = [...new Set((data?.byDateFine ?? []).map((d) => d.date))].sort();
     const series = PLATFORM_ORDER.map((p) => {
-      const byDate = new Map<string, number>();
+      const acc = new Map(bucketKeys.map((k) => [k, 0]));
+      let any = false;
       for (const d of data?.byDateFine ?? []) {
         if (d.platform !== p) continue;
-        if (goalFilter !== "all" && d.goal !== goalFilter) continue;
-        byDate.set(d.date, (byDate.get(d.date) ?? 0) + d.cost);
+        const k = bucketKey(d.date, bucket);
+        if (!acc.has(k)) continue;
+        acc.set(k, acc.get(k)! + d.cost);
+        if (d.cost > 0) any = true;
       }
-      return { platform: p, points: dates.map((dt) => byDate.get(dt) ?? 0), any: byDate.size > 0 };
+      return { platform: p, points: bucketKeys.map((k) => acc.get(k)!), any };
     }).filter((s) => s.any);
-    return { dates, series };
-  }, [data?.byDateFine, goalFilter]);
+    return series;
+  }, [data?.byDateFine, bucketKeys, bucket]);
 
   const byGoal = useMemo(() => {
     const acc = new Map<CampaignGoal, number>();
@@ -540,9 +662,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     const needle = norm(q);
     const rows = regroup(
       (data?.rows ?? []).filter(
-        (r) =>
-          (goalFilter === "all" || r.goal === goalFilter) &&
-          (!needle || norm(r.campaign).includes(needle) || norm(r.adset ?? "").includes(needle) || norm(r.ad ?? "").includes(needle) || norm(r.accountName).includes(needle)),
+        (r) => !needle || norm(r.campaign).includes(needle) || norm(r.adset ?? "").includes(needle) || norm(r.ad ?? "").includes(needle) || norm(r.accountName).includes(needle),
       ),
       "campaign",
     );
@@ -566,7 +686,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
       mixed: allCurs.size > 1,
     };
     return { list, total };
-  }, [data?.rows, data?.accountsUsed, data?.emptyAccounts, data?.failures, goalFilter, q, regroup]);
+  }, [data?.rows, data?.accountsUsed, data?.emptyAccounts, data?.failures, q, regroup]);
 
   // ── Campaign tree: code → utm_campaign → ad set → ad ───────────────────────
   const mediaIndex = useMemo(() => {
@@ -606,8 +726,8 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     const codes = new Map<string, { agg: StageAgg; campaigns: Map<string, StageAgg> }>();
     for (const r of crm?.codeRows ?? []) {
       const c = norm(r.code);
-      if (code !== "all" && c !== code) continue;
-      if (activeCamp !== "all" && norm(r.campaign) !== activeCamp) continue;
+      if (activeCodes.length && !activeCodes.includes(c)) continue;
+      if (activeCamps.length && !activeCamps.includes(norm(r.campaign))) continue;
       const needle = norm(q);
       if (needle && !c.includes(needle) && !norm(r.campaign).includes(needle)) continue;
       const entry = codes.get(c) ?? { agg: emptyStages(), campaigns: new Map<string, StageAgg>() };
@@ -626,7 +746,8 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
       }))
       .sort((a, b) => b.agg.leads - a.agg.leads)
       .slice(0, 40);
-  }, [crm?.codeRows, code, activeCamp, q, mediaIndex]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [crm?.codeRows, codesKey, campsKey, q, mediaIndex]);
 
   const toggleNode = (key: string) =>
     setExpanded((s) => {
@@ -640,7 +761,14 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   const rowContext = (r: CampaignRow) =>
     viewLevel === "ad" ? [r.campaign, r.adset].filter(Boolean).join(" › ") : viewLevel === "adset" ? r.campaign : null;
 
-  const filtersActive = platformFilter !== "all" || goalFilter !== "all" || code !== "all" || activeCamp !== "all" || activeSrc !== "all" || activeMed !== "all" || activeContent !== "all" || q.trim() !== "";
+  const filtersActive =
+    platformFilter !== "all" || activeCodes.length > 0 || activeCamps.length > 0 || activeSrcs.length > 0 ||
+    activeMeds.length > 0 || activeContents.length > 0 || q.trim() !== "";
+  function clearAll() {
+    setPlatformFilter("all");
+    setCodes([]); setUtmCamps([]); setUtmSrcs([]); setUtmMeds([]); setUtmContents([]);
+    setQ("");
+  }
 
   const explorerRows = useMemo(() => {
     const needle = norm(explorerQ);
@@ -774,26 +902,19 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
                   {PLATFORMS[p].label}
                 </button>
               ))}
-              <span style={{ width: 10 }} />
-              <button className={`filter-btn${goalFilter === "all" ? " active" : ""}`} onClick={() => setGoalFilter("all")}>All goals</button>
-              {goalsPresent.map((g) => (
-                <button key={g} className={`filter-btn${goalFilter === g ? " active" : ""}`} onClick={() => setGoalFilter(g)}>{GOAL_LABELS[g]}</button>
-              ))}
               {filtersActive && (
-                <button className="filter-btn" style={{ marginLeft: "auto" }} onClick={() => { setPlatformFilter("all"); setGoalFilter("all"); setCode("all"); setUtmCamp("all"); setUtmSrc("all"); setUtmMed("all"); setUtmContent("all"); setQ(""); }}>
-                  Clear all
-                </button>
+                <button className="filter-btn" style={{ marginLeft: "auto" }} onClick={clearAll}>Clear all filters</button>
               )}
             </div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8, alignItems: "center" }}>
               <span className="muted" style={{ fontSize: 11 }}>
                 Engage <HelpTip text="Straight from Engage: campaign_code is the campaign entity's reference (a code groups several utm_campaigns); the four utm_* fields are what each lead's record carries. All five are searchable and interlinked — each offers only values that exist under the other active filters." />
               </span>
-              <FilterSelect label="campaign_code" value={code} options={codeOptions} onChange={setCode} width={230} />
-              <FilterSelect label="utm_campaign" value={activeCamp} options={campOptions} onChange={setUtmCamp} width={230} />
-              <FilterSelect label="utm_source" value={activeSrc} options={srcOptions} onChange={setUtmSrc} width={165} />
-              <FilterSelect label="utm_medium" value={activeMed} options={medOptions} onChange={setUtmMed} width={160} />
-              <FilterSelect label="utm_content" value={activeContent} options={contentOptions} onChange={setUtmContent} width={185} />
+              <FilterSelect label="campaign_code" selected={activeCodes} options={codeOptions} onToggle={toggleIn(setCodes)} onClear={() => setCodes([])} width={230} />
+              <FilterSelect label="utm_campaign" selected={activeCamps} options={campOptions} onToggle={toggleIn(setUtmCamps)} onClear={() => setUtmCamps([])} width={230} />
+              <FilterSelect label="utm_source" selected={activeSrcs} options={srcOptions} onToggle={toggleIn(setUtmSrcs)} onClear={() => setUtmSrcs([])} width={170} />
+              <FilterSelect label="utm_medium" selected={activeMeds} options={medOptions} onToggle={toggleIn(setUtmMeds)} onClear={() => setUtmMeds([])} width={165} />
+              <FilterSelect label="utm_content" selected={activeContents} options={contentOptions} onToggle={toggleIn(setUtmContents)} onClear={() => setUtmContents([])} width={190} />
               <input className="search-box" style={{ flex: 1, minWidth: 150 }} placeholder="Search everything…" value={q} onChange={(e) => setQ(e.target.value)} />
             </div>
           </div>
@@ -850,8 +971,15 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
               Lead funnel <HelpTip text="Campaign-tagged CRM leads by the pipeline stage they sit at today, closed leads dropped. Each stage shows its share of leads." />
             </div>
             <div className="chart-sub">
-              {crm?.error && !crm.rows.length ? `CRM unavailable: ${crm.error}` : `${fmt(crmAgg.leads)} open leads${code !== "all" ? ` · code ${code}` : ""} · ${crm?.label ?? ""}${crm?.truncated ? " · largest groups only (row cap hit)" : ""}${crm?.error ? ` · ${crm.error}` : ""}`}
+              {crm?.error && !crm.rows.length ? `CRM unavailable: ${crm.error}` : `${fmt(crmAgg.leads)} open leads${activeCodes.length === 1 ? ` · code ${activeCodes[0]}` : activeCodes.length > 1 ? ` · ${activeCodes.length} codes` : ""} · ${crm?.label ?? ""}${crm?.truncated ? " · largest groups only (row cap hit)" : ""}${crm?.error ? ` · ${crm.error}` : ""}`}
             </div>
+            {codesOverlap && (
+              <div className="chart-sub" style={{ marginTop: 8, color: C.coral }}>
+                ⚠ Two or more of the selected codes share leads — Engage links a lead to its own campaign entity <em>and</em> to any
+                umbrella project code above it. Those leads are counted once per code here, so the totals below are higher than the
+                number of distinct leads. Select the codes one at a time for exact figures.
+              </div>
+            )}
             <div style={{ display: "grid", gap: 6, marginTop: 12 }}>
               {funnel.map((s, i) => (
                 <div key={s.label} style={{ display: "grid", gridTemplateColumns: "150px 1fr 170px", alignItems: "center", gap: 10 }}>
@@ -1000,13 +1128,13 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
               <div className="chart-title">
                 Spend &amp; leads over time <HelpTip text="Leads here are platform-reported (Meta website + form leads; Google/LinkedIn conversions) so they exist per day. Platform and goal filters apply; Engage filters can't reach this chart because the ad platforms don't report by UTM." />
               </div>
-              <div className="chart-sub">Daily · {data.label}</div>
+              <div className="chart-sub">{BUCKET_LABEL[bucket]} · {data.label}</div>
               <div className="chart-canvas-wrap">
-                {trend.length ? (
+                {trend.some((d) => d.cost > 0 || d.leads > 0) ? (
                   <ChartBox
                     type="line"
                     data={{
-                      labels: trend.map((d) => d.date.slice(5)),
+                      labels: bucketLabels,
                       datasets: [
                         { label: `Spend${cur !== "—" ? ` (${cur})` : ""}`, data: trend.map((d) => d.cost), borderColor: C.dark, backgroundColor: "rgba(31,52,63,.08)", fill: true, tension: 0.3, yAxisID: "y" },
                         { label: "Leads", data: trend.map((d) => d.leads), borderColor: C.green, backgroundColor: "transparent", tension: 0.3, yAxisID: "y1" },
@@ -1027,14 +1155,14 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
             </div>
             <div className="chart-card">
               <div className="chart-title">Spend by platform over time</div>
-              <div className="chart-sub">Daily · Google in green, Meta in blue{goalFilter !== "all" ? ` · ${GOAL_LABELS[goalFilter as CampaignGoal]} campaigns` : ""}</div>
+              <div className="chart-sub">{BUCKET_LABEL[bucket]} · Google in green, Meta in blue</div>
               <div className="chart-canvas-wrap">
-                {platformTrend.series.length ? (
+                {platformTrend.length ? (
                   <ChartBox
                     type="line"
                     data={{
-                      labels: platformTrend.dates.map((d) => d.slice(5)),
-                      datasets: platformTrend.series.map((s) => ({
+                      labels: bucketLabels,
+                      datasets: platformTrend.map((s) => ({
                         label: PLATFORMS[s.platform].label,
                         data: s.points,
                         borderColor: PLATFORM_COLOR[s.platform],
