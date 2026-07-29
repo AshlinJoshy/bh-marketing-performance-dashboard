@@ -97,6 +97,14 @@ export const VERIFIED_READABLE: Record<PaidPlatform, string[]> = {
 };
 
 /**
+ * Where prioritised accounts are managed. The subscription id comes verbatim
+ * from Supermetrics' own rejection message ("To manage your prioritised
+ * accounts, follow the link below"), so this is the exact page rather than a
+ * guessed one. Append `#datasource-<dsId>` to jump to a platform's section.
+ */
+export const SUPERMETRICS_SUBSCRIPTION_URL = "https://hub.supermetrics.com/subscriptions/1808889";
+
+/**
  * Accounts confirmed NOT readable — each individually probed through the
  * Supermetrics hub API and rejected as "not a prioritised account". The live
  * dashboard sees these as a bare QUERY_ERROR; this list is what lets that

@@ -6,7 +6,7 @@ import HelpTip from "@/components/HelpTip";
 import { savePaidConfigAction } from "@/app/actions";
 import { C } from "@/lib/theme";
 import { PLATFORMS, GOAL_LABELS, type PaidData, type PaidPlatform, type CampaignGoal, type PaidLevel, type CampaignRow } from "@/lib/paid";
-import { ACCOUNT_CATALOG, VERIFIED_BLOCKED, type CatalogAccount } from "@/lib/paidAccounts";
+import { ACCOUNT_CATALOG, VERIFIED_BLOCKED, SUPERMETRICS_SUBSCRIPTION_URL, type CatalogAccount } from "@/lib/paidAccounts";
 import type { CampaignLeadsData } from "@/lib/metabase";
 import type { PaidConfig } from "@/lib/data";
 
@@ -884,8 +884,17 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
               </div>
               {data.failures.some((f) => f.notPrioritised) && (
                 <div className="chart-sub" style={{ marginTop: 10 }}>
-                  Supermetrics licenses a subset of ad accounts for querying. Change the prioritised list on the{" "}
-                  <a href="https://hub.supermetrics.com/token-management" target="_blank" rel="noopener noreferrer">Supermetrics hub</a> and these will start loading.
+                  Supermetrics licenses a subset of ad accounts for querying — plans cap how many can be prioritised, so adding one
+                  may mean swapping another out. Manage the list here and these accounts start loading on the next refresh, no code
+                  change needed:{" "}
+                  {[...new Set(data.failures.filter((f) => f.notPrioritised).map((f) => f.platform))].map((p, i) => (
+                    <span key={p}>
+                      {i > 0 && " · "}
+                      <a href={`${SUPERMETRICS_SUBSCRIPTION_URL}#datasource-${PLATFORMS[p].dsId}`} target="_blank" rel="noopener noreferrer">
+                        {PLATFORMS[p].label} prioritised accounts
+                      </a>
+                    </span>
+                  ))}
                 </div>
               )}
               {data.failures.some((f) => f.authProblem) && (
