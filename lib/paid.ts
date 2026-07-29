@@ -103,7 +103,14 @@ export interface PaidData {
   rows: CampaignRow[];
   /** Some account hit the 10k-row cap, so totals may undercount. */
   truncated: boolean;
-  byDate: { date: string; cost: number; result: number; impressions: number }[];
+  /**
+   * Daily series kept at (date × platform × goal) granularity so the client's
+   * dashboard-level filters apply to the trend charts too, instead of the trend
+   * silently ignoring them. `leads` is platform-reported: Meta website + form
+   * leads; Google/LinkedIn conversions (their lead proxy) — never link clicks,
+   * which are traffic, not leads.
+   */
+  byDateFine: { date: string; platform: PaidPlatform; goal: CampaignGoal; cost: number; leads: number }[];
   /** Distinct currencies present. More than one means spend must not be summed. */
   currencies: string[];
   accountsUsed: PaidAccount[];
@@ -507,7 +514,7 @@ export async function getPaidData(fromRaw?: string, toRaw?: string, days = 30, l
   const { from, to, label } = paidRange(fromRaw, toRaw, days);
   const connected = !!process.env.SUPERMETRICS_API_KEY;
   const base: PaidData = {
-    connected, label, from, to, level, rows: [], truncated: false, byDate: [], currencies: [],
+    connected, label, from, to, level, rows: [], truncated: false, byDateFine: [], currencies: [],
     accountsUsed: [], emptyAccounts: [], failures: [], unconfigured: false,
   };
   if (!connected) return base;
@@ -543,16 +550,16 @@ export async function getPaidData(fromRaw?: string, toRaw?: string, days = 30, l
 
   // Roll the per-day rows up to one row per campaign, and build the trend from
   // the same data before collapsing it.
-  const dayAcc = new Map<string, { cost: number; result: number; impressions: number }>();
+  const dayAcc = new Map<string, { date: string; platform: PaidPlatform; goal: CampaignGoal; cost: number; leads: number }>();
   const campAcc = new Map<string, CampaignRow>();
   for (const r of rows) {
     const d = (r as CampaignRow & { _date?: string })._date;
     if (d) {
-      const cur = dayAcc.get(d) ?? { cost: 0, result: 0, impressions: 0 };
+      const k = `${d}|${r.platform}|${r.goal}`;
+      const cur = dayAcc.get(k) ?? { date: d, platform: r.platform, goal: r.goal, cost: 0, leads: 0 };
       cur.cost += r.cost;
-      cur.result += r.result;
-      cur.impressions += r.impressions;
-      dayAcc.set(d, cur);
+      cur.leads += r.platform === "meta" ? (r.websiteLeads ?? 0) + (r.facebookLeads ?? 0) : (r.conversions ?? 0);
+      dayAcc.set(k, cur);
     }
     const key = `${r.platform}|${r.accountId}|${r.campaign}|${r.adset ?? ""}|${r.ad ?? ""}`;
     const prev = campAcc.get(key);
@@ -573,7 +580,7 @@ export async function getPaidData(fromRaw?: string, toRaw?: string, days = 30, l
   }
 
   base.rows = [...campAcc.values()].sort((a, b) => b.cost - a.cost);
-  base.byDate = [...dayAcc].map(([date, v]) => ({ date, ...v })).sort((a, b) => a.date.localeCompare(b.date));
+  base.byDateFine = [...dayAcc.values()].sort((a, b) => a.date.localeCompare(b.date));
   base.currencies = [...new Set(base.rows.map((r) => r.currency).filter((c) => c && c !== "—"))].sort();
 
   // An empty tab has three quite different causes and they need different

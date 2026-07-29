@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState, useTransition } from "react";
 import ChartBox from "@/components/Chart";
 import HelpTip from "@/components/HelpTip";
+import DateRangePicker from "@/components/DateRangePicker";
 import Sankey from "@/components/Sankey";
 import { receiveWebInsightsAction } from "@/app/actions";
 import { C } from "@/lib/theme";
@@ -13,13 +14,13 @@ function insightColor(kind: string) {
 }
 
 const fmt = (n: number) => new Intl.NumberFormat("en-US").format(Math.round(n || 0));
-const ymd = (d: Date) => d.toISOString().slice(0, 10);
 
 const legendBottom = { legend: { position: "bottom" as const, labels: { font: { size: 10 } } } };
 
 export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
   const [data, setData] = useState<WebMetrics>(initial);
-  const [mode, setMode] = useState<"preset" | "custom">("preset");
+  // Day-count of the current range, kept only because the insights action wants
+  // a rough window size alongside the concrete dates.
   const [days, setDays] = useState<number>(initial.days || 30);
   const [from, setFrom] = useState<string>(initial.from);
   const [to, setTo] = useState<string>(initial.to);
@@ -49,10 +50,7 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
   }, []);
 
   // range query string (range only)
-  const rangeQs = useCallback(
-    () => (mode === "custom" && from && to && from <= to ? `from=${from}&to=${to}` : `days=${days}`),
-    [mode, from, to, days],
-  );
+  const rangeQs = useCallback(() => `from=${from}&to=${to}`, [from, to]);
   // humans + journey-page-filter suffix shared by every load
   const tail = useCallback(
     (h = humansOnly) => `&humans=${h ? 1 : 0}${flowPages.trim() ? `&flowPages=${encodeURIComponent(flowPages.trim())}${flowExact ? "&flowMatch=exact" : ""}` : ""}`,
@@ -96,13 +94,11 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
   const popup = popupFresh ? popupRes!.n : null;
   const popupErr = popupFresh && popupRes!.err;
 
-  function pickPreset(d: number) {
-    setMode("preset");
-    setDays(d);
-    load(`days=${d}${tail()}`, false);
-  }
-  function applyCustom() {
-    if (from && to && from <= to) load(`from=${from}&to=${to}${tail()}`, false);
+  function applyRange(f: string, t: string) {
+    setFrom(f);
+    setTo(t);
+    setDays(Math.max(1, Math.round((new Date(t).getTime() - new Date(f).getTime()) / 864e5) + 1));
+    load(`from=${f}&to=${t}${tail()}`, false);
   }
   function toggleHumans() {
     const next = !humansOnly;
@@ -131,8 +127,7 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
   function getInsights() {
     setInsErr(null);
     startInsights(async () => {
-      const custom = mode === "custom" && from && to && from <= to;
-      const r = custom ? await receiveWebInsightsAction(days, from, to) : await receiveWebInsightsAction(days);
+      const r = await receiveWebInsightsAction(days, from, to);
       if (r.ok) setInsights(r.insights);
       else setInsErr(r.error);
     });
@@ -162,37 +157,11 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
       {/* controls */}
       <div className="controls-bar">
         <div className="field">
-          <label>Range <HelpTip text="Time window for every metric on this page. Use a preset or pick a custom From/To range." /></label>
+          <label>Range <HelpTip text="Time window for every metric on this page." /></label>
           <div className="ps-platforms">
-            {[7, 30, 90].map((d) => (
-              <button key={d} className={`filter-btn${mode === "preset" && days === d ? " active" : ""}`} onClick={() => pickPreset(d)}>
-                {d}d
-              </button>
-            ))}
-            <button className={`filter-btn${mode === "custom" ? " active" : ""}`} onClick={() => setMode("custom")}>
-              Custom
-            </button>
+            <DateRangePicker initialFrom={initial.from} initialTo={initial.to} onApply={applyRange} />
           </div>
         </div>
-
-        {mode === "custom" && (
-          <>
-            <div className="field">
-              <label>From</label>
-              <input type="date" className="ps-select" value={from} max={to} onChange={(e) => setFrom(e.target.value)} />
-            </div>
-            <div className="field">
-              <label>To</label>
-              <input type="date" className="ps-select" value={to} min={from} max={ymd(new Date())} onChange={(e) => setTo(e.target.value)} />
-            </div>
-            <div className="field">
-              <label>&nbsp;</label>
-              <button className="filter-btn" onClick={applyCustom} disabled={loading || !(from && to && from <= to)}>
-                Apply
-              </button>
-            </div>
-          </>
-        )}
 
         <div className="field">
           <label>Traffic <HelpTip text="Humans only excludes bots/crawlers — PostHog-flagged bots, traffic from cloud datacenters (e.g. AWS Ashburn), and desktop-Linux/server traffic (the China/Singapore/Hong Kong server bots). Switch to All traffic to see the raw, bot-inflated numbers." /></label>

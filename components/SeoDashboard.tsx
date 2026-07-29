@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState, useTransition } from "react"
 import { useRouter } from "next/navigation";
 import ChartBox from "@/components/Chart";
 import HelpTip from "@/components/HelpTip";
+import DateRangePicker from "@/components/DateRangePicker";
 import { saveSeoConfigAction } from "@/app/actions";
 import { C } from "@/lib/theme";
 import type { SeoData } from "@/lib/seo";
@@ -18,10 +19,6 @@ const fmtK = (n: number | null | undefined) => {
   return new Intl.NumberFormat("en-US").format(Math.round(n));
 };
 const pct1 = (n: number | null | undefined) => (n == null ? "—" : `${(n * 100).toFixed(1)}%`);
-const ymd = (d: Date) => d.toISOString().slice(0, 10);
-/** from/to for a "last N days" preset. Module scope so the clock read is not
- *  analysed as render-time work. */
-const presetQs = (d: number) => `from=${ymd(new Date(Date.now() - (d - 1) * 864e5))}&to=${ymd(new Date())}`;
 
 const CH_COLORS: Record<string, string> = {
   "Organic Search": C.green,
@@ -62,8 +59,6 @@ function ConnectCard({ title, lines }: { title: string; lines: string[] }) {
 export default function SeoDashboard({ initial }: { initial: SeoData }) {
   const router = useRouter();
   const [data, setData] = useState<SeoData>(initial);
-  const [mode, setMode] = useState<"preset" | "custom">("preset");
-  const [days, setDays] = useState<number>(30);
   const [from, setFrom] = useState<string>(initial.from);
   const [to, setTo] = useState<string>(initial.to);
   const [loading, setLoading] = useState(false);
@@ -80,10 +75,7 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
   const [kwMsg, setKwMsg] = useState<string | null>(null);
   const [kwSaving, startKwSave] = useTransition();
 
-  const rangeQs = useCallback(() => {
-    if (mode === "custom" && from && to && from <= to) return `from=${from}&to=${to}`;
-    return presetQs(days);
-  }, [mode, from, to, days]);
+  const rangeQs = useCallback(() => `from=${from}&to=${to}`, [from, to]);
 
   // fast half — PostHog + GSC
   const load = useCallback(async (qs: string) => {
@@ -198,19 +190,12 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function pickPreset(d: number) {
-    setMode("preset");
-    setDays(d);
-    const qs = presetQs(d);
+  function applyRange(f: string, t: string) {
+    setFrom(f);
+    setTo(t);
+    const qs = `from=${f}&to=${t}`;
     load(qs);
     loadLeads(qs);
-  }
-  function applyCustom() {
-    if (from && to && from <= to) {
-      const qs = `from=${from}&to=${to}`;
-      load(qs);
-      loadLeads(qs);
-    }
   }
   function refresh() {
     const qs = rangeQs();
@@ -283,19 +268,9 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
         <div className="field">
           <label>Range <HelpTip text="Window for every metric. GSC data lags ~2–3 days, so the last couple of days may be partial." /></label>
           <div className="ps-platforms">
-            {[7, 30, 90].map((d) => (
-              <button key={d} className={`filter-btn${mode === "preset" && days === d ? " active" : ""}`} onClick={() => pickPreset(d)}>{d}d</button>
-            ))}
-            <button className={`filter-btn${mode === "custom" ? " active" : ""}`} onClick={() => setMode("custom")}>Custom</button>
+            <DateRangePicker initialFrom={initial.from} initialTo={initial.to} onApply={applyRange} />
           </div>
         </div>
-        {mode === "custom" && (
-          <>
-            <div className="field"><label>From</label><input type="date" className="ps-select" value={from} max={to} onChange={(e) => setFrom(e.target.value)} /></div>
-            <div className="field"><label>To</label><input type="date" className="ps-select" value={to} min={from} max={ymd(new Date())} onChange={(e) => setTo(e.target.value)} /></div>
-            <div className="field"><label>&nbsp;</label><button className="filter-btn" onClick={applyCustom} disabled={loading || !(from && to && from <= to)}>Apply</button></div>
-          </>
-        )}
         <div className="field" style={{ marginLeft: "auto" }}>
           <label>&nbsp;</label>
           <button className="filter-btn" onClick={refresh} disabled={loading}>{loading ? "Refreshing…" : "↻ Refresh"}</button>

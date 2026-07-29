@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState, useTransition } from "react";
 import ChartBox from "@/components/Chart";
 import HelpTip from "@/components/HelpTip";
+import DateRangePicker, { rangeFor } from "@/components/DateRangePicker";
 import { savePaidConfigAction } from "@/app/actions";
 import { C } from "@/lib/theme";
 import { PLATFORMS, GOAL_LABELS, type PaidData, type PaidPlatform, type CampaignGoal, type PaidLevel, type CampaignRow } from "@/lib/paid";
@@ -29,19 +30,14 @@ const GOAL_COLOR: Record<CampaignGoal, string> = {
   leads: C.green, conversions: C.blue, traffic: C.sand, awareness: "#7c5cbf", engagement: C.coral, other: C.mid,
 };
 
-/** Same pipeline vocabulary the SEO tab uses for the same CRM column. */
-const STAGE_ORDER = ["New", "Qualified", "Viewing", "Listed", "Valuation", "Reserved", "Offer", "Deal"];
-const stageIdx = (s: string) => {
-  const i = STAGE_ORDER.findIndex((x) => x.toLowerCase() === s.toLowerCase());
-  return i === -1 ? 0 : i;
-};
-
 const norm = (s: string) => s.toLowerCase().trim();
+/** A lead still in play. Closed = dropped/lost, and drops out of the funnel. */
+const inPlay = (state: string) => norm(state) !== "closed";
 
 /**
  * utm_source spellings that mean each platform. Used only to narrow the CRM
- * side when a platform filter is on — it is a heuristic over free-text tags,
- * and the tooltip says so.
+ * side when a platform filter is on — a heuristic over free-text tags, and the
+ * tooltip says so.
  */
 const SRC_OF_PLATFORM: Record<PaidPlatform, string[]> = {
   google: ["google", "adwords", "google_ads", "googleads", "google-ads"],
@@ -53,22 +49,16 @@ const LEVEL_LABEL: Record<PaidLevel, string> = { campaign: "Campaigns", adset: "
 
 type CrmJoin = { leads: number; qualified: number; deals: number };
 
-// Default custom-range inputs. Evaluated once at module load, so the clock read
-// never happens during render.
-const ymdOf = (t: number) => new Date(t).toISOString().slice(0, 10);
-const DEFAULT_TO = ymdOf(Date.now());
-const DEFAULT_FROM = ymdOf(Date.now() - 29 * 864e5);
+// Default range = this month, resolved once at module load (never during render).
+const INIT_RANGE = rangeFor("this_month");
 
 export default function DigitalDashboard({ initial, config }: { initial: PaidData | null; config: PaidConfig }) {
   // `initial` is null on purpose: the server renders the shell without waiting
-  // on Supermetrics (up to 25s per account), and the media numbers stream in
-  // here behind a skeleton instead of blocking the navigation.
+  // on Supermetrics (up to 25s per account); data streams in behind skeletons.
   const [data, setData] = useState<PaidData | null>(initial);
   const [level, setLevel] = useState<PaidLevel>("campaign");
-  const [days, setDays] = useState(30);
-  const [mode, setMode] = useState<"preset" | "custom">("preset");
-  const [from, setFrom] = useState(initial?.from ?? DEFAULT_FROM);
-  const [to, setTo] = useState(initial?.to ?? DEFAULT_TO);
+  const [from, setFrom] = useState(initial?.from ?? INIT_RANGE.from);
+  const [to, setTo] = useState(initial?.to ?? INIT_RANGE.to);
   const [loading, setLoading] = useState(false);
 
   // CRM half — fetched separately so the slow CRM view can never delay the
@@ -85,9 +75,6 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     }),
     [config],
   );
-  // With no server-side data the "should the picker auto-open" signal comes
-  // from the config itself: zero selected accounts means there is nothing to
-  // load until the user picks some.
   const nothingSelected = PLATFORM_ORDER.every((p) => (config.accounts[p] ?? []).length === 0);
   const [cfgOpen, setCfgOpen] = useState(initial ? initial.unconfigured : nothingSelected);
   const [sel, setSel] = useState<Record<PaidPlatform, string[]>>(initialSel);
@@ -98,22 +85,19 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   const selKey = (s: Record<PaidPlatform, string[]>) => PLATFORM_ORDER.map((p) => [...s[p]].sort().join(",")).join("|");
   const dirty = selKey(sel) !== selKey(savedSel);
 
-  // ── View filters ────────────────────────────────────────────────────────────
+  // ── Dashboard-level filters — every figure on the page answers to these ────
   const [platformFilter, setPlatformFilter] = useState<"all" | PaidPlatform>("all");
   const [goalFilter, setGoalFilter] = useState<"all" | CampaignGoal>("all");
   const [utmSrc, setUtmSrc] = useState<string>("all");
   const [utmMed, setUtmMed] = useState<string>("all");
+  const [utmCamp, setUtmCamp] = useState<string>("all");
   const [q, setQ] = useState("");
+  const [explorerOpen, setExplorerOpen] = useState(true);
 
-  const rangeQs = useCallback(
-    () => (mode === "custom" && from && to && from <= to ? `from=${from}&to=${to}` : `days=${days}`),
-    [mode, from, to, days],
-  );
-
-  const loadMedia = useCallback(async (qs: string, lvl: PaidLevel) => {
+  const loadMedia = useCallback(async (f: string, t: string, lvl: PaidLevel) => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/digital?${qs}&level=${lvl}`, { cache: "no-store" });
+      const res = await fetch(`/api/digital?from=${f}&to=${t}&level=${lvl}`, { cache: "no-store" });
       const json = await res.json();
       if (res.ok && json && Array.isArray(json.rows)) setData(json as PaidData);
       else console.error("[digital] refresh failed", json?.error ?? res.status);
@@ -124,10 +108,10 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     }
   }, []);
 
-  const loadCrm = useCallback(async (qs: string) => {
+  const loadCrm = useCallback(async (f: string, t: string) => {
     setCrmLoading(true);
     try {
-      const res = await fetch(`/api/digital/crm?${qs}`, { cache: "no-store" });
+      const res = await fetch(`/api/digital/crm?from=${f}&to=${t}`, { cache: "no-store" });
       const json = await res.json();
       if (res.ok && json && Array.isArray(json.rows)) setCrm(json as CampaignLeadsData);
       else setCrm({ connected: true, label: "", rows: [], truncated: false, error: json?.error || `HTTP ${res.status}` });
@@ -140,32 +124,25 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
 
   // Both halves load on mount ON PURPOSE — media because the server no longer
   // blocks navigation on Supermetrics, CRM because the Metabase view is slow.
-  // Flipping loading flags during the mount effect is the intended behaviour
-  // here, not a cascading render. Level changes refetch media only; the CRM
-  // join key is the campaign either way.
+  // Flipping loading flags during the mount effect is intended behaviour here,
+  // not a cascading render.
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (!initial) loadMedia(rangeQs(), "campaign");
-    loadCrm(rangeQs());
+    if (!initial) loadMedia(from, to, "campaign");
+    loadCrm(from, to);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function pickPreset(d: number) {
-    setMode("preset");
-    setDays(d);
-    loadMedia(`days=${d}`, level);
-    loadCrm(`days=${d}`);
-  }
-  function applyCustom() {
-    if (!from || !to || from > to) return;
-    setMode("custom");
-    loadMedia(`from=${from}&to=${to}`, level);
-    loadCrm(`from=${from}&to=${to}`);
+  function applyRange(f: string, t: string) {
+    setFrom(f);
+    setTo(t);
+    loadMedia(f, t, level);
+    loadCrm(f, t);
   }
   function changeLevel(lvl: PaidLevel) {
     if (lvl === level) return;
     setLevel(lvl);
-    loadMedia(rangeQs(), lvl);
+    loadMedia(from, to, lvl);
   }
 
   // ── Account picker actions ──────────────────────────────────────────────────
@@ -197,7 +174,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
       setSavedSel(sel);
       setCfgMsg(null);
       setCfgOpen(false);
-      await loadMedia(rangeQs(), level);
+      await loadMedia(from, to, level);
     });
   }
 
@@ -218,70 +195,105 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
 
   const totals = useMemo(() => {
     const byCur = new Map<string, number>();
-    let impressions = 0, clicks = 0, result = 0;
+    let impressions = 0, clicks = 0;
     for (const r of mediaRows) {
       byCur.set(r.currency, (byCur.get(r.currency) ?? 0) + r.cost);
       impressions += r.impressions;
       clicks += r.clicks;
-      result += r.result;
     }
     const curs = [...byCur.entries()].sort((a, b) => b[1] - a[1]);
     return {
       spendByCurrency: curs,
       singleCurrency: curs.length === 1 ? curs[0][0] : null,
       spend: curs.reduce((s, [, v]) => s + v, 0),
-      impressions, clicks, result,
+      impressions, clicks,
     };
   }, [mediaRows]);
 
-  // ── CRM side, filtered ──────────────────────────────────────────────────────
+  // ── CRM side: interlinked facets ────────────────────────────────────────────
   /**
-   * The platform filter narrows the CRM side by utm_source spelling; the UTM
-   * chips narrow it directly; the search box matches utm_campaign so both
-   * tables answer the same question at once.
+   * Facet options are computed against rows filtered by every OTHER facet, so
+   * picking platform=Google leaves only Google-flavoured utm_sources in the
+   * source dropdown, and so on — the dropdowns describe what is actually there
+   * to choose. A stale selection that a new upstream filter has emptied is
+   * treated as "all" rather than silently zeroing the page.
    */
+  const crmScoped = useCallback(
+    (skip: "source" | "medium" | "campaign" | null) => {
+      const rows = crm?.rows ?? [];
+      const needle = norm(q);
+      const srcSet = platformFilter === "all" ? null : new Set(SRC_OF_PLATFORM[platformFilter]);
+      return rows.filter(
+        (r) =>
+          (!srcSet || srcSet.has(norm(r.source))) &&
+          (skip === "source" || utmSrc === "all" || norm(r.source) === utmSrc) &&
+          (skip === "medium" || utmMed === "all" || norm(r.medium) === utmMed) &&
+          (skip === "campaign" || utmCamp === "all" || norm(r.campaign) === utmCamp) &&
+          (!needle || norm(r.campaign).includes(needle)),
+      );
+    },
+    [crm, platformFilter, utmSrc, utmMed, utmCamp, q],
+  );
+
+  const facet = (rows: { n: number }[] & { source?: string }[], key: "source" | "medium" | "campaign") => {
+    const acc = new Map<string, number>();
+    for (const r of rows as { source: string; medium: string; campaign: string; n: number }[]) {
+      acc.set(norm(r[key]), (acc.get(norm(r[key])) ?? 0) + r.n);
+    }
+    return [...acc].sort((a, b) => b[1] - a[1]);
+  };
+  const srcOptions = useMemo(() => facet(crmScoped("source"), "source"), [crmScoped]);
+  const medOptions = useMemo(() => facet(crmScoped("medium"), "medium"), [crmScoped]);
+  const campOptions = useMemo(() => facet(crmScoped("campaign"), "campaign").slice(0, 150), [crmScoped]);
+
+  const activeSrc = utmSrc !== "all" && !srcOptions.some(([s]) => s === utmSrc) ? "all" : utmSrc;
+  const activeMed = utmMed !== "all" && !medOptions.some(([m]) => m === utmMed) ? "all" : utmMed;
+  const activeCamp = utmCamp !== "all" && !campOptions.some(([c]) => c === utmCamp) ? "all" : utmCamp;
+
   const crmFiltered = useMemo(() => {
-    const rows = crm?.rows ?? [];
-    const needle = norm(q);
-    const srcSet = platformFilter === "all" ? null : new Set(SRC_OF_PLATFORM[platformFilter]);
+    const rows = crmScoped(null);
     return rows.filter(
       (r) =>
-        (!srcSet || srcSet.has(norm(r.source))) &&
-        (utmSrc === "all" || norm(r.source) === utmSrc) &&
-        (utmMed === "all" || norm(r.medium) === utmMed) &&
-        (!needle || norm(r.campaign).includes(needle)),
+        (activeSrc === "all" || norm(r.source) === activeSrc) &&
+        (activeMed === "all" || norm(r.medium) === activeMed) &&
+        (activeCamp === "all" || norm(r.campaign) === activeCamp),
     );
-  }, [crm, platformFilter, utmSrc, utmMed, q]);
+  }, [crmScoped, activeSrc, activeMed, activeCamp]);
 
+  /**
+   * Exact-stage buckets, Closed leads dropped everywhere: a lead that was
+   * qualified and then closed is not a qualified lead, it is a dead one, and
+   * counting it would flatter every stage.
+   */
   const crmAgg = useMemo(() => {
-    let total = 0, qualified = 0, deals = 0;
-    const byStage = new Map<string, number>();
+    let leads = 0, qualified = 0, viewing = 0, offerRes = 0, deals = 0;
     for (const r of crmFiltered) {
-      total += r.n;
-      byStage.set(r.stage, (byStage.get(r.stage) ?? 0) + r.n);
-      if (stageIdx(r.stage) >= 1) qualified += r.n;
-      if (r.stage.toLowerCase() === "deal") deals += r.n;
+      if (!inPlay(r.state)) continue;
+      leads += r.n;
+      const st = norm(r.stage);
+      if (st === "qualified") qualified += r.n;
+      else if (st === "viewing") viewing += r.n;
+      else if (st === "offer" || st === "reserved") offerRes += r.n;
+      else if (st === "deal") deals += r.n;
     }
-    const stages = STAGE_ORDER.filter((s) => byStage.has(s)).map((s) => ({ stage: s, n: byStage.get(s)! }));
-    // Anything outside the known vocabulary still counts — appended, not dropped.
-    for (const [s, n] of byStage) if (!STAGE_ORDER.some((x) => x === s)) stages.push({ stage: s, n });
-    return { total, qualified, deals, stages };
+    return { leads, qualified, viewing, offerRes, deals };
   }, [crmFiltered]);
 
   const crmByCampaign = useMemo(() => {
     const m = new Map<string, CrmJoin>();
     for (const r of crmFiltered) {
+      if (!inPlay(r.state)) continue;
       const k = norm(r.campaign);
       const cur = m.get(k) ?? { leads: 0, qualified: 0, deals: 0 };
       cur.leads += r.n;
-      if (stageIdx(r.stage) >= 1) cur.qualified += r.n;
-      if (r.stage.toLowerCase() === "deal") cur.deals += r.n;
+      const st = norm(r.stage);
+      if (st === "qualified") cur.qualified += r.n;
+      if (st === "deal") cur.deals += r.n;
       m.set(k, cur);
     }
     return m;
   }, [crmFiltered]);
 
-  /** Join: campaign name (case-insensitive) or the Meta campaign id. */
   const joinFor = useCallback(
     (r: CampaignRow): CrmJoin | null => {
       const byName = crmByCampaign.get(norm(r.campaign));
@@ -292,53 +304,52 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     [crmByCampaign],
   );
 
-  /** CRM campaigns that matched nothing on the media side — the tagging gaps. */
-  const unmatchedCrm = useMemo(() => {
-    const mediaKeys = new Set<string>();
-    for (const r of data?.rows ?? []) {
-      mediaKeys.add(norm(r.campaign));
-      if (r.campaignId) mediaKeys.add(norm(r.campaignId));
-    }
-    const acc = new Map<string, { campaign: string; source: string; leads: number }>();
-    for (const r of crmFiltered) {
-      const k = norm(r.campaign);
-      if (mediaKeys.has(k) || r.campaign === "(none)") continue;
-      const cur = acc.get(k) ?? { campaign: r.campaign, source: r.source, leads: 0 };
-      cur.leads += r.n;
-      acc.set(k, cur);
-    }
-    return [...acc.values()].sort((a, b) => b.leads - a.leads).slice(0, 10);
-  }, [crmFiltered, data?.rows]);
-
-  const utmSources = useMemo(() => {
-    const acc = new Map<string, number>();
-    for (const r of crm?.rows ?? []) acc.set(norm(r.source), (acc.get(norm(r.source)) ?? 0) + r.n);
-    return [...acc].sort((a, b) => b[1] - a[1]);
-  }, [crm]);
-  const utmMediums = useMemo(() => {
-    const acc = new Map<string, number>();
-    for (const r of crm?.rows ?? []) acc.set(norm(r.medium), (acc.get(norm(r.medium)) ?? 0) + r.n);
-    return [...acc].sort((a, b) => b[1] - a[1]);
-  }, [crm]);
-
-  // ── Full funnel: media → CRM ───────────────────────────────────────────────
-  const funnel = useMemo(() => {
-    const steps = [
-      { label: "Impressions", n: totals.impressions, note: "ads shown" },
-      { label: "Clicks", n: totals.clicks, note: "visits bought" },
-      { label: "CRM leads", n: crmAgg.total, note: "utm-tagged enquiries" },
-      { label: "Qualified+", n: crmAgg.qualified, note: "past the New stage" },
-      { label: "Deal stage", n: crmAgg.deals, note: "current pipeline" },
-    ];
-    return steps;
-  }, [totals, crmAgg]);
+  // ── Funnel: leads → pipeline, CRM only ─────────────────────────────────────
+  const funnel = useMemo(
+    () => [
+      { label: "Leads", n: crmAgg.leads, note: "campaign-tagged, not closed" },
+      { label: "Qualified", n: crmAgg.qualified, note: "at Qualified now" },
+      { label: "Viewing", n: crmAgg.viewing, note: "at Viewing now" },
+      { label: "Offer / Reserved", n: crmAgg.offerRes, note: "in negotiation" },
+      { label: "Deal", n: crmAgg.deals, note: "reached Deal stage" },
+    ],
+    [crmAgg],
+  );
+  const funnelMax = Math.max(...funnel.map((s) => s.n), 1);
 
   const cur = totals.singleCurrency ?? "—";
-  const cpl = crmAgg.total > 0 && totals.singleCurrency ? totals.spend / crmAgg.total : null;
+  const cpl = crmAgg.leads > 0 && totals.singleCurrency ? totals.spend / crmAgg.leads : null;
   const cpql = crmAgg.qualified > 0 && totals.singleCurrency ? totals.spend / crmAgg.qualified : null;
   const selectedCount = PLATFORM_ORDER.reduce((n, p) => n + sel[p].length, 0);
   const goalsPresent = useMemo(() => [...new Set((data?.rows ?? []).map((r) => r.goal))], [data?.rows]);
-  const platformsPresent = useMemo(() => PLATFORM_ORDER.filter((p) => (data?.rows ?? []).some((r) => r.platform === p)), [data?.rows]);
+
+  // ── Trends, filter-aware (platform + goal reach the daily series) ──────────
+  const trend = useMemo(() => {
+    const acc = new Map<string, { cost: number; leads: number }>();
+    for (const d of data?.byDateFine ?? []) {
+      if (platformFilter !== "all" && d.platform !== platformFilter) continue;
+      if (goalFilter !== "all" && d.goal !== goalFilter) continue;
+      const cur = acc.get(d.date) ?? { cost: 0, leads: 0 };
+      cur.cost += d.cost;
+      cur.leads += d.leads;
+      acc.set(d.date, cur);
+    }
+    return [...acc].map(([date, v]) => ({ date, ...v })).sort((a, b) => a.date.localeCompare(b.date));
+  }, [data?.byDateFine, platformFilter, goalFilter]);
+
+  const platformTrend = useMemo(() => {
+    const dates = [...new Set((data?.byDateFine ?? []).map((d) => d.date))].sort();
+    const series = PLATFORM_ORDER.map((p) => {
+      const byDate = new Map<string, number>();
+      for (const d of data?.byDateFine ?? []) {
+        if (d.platform !== p) continue;
+        if (goalFilter !== "all" && d.goal !== goalFilter) continue;
+        byDate.set(d.date, (byDate.get(d.date) ?? 0) + d.cost);
+      }
+      return { platform: p, points: dates.map((dt) => byDate.get(dt) ?? 0), any: byDate.size > 0 };
+    }).filter((s) => s.any);
+    return { dates, series };
+  }, [data?.byDateFine, goalFilter]);
 
   const byGoal = useMemo(() => {
     const acc = new Map<CampaignGoal, number>();
@@ -346,22 +357,47 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     return [...acc].map(([goal, cost]) => ({ goal, cost })).sort((a, b) => b.cost - a.cost);
   }, [mediaRows]);
 
-  const byPlatform = useMemo(() => {
+  // ── Platform comparison: every selected platform, zero-filled, plus Total ──
+  const platformTable = useMemo(() => {
+    const present = new Set<PaidPlatform>();
+    for (const a of data?.accountsUsed ?? []) present.add(a.platform);
+    for (const a of data?.emptyAccounts ?? []) present.add(a.platform);
+    for (const f of data?.failures ?? []) present.add(f.platform);
+    const needle = norm(q);
+    // Goal + search apply; the platform filter deliberately does NOT — a
+    // comparison with the other platforms filtered out compares nothing.
+    const rows = (data?.rows ?? []).filter(
+      (r) =>
+        (goalFilter === "all" || r.goal === goalFilter) &&
+        (!needle || norm(r.campaign).includes(needle) || norm(r.adset ?? "").includes(needle) || norm(r.ad ?? "").includes(needle) || norm(r.accountName).includes(needle)),
+    );
     const acc = new Map<PaidPlatform, { cost: number; impressions: number; clicks: number; result: number; n: number; currencies: Set<string> }>();
-    for (const r of mediaRows) {
-      const cur = acc.get(r.platform) ?? { cost: 0, impressions: 0, clicks: 0, result: 0, n: 0, currencies: new Set<string>() };
+    for (const p of PLATFORM_ORDER) if (present.has(p)) acc.set(p, { cost: 0, impressions: 0, clicks: 0, result: 0, n: 0, currencies: new Set() });
+    for (const r of rows) {
+      const cur = acc.get(r.platform);
+      if (!cur) continue;
       cur.cost += r.cost; cur.impressions += r.impressions; cur.clicks += r.clicks; cur.result += r.result; cur.n += 1;
       cur.currencies.add(r.currency);
-      acc.set(r.platform, cur);
     }
-    return PLATFORM_ORDER.filter((p) => acc.has(p)).map((p) => ({ platform: p, ...acc.get(p)! }));
-  }, [mediaRows]);
+    const list = PLATFORM_ORDER.filter((p) => acc.has(p)).map((p) => ({ platform: p, ...acc.get(p)! }));
+    const allCurs = new Set(list.flatMap((l) => [...l.currencies]));
+    const total = {
+      n: list.reduce((s, l) => s + l.n, 0),
+      cost: list.reduce((s, l) => s + l.cost, 0),
+      impressions: list.reduce((s, l) => s + l.impressions, 0),
+      clicks: list.reduce((s, l) => s + l.clicks, 0),
+      result: list.reduce((s, l) => s + l.result, 0),
+      currency: allCurs.size === 1 ? [...allCurs][0] : "—",
+      mixed: allCurs.size > 1,
+    };
+    return { list, total };
+  }, [data?.rows, data?.accountsUsed, data?.emptyAccounts, data?.failures, goalFilter, q]);
 
   const rowName = (r: CampaignRow) => (level === "ad" ? r.ad ?? r.adset ?? r.campaign : level === "adset" ? r.adset ?? r.campaign : r.campaign);
   const rowContext = (r: CampaignRow) =>
     level === "ad" ? [r.campaign, r.adset].filter(Boolean).join(" › ") : level === "adset" ? r.campaign : null;
 
-  const funnelMax = Math.max(...funnel.map((s) => s.n), 1);
+  const filtersActive = platformFilter !== "all" || goalFilter !== "all" || activeSrc !== "all" || activeMed !== "all" || activeCamp !== "all" || q.trim() !== "";
 
   return (
     <div className="page">
@@ -369,19 +405,12 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
         <div>
           <h1>Digital Performance</h1>
           <p className="page-sub">
-            Paid media · Google, Meta &amp; LinkedIn via Supermetrics · CRM funnel via Metabase · {data ? data.label : "loading…"}
+            Paid media via Supermetrics · lead funnel via the CRM · {data ? data.label : "loading…"}
             {data && loading ? " · refreshing…" : ""}
           </p>
         </div>
         <div className="filter-row" style={{ flexWrap: "wrap" }}>
-          {[7, 30, 90].map((d) => (
-            <button key={d} className={`filter-btn${mode === "preset" && days === d ? " active" : ""}`} onClick={() => pickPreset(d)}>
-              {d}d
-            </button>
-          ))}
-          <input type="date" className="search-box" style={{ width: 140 }} value={from} onChange={(e) => setFrom(e.target.value)} />
-          <input type="date" className="search-box" style={{ width: 140 }} value={to} onChange={(e) => setTo(e.target.value)} />
-          <button className="filter-btn" onClick={applyCustom}>Apply</button>
+          <DateRangePicker initialFrom={from} initialTo={to} onApply={applyRange} />
           <button
             className={`filter-btn${cfgOpen ? " active" : ""}`}
             onClick={() => (cfgOpen ? closeConfig(true) : setCfgOpen(true))}
@@ -479,34 +508,78 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
             </div>
           )}
 
-          {/* ── KPIs: spend → outcome, left to right ─────────────────────────── */}
+          {/* ── Dashboard-level filters — everything below answers to these ──── */}
+          <div className="chart-card" style={{ marginBottom: 16 }}>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+              <button className={`filter-btn${platformFilter === "all" ? " active" : ""}`} onClick={() => setPlatformFilter("all")}>All platforms</button>
+              {PLATFORM_ORDER.filter((p) => (data.rows.some((r) => r.platform === p) || (crm?.rows ?? []).some((r) => SRC_OF_PLATFORM[p].includes(norm(r.source))))).map((p) => (
+                <button key={p} className={`filter-btn${platformFilter === p ? " active" : ""}`} onClick={() => setPlatformFilter(p)}>{PLATFORMS[p].label}</button>
+              ))}
+              <span style={{ width: 10 }} />
+              <button className={`filter-btn${goalFilter === "all" ? " active" : ""}`} onClick={() => setGoalFilter("all")}>All goals</button>
+              {goalsPresent.map((g) => (
+                <button key={g} className={`filter-btn${goalFilter === g ? " active" : ""}`} onClick={() => setGoalFilter(g)}>{GOAL_LABELS[g]}</button>
+              ))}
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8, alignItems: "center" }}>
+              <span className="muted" style={{ fontSize: 11 }}>
+                UTM <HelpTip text="Filters every CRM figure — funnel, KPIs, per-campaign columns — by what each lead's record carries. The dropdowns are interlinked: each only offers values that exist under the other active filters, so picking the Google platform leaves only Google-flavoured sources here." />
+              </span>
+              <select className="search-box" style={{ width: 165 }} value={activeSrc} onChange={(e) => setUtmSrc(e.target.value)}>
+                <option value="all">source: all</option>
+                {srcOptions.map(([s, n]) => (
+                  <option key={s} value={s}>{s} ({n})</option>
+                ))}
+              </select>
+              <select className="search-box" style={{ width: 165 }} value={activeMed} onChange={(e) => setUtmMed(e.target.value)}>
+                <option value="all">medium: all</option>
+                {medOptions.map(([m, n]) => (
+                  <option key={m} value={m}>{m} ({n})</option>
+                ))}
+              </select>
+              <select className="search-box" style={{ width: 230 }} value={activeCamp} onChange={(e) => setUtmCamp(e.target.value)}>
+                <option value="all">campaign: all</option>
+                {campOptions.map(([c, n]) => (
+                  <option key={c} value={c}>{c.length > 42 ? c.slice(0, 42) + "…" : c} ({n})</option>
+                ))}
+              </select>
+              <input className="search-box" style={{ flex: 1, minWidth: 160 }} placeholder="Search campaigns, ad sets, ads…" value={q} onChange={(e) => setQ(e.target.value)} />
+              {filtersActive && (
+                <button className="filter-btn" onClick={() => { setPlatformFilter("all"); setGoalFilter("all"); setUtmSrc("all"); setUtmMed("all"); setUtmCamp("all"); setQ(""); }}>
+                  Clear
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* ── KPIs: spend → pipeline ───────────────────────────────────────── */}
           <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(3,1fr)" }}>
             <div className="kpi-card">
-              <div className="kpi-label">Spend <HelpTip text={totals.singleCurrency ? `Media spend across the filtered rows, in ${totals.singleCurrency}.` : "The filtered accounts bill in more than one currency; the split is shown below and nothing is summed across currencies."} /></div>
+              <div className="kpi-label">Spend <HelpTip text={totals.singleCurrency ? `Media spend for the current filters, in ${totals.singleCurrency}.` : "The filtered accounts bill in more than one currency; the split is shown below and nothing is summed across currencies."} /></div>
               <div className="kpi-value">{totals.singleCurrency ? money(totals.spend, cur) : <span style={{ fontSize: 15 }}>Mixed currency</span>}</div>
             </div>
             <div className="kpi-card">
-              <div className="kpi-label">Impressions <HelpTip text="Ads shown, across the filtered rows." /></div>
-              <div className="kpi-value">{fmtK(totals.impressions)}</div>
+              <div className="kpi-label">Leads <HelpTip text="Campaign-tagged leads created in the CRM in this range, excluding closed ones. Answers to every filter above. Source: Metabase." /></div>
+              <div className="kpi-value" style={{ color: C.green }}>{crmLoading ? "…" : crm?.error ? "—" : fmt(crmAgg.leads)}</div>
             </div>
             <div className="kpi-card">
-              <div className="kpi-label">Clicks <HelpTip text="Google and LinkedIn report all clicks; Meta reports link clicks." /></div>
-              <div className="kpi-value">{fmtK(totals.clicks)} <span className="muted" style={{ fontSize: 12 }}>· CTR {pct1(ratio(totals.clicks, totals.impressions))}</span></div>
+              <div className="kpi-label">Qualified <HelpTip text="Leads sitting at the Qualified stage right now, still open. Closed leads are dropped." /></div>
+              <div className="kpi-value">{crmLoading ? "…" : crm?.error ? "—" : fmt(crmAgg.qualified)}</div>
             </div>
             <div className="kpi-card">
-              <div className="kpi-label">CRM leads <HelpTip text="Leads created in the CRM in this range whose record carries a utm_campaign — the ones attributable to a campaign. Filtered by the same platform/UTM filters as everything else. Source: Metabase." /></div>
-              <div className="kpi-value" style={{ color: C.green }}>{crmLoading ? "…" : crm?.error ? "—" : fmt(crmAgg.total)}</div>
+              <div className="kpi-label">Viewing <HelpTip text="Leads at the Viewing stage right now, still open." /></div>
+              <div className="kpi-value">{crmLoading ? "…" : crm?.error ? "—" : fmt(crmAgg.viewing)}</div>
             </div>
             <div className="kpi-card">
-              <div className="kpi-label">Cost / CRM lead <HelpTip text={totals.singleCurrency ? "Filtered spend divided by CRM leads. Also shown per qualified lead — leads past the New stage." : "Hidden while the filtered accounts span multiple currencies — dividing a mixed sum would be meaningless."} /></div>
+              <div className="kpi-label">Deal stage <HelpTip text="Leads currently at the Deal stage of the pipeline (not closed). A stage snapshot — not the same as a signed transaction in the deals table." /></div>
+              <div className="kpi-value">{crmLoading ? "…" : crm?.error ? "—" : fmt(crmAgg.deals)}</div>
+            </div>
+            <div className="kpi-card">
+              <div className="kpi-label">Cost / lead <HelpTip text={totals.singleCurrency ? "Filtered spend divided by leads, and by currently-qualified leads." : "Hidden while the filtered accounts span multiple currencies — dividing a mixed sum would be meaningless."} /></div>
               <div className="kpi-value" style={{ fontSize: 16 }}>
                 {cpl == null ? "—" : money(cpl, cur)}
                 {cpql != null && <span className="muted" style={{ fontSize: 12 }}> · {money(cpql, cur)} / qualified</span>}
               </div>
-            </div>
-            <div className="kpi-card">
-              <div className="kpi-label">Reached Deal stage <HelpTip text="Campaign-tagged leads currently sitting at the Deal stage of the CRM pipeline. A stage snapshot — not the same as a signed transaction in the deals table." /></div>
-              <div className="kpi-value">{crmLoading ? "…" : crm?.error ? "—" : fmt(crmAgg.deals)}</div>
             </div>
           </div>
 
@@ -525,96 +598,127 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
             </div>
           )}
 
-          {/* ── The proof: media → CRM funnel ────────────────────────────────── */}
+          {/* ── Lead funnel ──────────────────────────────────────────────────── */}
           <div className="chart-card" style={{ marginBottom: 16 }}>
             <div className="chart-title">
-              Paid funnel — spend to pipeline <HelpTip text="Media numbers from the ad platforms; lead, qualification and deal numbers from the CRM, joined on utm_campaign. Stages are where each lead sits today (a snapshot), not cohort progression. Percentages are of the previous step." />
+              Lead funnel <HelpTip text="Campaign-tagged CRM leads by the pipeline stage they sit at today, closed leads dropped. Each stage shows its share of leads. Joined to the ads by utm_campaign, so every filter above applies." />
             </div>
             <div className="chart-sub">
-              {crmLoading ? "CRM loading…" : crm?.error ? `CRM unavailable: ${crm.error}` : `Impressions and clicks from ${data.accountsUsed.length} account(s) · leads from campaign-tagged CRM records · ${data.label}`}
+              {crmLoading ? "CRM loading…" : crm?.error ? `CRM unavailable: ${crm.error}` : `${fmt(crmAgg.leads)} open campaign-tagged leads · ${crm?.label ?? ""}${crm?.truncated ? " · largest groups only (row cap hit)" : ""}`}
             </div>
             <div style={{ display: "grid", gap: 6, marginTop: 12 }}>
-              {funnel.map((s, i) => {
-                const prev = i > 0 ? funnel[i - 1].n : null;
-                const conv = prev != null && prev > 0 ? s.n / prev : null;
-                const isCrm = i >= 2;
-                return (
-                  <div key={s.label} style={{ display: "grid", gridTemplateColumns: "150px 1fr 170px", alignItems: "center", gap: 10 }}>
-                    <div style={{ fontSize: 12, fontWeight: 600, color: isCrm ? C.green : C.dark }}>
-                      {s.label}
-                      <div className="muted" style={{ fontSize: 10, fontWeight: 400 }}>{s.note}</div>
-                    </div>
-                    <div style={{ background: "var(--warm-white)", borderRadius: 5, height: 26, position: "relative", overflow: "hidden" }}>
-                      <div
-                        style={{
-                          width: `${Math.max((s.n / funnelMax) * 100, s.n > 0 ? 1.5 : 0)}%`,
-                          background: isCrm ? C.green : C.blue,
-                          opacity: isCrm ? 0.85 : 0.75,
-                          height: "100%",
-                          borderRadius: 5,
-                          transition: "width .3s",
-                        }}
-                      />
-                    </div>
-                    <div style={{ fontSize: 12, textAlign: "right" }}>
-                      <strong>{fmtK(s.n)}</strong>
-                      {conv != null && <span className="muted"> · {pct0(conv)} of prev.</span>}
-                    </div>
+              {funnel.map((s, i) => (
+                <div key={s.label} style={{ display: "grid", gridTemplateColumns: "150px 1fr 170px", alignItems: "center", gap: 10 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: C.green }}>
+                    {s.label}
+                    <div className="muted" style={{ fontSize: 10, fontWeight: 400 }}>{s.note}</div>
                   </div>
-                );
-              })}
+                  <div style={{ background: "var(--warm-white)", borderRadius: 5, height: 26, position: "relative", overflow: "hidden" }}>
+                    <div
+                      style={{
+                        width: `${Math.max((s.n / funnelMax) * 100, s.n > 0 ? 1.5 : 0)}%`,
+                        background: C.green,
+                        opacity: i === 0 ? 0.9 : 0.7,
+                        height: "100%",
+                        borderRadius: 5,
+                        transition: "width .3s",
+                      }}
+                    />
+                  </div>
+                  <div style={{ fontSize: 12, textAlign: "right" }}>
+                    <strong>{fmt(s.n)}</strong>
+                    {i > 0 && funnel[0].n > 0 && <span className="muted"> · {pct0(s.n / funnel[0].n)} of leads</span>}
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
 
-          {/* ── Trend + platform mix ─────────────────────────────────────────── */}
+          {/* ── Trends ───────────────────────────────────────────────────────── */}
           <div className="charts-grid-2">
             <div className="chart-card">
-              <div className="chart-title">Spend &amp; results over time</div>
-              <div className="chart-sub">Daily · all selected accounts · {data.label}</div>
+              <div className="chart-title">
+                Spend &amp; leads over time <HelpTip text="Leads here are platform-reported (Meta website + form leads; Google/LinkedIn conversions) so they exist per day. Platform and goal filters apply; UTM filters can't reach this chart because the ad platforms don't report by UTM." />
+              </div>
+              <div className="chart-sub">Daily · {data.label}</div>
               <div className="chart-canvas-wrap">
-                {data.byDate.length ? (
+                {trend.length ? (
                   <ChartBox
                     type="line"
                     data={{
-                      labels: data.byDate.map((d) => d.date.slice(5)),
+                      labels: trend.map((d) => d.date.slice(5)),
                       datasets: [
-                        { label: `Spend${cur !== "—" ? ` (${cur})` : ""}`, data: data.byDate.map((d) => d.cost), borderColor: C.blue, backgroundColor: "rgba(31,52,63,.08)", fill: true, tension: 0.3, yAxisID: "y" },
-                        { label: "Results", data: data.byDate.map((d) => d.result), borderColor: C.green, backgroundColor: "transparent", tension: 0.3, yAxisID: "y1" },
+                        { label: `Spend${cur !== "—" ? ` (${cur})` : ""}`, data: trend.map((d) => d.cost), borderColor: C.blue, backgroundColor: "rgba(31,52,63,.08)", fill: true, tension: 0.3, yAxisID: "y" },
+                        { label: "Leads", data: trend.map((d) => d.leads), borderColor: C.green, backgroundColor: "transparent", tension: 0.3, yAxisID: "y1" },
                       ],
                     }}
                     options={{
                       interaction: { mode: "index", intersect: false },
                       scales: {
                         y: { beginAtZero: true, position: "left", title: { display: true, text: "Spend" } },
-                        y1: { beginAtZero: true, position: "right", grid: { drawOnChartArea: false }, title: { display: true, text: "Results" } },
+                        y1: { beginAtZero: true, position: "right", grid: { drawOnChartArea: false }, title: { display: true, text: "Leads" }, ticks: { precision: 0 } },
                       },
                     }}
                   />
                 ) : (
-                  <div className="empty-state">No daily data in range.</div>
+                  <div className="empty-state">No daily data for the current filters.</div>
                 )}
               </div>
             </div>
             <div className="chart-card">
+              <div className="chart-title">Spend by platform over time</div>
+              <div className="chart-sub">Daily · one line per platform{goalFilter !== "all" ? ` · ${GOAL_LABELS[goalFilter as CampaignGoal]} campaigns` : ""}</div>
+              <div className="chart-canvas-wrap">
+                {platformTrend.series.length ? (
+                  <ChartBox
+                    type="line"
+                    data={{
+                      labels: platformTrend.dates.map((d) => d.slice(5)),
+                      datasets: platformTrend.series.map((s) => ({
+                        label: PLATFORMS[s.platform].label,
+                        data: s.points,
+                        borderColor: PLATFORM_COLOR[s.platform],
+                        backgroundColor: "transparent",
+                        tension: 0.3,
+                      })),
+                    }}
+                    options={{ interaction: { mode: "index", intersect: false }, scales: { y: { beginAtZero: true } } }}
+                  />
+                ) : (
+                  <div className="empty-state">No daily data for the current filters.</div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* ── Mix + platform comparison ────────────────────────────────────── */}
+          <div className="charts-grid-2">
+            <div className="chart-card">
               <div className="chart-title">Where the money goes</div>
               <div className="chart-sub">
-                {totals.singleCurrency ? `Spend share by platform (${cur})` : "Impression share by platform — spend spans multiple currencies, so shares use impressions"} · then by campaign goal
+                {totals.singleCurrency ? `Spend share by platform (${cur})` : "Impression share by platform — spend spans multiple currencies"} · and by campaign goal
               </div>
-              <div className="chart-canvas-wrap" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                {byPlatform.length ? (
-                  <>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                <div className="chart-canvas-wrap">
+                  {platformTable.list.some((p) => p.cost > 0 || p.impressions > 0) ? (
                     <ChartBox
                       type="doughnut"
                       data={{
-                        labels: byPlatform.map((p) => PLATFORMS[p.platform].label),
+                        labels: platformTable.list.map((p) => PLATFORMS[p.platform].label),
                         datasets: [{
-                          data: byPlatform.map((p) => (totals.singleCurrency ? p.cost : p.impressions)),
-                          backgroundColor: byPlatform.map((p) => PLATFORM_COLOR[p.platform]),
+                          data: platformTable.list.map((p) => (totals.singleCurrency ? p.cost : p.impressions)),
+                          backgroundColor: platformTable.list.map((p) => PLATFORM_COLOR[p.platform]),
                           borderWidth: 1,
                         }],
                       }}
                       options={{ plugins: { legend: { position: "bottom", labels: { boxWidth: 10, font: { size: 10 } } } }, cutout: "55%" }}
                     />
+                  ) : (
+                    <div className="empty-state">Nothing in range.</div>
+                  )}
+                </div>
+                <div className="chart-canvas-wrap">
+                  {byGoal.length ? (
                     <ChartBox
                       type="bar"
                       data={{
@@ -623,57 +727,33 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
                       }}
                       options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true } } }}
                     />
-                  </>
-                ) : (
-                  <div className="empty-state" style={{ gridColumn: "1 / -1" }}>No campaigns match the filters.</div>
-                )}
-              </div>
-            </div>
-          </div>
-
-          {/* ── CRM pipeline of the filtered leads ───────────────────────────── */}
-          <div className="charts-grid-2">
-            <div className="chart-card">
-              <div className="chart-title">
-                CRM pipeline — campaign-tagged leads <HelpTip text="Where the leads matching the current filters sit in the pipeline right now. Same stage vocabulary as the SEO tab. Source: Metabase." />
-              </div>
-              <div className="chart-sub">{crmLoading ? "loading…" : `${fmt(crmAgg.total)} leads · ${crm?.label ?? ""}${crm?.truncated ? " · largest groups only (row cap hit)" : ""}`}</div>
-              <div className="chart-canvas-wrap">
-                {crm?.error ? (
-                  <div className="empty-state">⚠ {crm.error}</div>
-                ) : crmAgg.stages.length ? (
-                  <ChartBox
-                    type="bar"
-                    data={{
-                      labels: crmAgg.stages.map((s) => s.stage),
-                      datasets: [{ label: "Leads", data: crmAgg.stages.map((s) => s.n), backgroundColor: crmAgg.stages.map((s) => (s.stage === "Deal" ? C.green : s.stage === "New" ? C.sand : C.blue)), borderRadius: 5 }],
-                    }}
-                    options={{ indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } }}
-                  />
-                ) : (
-                  <div className="empty-state">{crmLoading ? "Loading from the CRM…" : "No campaign-tagged leads match the filters."}</div>
-                )}
+                  ) : (
+                    <div className="empty-state">Nothing in range.</div>
+                  )}
+                </div>
               </div>
             </div>
             <div className="chart-card">
               <div className="chart-title">
-                Platform comparison <HelpTip text="Rates are derived from raw totals, never averaged from the platforms' own pre-aggregated rate fields." />
+                Platform comparison <HelpTip text="Every selected platform, including quiet ones, plus a total. Goal and search filters apply; the platform filter deliberately does not — a comparison with the others hidden compares nothing. Rates are derived from raw totals." />
               </div>
-              <div className="chart-sub">Totals per platform for the current filters</div>
+              <div className="chart-sub">Totals per platform · {data.label}</div>
               <div className="table-scroll">
                 <table className="perf-table">
                   <thead>
                     <tr>
-                      <th>Platform</th><th style={{ textAlign: "right" }}>Spend</th><th style={{ textAlign: "right" }}>Impr.</th>
-                      <th style={{ textAlign: "right" }}>Clicks</th><th style={{ textAlign: "right" }}>CTR</th><th style={{ textAlign: "right" }}>Results</th>
+                      <th>Platform</th><th style={{ textAlign: "right" }}>Campaigns</th><th style={{ textAlign: "right" }}>Spend</th>
+                      <th style={{ textAlign: "right" }}>Impr.</th><th style={{ textAlign: "right" }}>Clicks</th>
+                      <th style={{ textAlign: "right" }}>CTR</th><th style={{ textAlign: "right" }}>Results</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {byPlatform.map((p) => {
+                    {platformTable.list.map((p) => {
                       const pc = p.currencies.size === 1 ? [...p.currencies][0] : "—";
                       return (
                         <tr key={p.platform}>
                           <td><span style={{ color: PLATFORM_COLOR[p.platform], fontWeight: 600 }}>{PLATFORMS[p.platform].label}</span></td>
+                          <td style={{ textAlign: "right" }}>{p.n}</td>
                           <td style={{ textAlign: "right" }}>{money(p.cost, pc)}</td>
                           <td style={{ textAlign: "right" }}>{fmtK(p.impressions)}</td>
                           <td style={{ textAlign: "right" }}>{fmtK(p.clicks)}</td>
@@ -682,184 +762,114 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
                         </tr>
                       );
                     })}
-                    {!byPlatform.length && <tr><td colSpan={6} className="muted">No rows match the filters.</td></tr>}
+                    {platformTable.list.length > 0 && (
+                      <tr style={{ fontWeight: 700, borderTop: "2px solid var(--border)" }}>
+                        <td>Total</td>
+                        <td style={{ textAlign: "right" }}>{platformTable.total.n}</td>
+                        <td style={{ textAlign: "right" }} title={platformTable.total.mixed ? "Spend spans multiple currencies and is not summed" : undefined}>
+                          {platformTable.total.mixed ? "mixed" : money(platformTable.total.cost, platformTable.total.currency)}
+                        </td>
+                        <td style={{ textAlign: "right" }}>{fmtK(platformTable.total.impressions)}</td>
+                        <td style={{ textAlign: "right" }}>{fmtK(platformTable.total.clicks)}</td>
+                        <td style={{ textAlign: "right" }}>{pct1(ratio(platformTable.total.clicks, platformTable.total.impressions))}</td>
+                        <td style={{ textAlign: "right" }}>{fmt(platformTable.total.result)}</td>
+                      </tr>
+                    )}
+                    {!platformTable.list.length && <tr><td colSpan={7} className="muted">No platforms selected.</td></tr>}
                   </tbody>
                 </table>
               </div>
             </div>
           </div>
 
-          {/* ── Explorer: campaign / ad set / ad, with CRM columns ───────────── */}
+          {/* ── Explorer ─────────────────────────────────────────────────────── */}
           <div className="chart-card" style={{ marginTop: 4 }}>
-            <div className="chart-title">
-              Explorer <HelpTip text="Every row with spend in range, biggest first. Result is goal-aware — leads for lead campaigns, link clicks for traffic, website conversions for sales. CRM columns join by utm_campaign (name or Meta campaign id) at campaign level; ad sets and ads inherit no CRM figures because the CRM only records the campaign tag." />
+            <div className="chart-title" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span>
+                Explorer <HelpTip text="Every row with spend in range, biggest first. Result is goal-aware — leads for lead campaigns, link clicks for traffic, website conversions for sales. CRM columns join by utm_campaign (name or Meta campaign id) at campaign level; ad sets and ads inherit no CRM figures because the CRM records only the campaign tag." />
+              </span>
+              <button className="filter-btn" onClick={() => setExplorerOpen((v) => !v)}>{explorerOpen ? "Hide" : "Show"}</button>
             </div>
             <div className="chart-sub">
               {mediaRows.length} row{mediaRows.length === 1 ? "" : "s"} · {LEVEL_LABEL[level].toLowerCase()}
               {data.truncated ? " · some accounts hit the row cap — totals may undercount" : ""}
             </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, margin: "10px 0 4px", alignItems: "center" }}>
-              {(Object.keys(LEVEL_LABEL) as PaidLevel[]).map((l) => (
-                <button key={l} className={`filter-btn${level === l ? " active" : ""}`} onClick={() => changeLevel(l)}>{LEVEL_LABEL[l]}</button>
-              ))}
-              <span style={{ width: 10 }} />
-              <button className={`filter-btn${platformFilter === "all" ? " active" : ""}`} onClick={() => setPlatformFilter("all")}>All platforms</button>
-              {platformsPresent.map((p) => (
-                <button key={p} className={`filter-btn${platformFilter === p ? " active" : ""}`} onClick={() => setPlatformFilter(p)}>{PLATFORMS[p].label}</button>
-              ))}
-              <span style={{ width: 10 }} />
-              <button className={`filter-btn${goalFilter === "all" ? " active" : ""}`} onClick={() => setGoalFilter("all")}>All goals</button>
-              {goalsPresent.map((g) => (
-                <button key={g} className={`filter-btn${goalFilter === g ? " active" : ""}`} onClick={() => setGoalFilter(g)}>{GOAL_LABELS[g]}</button>
-              ))}
-            </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, margin: "4px 0 10px", alignItems: "center" }}>
-              <span className="muted" style={{ fontSize: 11 }}>UTM <HelpTip text="Filters both the CRM figures and the funnel by the utm_source / utm_medium recorded on each lead. The platform filter also narrows the CRM side by the usual spellings of each platform's source tag." /></span>
-              <select className="search-box" style={{ width: 170 }} value={utmSrc} onChange={(e) => setUtmSrc(e.target.value)}>
-                <option value="all">source: all</option>
-                {utmSources.map(([s, n]) => (
-                  <option key={s} value={s}>{s} ({n})</option>
-                ))}
-              </select>
-              <select className="search-box" style={{ width: 170 }} value={utmMed} onChange={(e) => setUtmMed(e.target.value)}>
-                <option value="all">medium: all</option>
-                {utmMediums.map(([m, n]) => (
-                  <option key={m} value={m}>{m} ({n})</option>
-                ))}
-              </select>
-              <input className="search-box" style={{ flex: 1, minWidth: 180 }} placeholder="Search campaigns, ad sets, ads…" value={q} onChange={(e) => setQ(e.target.value)} />
-            </div>
-            <div className="table-scroll">
-              <table className="perf-table">
-                <thead>
-                  <tr>
-                    <th>{LEVEL_LABEL[level].replace(/s$/, "")}</th><th>Account</th><th>Goal</th>
-                    <th style={{ textAlign: "right" }}>Spend</th>
-                    <th style={{ textAlign: "right" }}>Impr.</th>
-                    <th style={{ textAlign: "right" }}>Clicks</th>
-                    <th style={{ textAlign: "right" }}>CTR</th>
-                    <th style={{ textAlign: "right" }}>Result</th>
-                    <th>Measured as</th>
-                    {level === "campaign" && (
-                      <>
-                        <th style={{ textAlign: "right" }}>CRM leads</th>
-                        <th style={{ textAlign: "right" }}>Qualified+</th>
-                        <th style={{ textAlign: "right" }}>Deals</th>
-                        <th style={{ textAlign: "right" }}>Cost / lead</th>
-                      </>
-                    )}
-                  </tr>
-                </thead>
-                <tbody>
-                  {mediaRows.slice(0, 80).map((r) => {
-                    const j = level === "campaign" ? joinFor(r) : null;
-                    const ctx = rowContext(r);
-                    const shallow = r.granularity !== level && level !== "campaign";
-                    return (
-                      <tr key={`${r.platform}|${r.accountId}|${r.campaign}|${r.adset ?? ""}|${r.ad ?? ""}`}>
-                        <td title={r.objective || undefined}>
-                          {rowName(r)}
-                          {ctx && <div className="muted" style={{ fontSize: 10 }}>{ctx}</div>}
-                          {shallow && (
-                            <div className="muted" style={{ fontSize: 10 }} title={r.platform === "google" ? "Google responsive search ads have no single ad name; shown at ad-group level." : "LinkedIn creative naming is unreliable; shown at campaign level."}>
-                              ({r.granularity === "adset" ? "ad-group level" : "campaign level"})
-                            </div>
-                          )}
-                        </td>
-                        <td className="muted" style={{ fontSize: 11 }}><span style={{ color: PLATFORM_COLOR[r.platform] }}>●</span> {r.accountName}</td>
-                        <td><span style={{ color: GOAL_COLOR[r.goal], fontWeight: 600, fontSize: 11 }}>{GOAL_LABELS[r.goal]}</span></td>
-                        <td style={{ textAlign: "right" }}>{money(r.cost, r.currency)}</td>
-                        <td style={{ textAlign: "right" }}>{fmtK(r.impressions)}</td>
-                        <td style={{ textAlign: "right" }}>{fmtK(r.clicks)}</td>
-                        <td style={{ textAlign: "right" }}>{pct1(ratio(r.clicks, r.impressions))}</td>
-                        <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(r.result)}</td>
-                        <td className="muted" style={{ fontSize: 11 }}>{r.resultLabel}</td>
+            {explorerOpen && (
+              <>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, margin: "10px 0" }}>
+                  {(Object.keys(LEVEL_LABEL) as PaidLevel[]).map((l) => (
+                    <button key={l} className={`filter-btn${level === l ? " active" : ""}`} onClick={() => changeLevel(l)}>{LEVEL_LABEL[l]}</button>
+                  ))}
+                </div>
+                <div className="table-scroll">
+                  <table className="perf-table">
+                    <thead>
+                      <tr>
+                        <th>{LEVEL_LABEL[level].replace(/s$/, "")}</th><th>Account</th><th>Goal</th>
+                        <th style={{ textAlign: "right" }}>Spend</th>
+                        <th style={{ textAlign: "right" }}>Impr.</th>
+                        <th style={{ textAlign: "right" }}>Clicks</th>
+                        <th style={{ textAlign: "right" }}>CTR</th>
+                        <th style={{ textAlign: "right" }}>Result</th>
+                        <th>Measured as</th>
                         {level === "campaign" && (
                           <>
-                            <td style={{ textAlign: "right", fontWeight: 600, color: j ? C.green : undefined }}>{j ? fmt(j.leads) : "—"}</td>
-                            <td style={{ textAlign: "right" }}>{j ? fmt(j.qualified) : "—"}</td>
-                            <td style={{ textAlign: "right" }}>{j ? fmt(j.deals) : "—"}</td>
-                            <td style={{ textAlign: "right" }}>{j && j.leads > 0 ? money(r.cost / j.leads, r.currency) : "—"}</td>
+                            <th style={{ textAlign: "right" }}>Leads</th>
+                            <th style={{ textAlign: "right" }}>Qualified</th>
+                            <th style={{ textAlign: "right" }}>Deals</th>
+                            <th style={{ textAlign: "right" }}>Cost / lead</th>
                           </>
                         )}
                       </tr>
-                    );
-                  })}
-                  {!mediaRows.length && <tr><td colSpan={level === "campaign" ? 13 : 9} className="muted">No rows match the filters.</td></tr>}
-                </tbody>
-              </table>
-            </div>
-            {mediaRows.length > 80 && <div className="chart-sub" style={{ marginTop: 8 }}>Showing the 80 highest-spending of {mediaRows.length} rows — narrow with the filters or search.</div>}
-            {level === "campaign" && !crmLoading && !crm?.error && (
-              <div className="chart-sub" style={{ marginTop: 8 }}>
-                A dash in the CRM columns means no lead in range carries that campaign&apos;s name or id as its utm_campaign — either it drives no form fills, or its ads aren&apos;t tagged.
-              </div>
+                    </thead>
+                    <tbody>
+                      {mediaRows.slice(0, 80).map((r) => {
+                        const j = level === "campaign" ? joinFor(r) : null;
+                        const ctx = rowContext(r);
+                        const shallow = r.granularity !== level && level !== "campaign";
+                        return (
+                          <tr key={`${r.platform}|${r.accountId}|${r.campaign}|${r.adset ?? ""}|${r.ad ?? ""}`}>
+                            <td title={r.objective || undefined}>
+                              {rowName(r)}
+                              {ctx && <div className="muted" style={{ fontSize: 10 }}>{ctx}</div>}
+                              {shallow && (
+                                <div className="muted" style={{ fontSize: 10 }} title={r.platform === "google" ? "Google responsive search ads have no single ad name; shown at ad-group level." : "LinkedIn creative naming is unreliable; shown at campaign level."}>
+                                  ({r.granularity === "adset" ? "ad-group level" : "campaign level"})
+                                </div>
+                              )}
+                            </td>
+                            <td className="muted" style={{ fontSize: 11 }}><span style={{ color: PLATFORM_COLOR[r.platform] }}>●</span> {r.accountName}</td>
+                            <td><span style={{ color: GOAL_COLOR[r.goal], fontWeight: 600, fontSize: 11 }}>{GOAL_LABELS[r.goal]}</span></td>
+                            <td style={{ textAlign: "right" }}>{money(r.cost, r.currency)}</td>
+                            <td style={{ textAlign: "right" }}>{fmtK(r.impressions)}</td>
+                            <td style={{ textAlign: "right" }}>{fmtK(r.clicks)}</td>
+                            <td style={{ textAlign: "right" }}>{pct1(ratio(r.clicks, r.impressions))}</td>
+                            <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(r.result)}</td>
+                            <td className="muted" style={{ fontSize: 11 }}>{r.resultLabel}</td>
+                            {level === "campaign" && (
+                              <>
+                                <td style={{ textAlign: "right", fontWeight: 600, color: j ? C.green : undefined }}>{j ? fmt(j.leads) : "—"}</td>
+                                <td style={{ textAlign: "right" }}>{j ? fmt(j.qualified) : "—"}</td>
+                                <td style={{ textAlign: "right" }}>{j ? fmt(j.deals) : "—"}</td>
+                                <td style={{ textAlign: "right" }}>{j && j.leads > 0 ? money(r.cost / j.leads, r.currency) : "—"}</td>
+                              </>
+                            )}
+                          </tr>
+                        );
+                      })}
+                      {!mediaRows.length && <tr><td colSpan={level === "campaign" ? 13 : 9} className="muted">No rows match the filters.</td></tr>}
+                    </tbody>
+                  </table>
+                </div>
+                {mediaRows.length > 80 && <div className="chart-sub" style={{ marginTop: 8 }}>Showing the 80 highest-spending of {mediaRows.length} rows — narrow with the filters or search.</div>}
+                {level === "campaign" && !crmLoading && !crm?.error && (
+                  <div className="chart-sub" style={{ marginTop: 8 }}>
+                    A dash in the CRM columns means no open lead in range carries that campaign&apos;s name or id as its utm_campaign — either it drives no form fills, or its ads aren&apos;t tagged.
+                  </div>
+                )}
+              </>
             )}
           </div>
-
-          {/* ── Meta outcome breakdown ──────────────────────────────────────── */}
-          {mediaRows.some((r) => r.platform === "meta") && (
-            <div className="chart-card" style={{ marginTop: 4 }}>
-              <div className="chart-title">
-                Meta — all outcomes side by side <HelpTip text="Meta reports several outcomes for the same row at once, and which one matters depends on the objective. All four are shown so a campaign is never judged on a metric it was not buying." />
-              </div>
-              <div className="chart-sub">Link clicks, website conversions, website leads and on-Facebook form leads</div>
-              <div className="table-scroll">
-                <table className="perf-table">
-                  <thead>
-                    <tr>
-                      <th>{LEVEL_LABEL[level].replace(/s$/, "")}</th><th>Objective</th>
-                      <th style={{ textAlign: "right" }}>Spend</th>
-                      <th style={{ textAlign: "right" }}>Link clicks</th>
-                      <th style={{ textAlign: "right" }}>Website conv.</th>
-                      <th style={{ textAlign: "right" }}>Website leads</th>
-                      <th style={{ textAlign: "right" }}>On-FB leads</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {mediaRows.filter((r) => r.platform === "meta").slice(0, 40).map((r) => (
-                      <tr key={`m|${r.accountId}|${r.campaign}|${r.adset ?? ""}|${r.ad ?? ""}`}>
-                        <td>
-                          {rowName(r)}
-                          {rowContext(r) && <div className="muted" style={{ fontSize: 10 }}>{rowContext(r)}</div>}
-                        </td>
-                        <td className="muted" style={{ fontSize: 11 }}>{r.objective || "—"}</td>
-                        <td style={{ textAlign: "right" }}>{money(r.cost, r.currency)}</td>
-                        <td style={{ textAlign: "right" }}>{fmt(r.linkClicks)}</td>
-                        <td style={{ textAlign: "right" }}>{fmt(r.websiteConversions)}</td>
-                        <td style={{ textAlign: "right" }}>{fmt(r.websiteLeads)}</td>
-                        <td style={{ textAlign: "right" }}>{fmt(r.facebookLeads)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-
-          {/* ── UTM tagging gaps ─────────────────────────────────────────────── */}
-          {unmatchedCrm.length > 0 && (
-            <div className="chart-card" style={{ marginTop: 4 }}>
-              <div className="chart-title">
-                CRM campaigns with no matching ad campaign <HelpTip text="utm_campaign values on CRM leads that match no campaign name or id on the selected ad accounts. Either the campaign lives on an unselected/unlicensed account, it's a non-paid source using campaign tags (email, portals), or the ads and the CRM disagree on naming — tagging debt worth cleaning either way." />
-              </div>
-              <div className="chart-sub">Top {unmatchedCrm.length} by leads · these leads are in the funnel above but join to no row in the explorer</div>
-              <div className="table-scroll">
-                <table className="perf-table">
-                  <thead><tr><th>utm_campaign</th><th>utm_source</th><th style={{ textAlign: "right" }}>Leads</th></tr></thead>
-                  <tbody>
-                    {unmatchedCrm.map((u) => (
-                      <tr key={u.campaign}>
-                        <td>{u.campaign}</td>
-                        <td className="muted">{u.source}</td>
-                        <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(u.leads)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
 
           {/* ── Accounts that could not be read ─────────────────────────────── */}
           {data.failures.length > 0 && (
@@ -914,7 +924,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
             Sources: {data.accountsUsed.length} ad account{data.accountsUsed.length === 1 ? "" : "s"} with data via Supermetrics
             {data.emptyAccounts.length ? ` · ${data.emptyAccounts.length} read but quiet in range (${data.emptyAccounts.map((a) => a.name).join(", ")})` : ""}
             {data.failures.length ? ` · ${data.failures.length} unavailable` : ""}
-            {" "}· CRM funnel from Metabase, joined on utm_campaign · rates derived from raw totals, never from pre-aggregated rate fields.
+            {" "}· lead funnel from the CRM (Metabase), joined on utm_campaign, closed leads excluded · rates derived from raw totals.
           </div>
         </>
       )}
