@@ -96,9 +96,14 @@ export const VERIFIED_READABLE: Record<PaidPlatform, string[]> = {
   linkedin: ["504276125"],
 };
 
-/** Accounts confirmed NOT readable — rejected as unprioritised during discovery. */
+/**
+ * Accounts confirmed NOT readable — each individually probed through the
+ * Supermetrics hub API and rejected as "not a prioritised account". The live
+ * dashboard sees these as a bare QUERY_ERROR; this list is what lets that
+ * generic code be reported as its verified meaning.
+ */
 export const VERIFIED_BLOCKED: Record<PaidPlatform, string[]> = {
   google: [],
-  meta: ["act_873275145025438", "act_9508663712551146"],
+  meta: ["act_873275145025438", "act_9508663712551146", "act_10091300310884299"],
   linkedin: [],
 };

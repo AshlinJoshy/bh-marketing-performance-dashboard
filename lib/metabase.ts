@@ -194,6 +194,77 @@ export async function mbQuery(sql: string, retry = true, timeoutMs = 20000): Pro
   return "rows" in r ? r.rows : null;
 }
 
+/**
+ * CRM leads grouped by their UTM tags and pipeline position — the join surface
+ * between paid campaigns and the CRM.
+ *
+ * One row per (utm_campaign, utm_source, utm_medium, stage, state) with a count.
+ * Only leads that carry a utm_campaign are included: those are the ones that can
+ * be attributed to a campaign at all. The Digital tab joins these to Supermetrics
+ * rows by campaign name (and Meta campaign id), filters them by the UTM values,
+ * and folds the stage counts into a funnel.
+ *
+ * Stage is a snapshot of where each lead sits NOW, so the funnel built from it
+ * is current pipeline composition, not cohort progression over time.
+ */
+export interface CampaignLeadCell {
+  campaign: string;
+  source: string;
+  medium: string;
+  stage: string;
+  state: string;
+  n: number;
+}
+export interface CampaignLeadsData {
+  connected: boolean;
+  label: string;
+  rows: CampaignLeadCell[];
+  /** Hit the row cap — smallest groups are missing. */
+  truncated: boolean;
+  error?: string;
+}
+
+export async function getCampaignLeads(fromRaw: string, toRaw: string): Promise<CampaignLeadsData> {
+  const connected = !!(
+    process.env.METABASE_URL &&
+    (process.env.METABASE_API_KEY || (process.env.METABASE_USERNAME && process.env.METABASE_PASSWORD))
+  );
+  const base: CampaignLeadsData = { connected, label: `${fromRaw} → ${toRaw}`, rows: [], truncated: false };
+  if (!connected) return base;
+  if (!isDate(fromRaw) || !isDate(toRaw)) return { ...base, error: "bad date range" };
+  if (!process.env.METABASE_API_KEY) {
+    const tok = await mbSessionToken();
+    if (!tok) {
+      return { ...base, error: "Metabase login failed — check METABASE_URL / METABASE_USERNAME / METABASE_PASSWORD." };
+    }
+  }
+  const range = `created_at >= '${fromRaw} 00:00:00' AND created_at <= '${toRaw} 23:59:59'`;
+  const utmCampaign = utmJson("campaign");
+  // Same single-scan discipline as getLeadsData: one pass over the view, grouped
+  // by low-cardinality dimensions, roll-ups done by the caller.
+  const res = await mbQueryEx(
+    `SELECT COALESCE(NULLIF(TRIM(${utmCampaign}), ''), '(none)') camp, ` +
+      `COALESCE(NULLIF(TRIM(${utmSource}), ''), '(none)') src, ` +
+      `COALESCE(NULLIF(TRIM(${utmMedium}), ''), '(none)') med, ` +
+      `CAST(status AS CHAR) stage, CAST(state AS CHAR) st, COUNT(*) n ` +
+      `FROM leads WHERE ${range} AND ${utmCampaign} IS NOT NULL AND TRIM(${utmCampaign}) <> '' ` +
+      `GROUP BY 1,2,3,4,5 ORDER BY n DESC LIMIT 4000`,
+    true,
+    35000,
+  );
+  if ("error" in res) return { ...base, error: `Metabase reachable, but the campaign-leads query failed: ${res.error}` };
+  base.rows = res.rows.map((r) => ({
+    campaign: String(r[0] ?? ""),
+    source: String(r[1] ?? ""),
+    medium: String(r[2] ?? ""),
+    stage: String(r[3] ?? ""),
+    state: String(r[4] ?? ""),
+    n: Number(r[5] ?? 0),
+  }));
+  base.truncated = base.rows.length >= 4000;
+  return base;
+}
+
 export async function getLeadsData(fromRaw: string, toRaw: string, opts?: { audit?: boolean }): Promise<LeadsData> {
   const connected = !!(
     process.env.METABASE_URL &&

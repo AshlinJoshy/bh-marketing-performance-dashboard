@@ -18,6 +18,7 @@
 // and naming (Google `Campaignname`, LinkedIn `campaignName`, Meta
 // `adcampaign_name`), so guessing them yields a silent empty card.
 import { getPaidConfig } from "@/lib/data";
+import { VERIFIED_BLOCKED as VERIFIED_UNPRIORITISED } from "@/lib/paidAccounts";
 
 const SM_ENDPOINT = process.env.SUPERMETRICS_API_URL || "https://api.supermetrics.com/enterprise/v2/query/data/json";
 
@@ -31,11 +32,27 @@ export type PaidPlatform = "google" | "meta" | "linkedin";
  */
 export type CampaignGoal = "leads" | "traffic" | "conversions" | "awareness" | "engagement" | "other";
 
+/**
+ * How deep a report goes. "adset" is Meta's word; it maps to Google ad groups.
+ * Platforms that cannot express a level keep their rows at the deepest level
+ * they CAN express, marked via `granularity`, rather than dropping out of the
+ * view silently.
+ */
+export type PaidLevel = "campaign" | "adset" | "ad";
+
 export interface CampaignRow {
   platform: PaidPlatform;
   accountId: string;
   accountName: string;
   campaign: string;
+  /** Platform's campaign id, where exposed (Meta). Second join key to the CRM. */
+  campaignId: string | null;
+  /** Ad set (Meta) / ad group (Google) when the level asked for it. */
+  adset: string | null;
+  /** Ad name (Meta only — Google responsive ads have no single name). */
+  ad: string | null;
+  /** The depth this row actually has — may be shallower than the requested level. */
+  granularity: PaidLevel;
   /** Raw platform objective, where the platform exposes one (Meta does). */
   objective: string | null;
   goal: CampaignGoal;
@@ -82,7 +99,10 @@ export interface PaidData {
   label: string;
   from: string;
   to: string;
+  level: PaidLevel;
   rows: CampaignRow[];
+  /** Some account hit the 10k-row cap, so totals may undercount. */
+  truncated: boolean;
   byDate: { date: string; cost: number; result: number; impressions: number }[];
   /** Distinct currencies present. More than one means spend must not be summed. */
   currencies: string[];
@@ -107,6 +127,12 @@ export interface PaidData {
 type FieldMap = {
   date: string;
   campaign: string;
+  /** Campaign id, for joining CRM utm_campaign values that carry ids. */
+  campaignId?: string;
+  /** Ad set / ad group dimension, when the platform has one. */
+  adset?: string;
+  /** Ad-name dimension, when the platform has one. */
+  ad?: string;
   currency: string;
   impressions: string;
   cost: string;
@@ -147,6 +173,7 @@ export const PLATFORMS: Record<PaidPlatform, PlatformSpec> = {
     fields: {
       date: "Date",
       campaign: "Campaignname",
+      adset: "Adgroupname",
       currency: "Currencycode",
       impressions: "Impressions",
       clicks: "Clicks",
@@ -162,6 +189,9 @@ export const PLATFORMS: Record<PaidPlatform, PlatformSpec> = {
     fields: {
       date: "Date",
       campaign: "adcampaign_name",
+      campaignId: "adcampaign_id",
+      adset: "adset_name",
+      ad: "ad_name",
       currency: "currency",
       objective: "campaignobjective",
       impressions: "impressions",
@@ -302,11 +332,26 @@ async function smQuery(
  * opposite responses: an unlicensed account is a subscription change, a bad
  * ds_user is a deployment variable.
  */
-function explain(raw: string, platform: PaidPlatform): { reason: string; notPrioritised: boolean; authProblem: boolean; raw: string } {
+function explain(raw: string, platform: PaidPlatform, accountId: string): { reason: string; notPrioritised: boolean; authProblem: boolean; raw: string } {
   const spec = PLATFORMS[platform];
   const base = { notPrioritised: false, authProblem: false, raw };
   if (/prioritis|prioritiz/i.test(raw)) {
     return { ...base, notPrioritised: true, reason: "Not a prioritised account on this Supermetrics subscription, so its data cannot be pulled." };
+  }
+  // The Data Fetching API reports the unprioritised case as a bare QUERY_ERROR,
+  // unlike the hub API which spells it out. Every account that has shown
+  // QUERY_ERROR here was then probed through the hub API and confirmed
+  // unprioritised, so the verified list turns this generic code into its actual
+  // meaning; for accounts outside that list the wording stays hedged.
+  if (/QUERY_ERROR/i.test(raw)) {
+    const verified = VERIFIED_UNPRIORITISED[platform]?.includes(accountId);
+    return {
+      ...base,
+      notPrioritised: true,
+      reason: verified
+        ? "Not a prioritised account on this Supermetrics subscription (verified) — its data cannot be pulled until it is added to the prioritised list."
+        : "Supermetrics rejected the query (QUERY_ERROR). For every account checked so far this has meant it is not on the subscription's prioritised list.",
+    };
   }
   if (/QUERY_AUTH_UNAVAILABLE|not authori[sz]ed|invalid[_ ]?grant/i.test(raw)) {
     return {
@@ -362,11 +407,21 @@ export function paidRange(fromRaw?: string, toRaw?: string, days = 30): { from: 
  * were unlicensed. Batching them would mean one unlicensed account blanking the
  * whole dashboard, so each is isolated and its failure reported individually.
  */
-async function fetchAccount(platform: PaidPlatform, acct: PaidAccount, from: string, to: string): Promise<{ rows: CampaignRow[]; failure?: AccountFailure }> {
+async function fetchAccount(platform: PaidPlatform, acct: PaidAccount, from: string, to: string, level: PaidLevel): Promise<{ rows: CampaignRow[]; failure?: AccountFailure }> {
   const spec = PLATFORMS[platform];
   const f = spec.fields;
+  // Which breakdown dims this platform can actually serve at the asked level.
+  // A platform without the dimension stays at the deepest level it has, and the
+  // row says so via `granularity`, instead of vanishing from the deeper views.
+  const wantAdset = (level === "adset" || level === "ad") && !!f.adset;
+  const wantAd = level === "ad" && !!f.ad;
+  const granularity: PaidLevel = wantAd ? "ad" : wantAdset ? "adset" : "campaign";
   // Order matters: the response columns come back in the order requested.
-  const order: (keyof FieldMap)[] = ["date", "campaign", "currency"];
+  const order: (keyof FieldMap)[] = ["date", "campaign"];
+  if (f.campaignId) order.push("campaignId");
+  if (wantAdset) order.push("adset");
+  if (wantAd) order.push("ad");
+  order.push("currency");
   if (f.objective) order.push("objective");
   order.push("impressions", "cost");
   for (const k of ["clicks", "conversions", "linkClicks", "websiteConversions", "websiteLeads", "facebookLeads"] as (keyof FieldMap)[]) {
@@ -376,7 +431,7 @@ async function fetchAccount(platform: PaidPlatform, acct: PaidAccount, from: str
 
   const res = await smQuery(spec.dsId, acct.id, fieldIds, from, to, process.env[spec.dsUserEnv]);
   if ("error" in res) {
-    return { rows: [], failure: { platform, accountId: acct.id, accountName: acct.name, ...explain(res.error, platform) } };
+    return { rows: [], failure: { platform, accountId: acct.id, accountName: acct.name, ...explain(res.error, platform, acct.id) } };
   }
 
   const at = (row: any[], k: keyof FieldMap): unknown => {
@@ -422,6 +477,10 @@ async function fetchAccount(platform: PaidPlatform, acct: PaidAccount, from: str
       accountId: acct.id,
       accountName: acct.name,
       campaign: String(at(row, "campaign") ?? "(unnamed)"),
+      campaignId: f.campaignId ? String(at(row, "campaignId") ?? "") || null : null,
+      adset: wantAdset ? String(at(row, "adset") ?? "") || null : null,
+      ad: wantAd ? String(at(row, "ad") ?? "") || null : null,
+      granularity,
       objective,
       goal,
       currency: String(at(row, "currency") ?? "") || "—",
@@ -444,11 +503,11 @@ async function fetchAccount(platform: PaidPlatform, acct: PaidAccount, from: str
 }
 
 // ─── Public entry point ───────────────────────────────────────────────────────
-export async function getPaidData(fromRaw?: string, toRaw?: string, days = 30): Promise<PaidData> {
+export async function getPaidData(fromRaw?: string, toRaw?: string, days = 30, level: PaidLevel = "campaign"): Promise<PaidData> {
   const { from, to, label } = paidRange(fromRaw, toRaw, days);
   const connected = !!process.env.SUPERMETRICS_API_KEY;
   const base: PaidData = {
-    connected, label, from, to, rows: [], byDate: [], currencies: [],
+    connected, label, from, to, level, rows: [], truncated: false, byDate: [], currencies: [],
     accountsUsed: [], emptyAccounts: [], failures: [], unconfigured: false,
   };
   if (!connected) return base;
@@ -462,7 +521,7 @@ export async function getPaidData(fromRaw?: string, toRaw?: string, days = 30): 
 
   // Accounts are independent queries, so they run concurrently. A slow or
   // unlicensed one degrades its own row rather than the whole tab.
-  const settled = await Promise.all(selected.map((a) => fetchAccount(a.platform, a, from, to)));
+  const settled = await Promise.all(selected.map((a) => fetchAccount(a.platform, a, from, to, level)));
 
   const rows: CampaignRow[] = [];
   for (let i = 0; i < settled.length; i++) {
@@ -474,6 +533,9 @@ export async function getPaidData(fromRaw?: string, toRaw?: string, days = 30): 
     if (r.rows.length) {
       rows.push(...r.rows);
       base.accountsUsed.push(selected[i]);
+      // max_rows is 10000; a response that size almost certainly hit the cap,
+      // and a silent cap reads as "covered everything" when it didn't.
+      if (r.rows.length >= 9999) base.truncated = true;
     } else {
       base.emptyAccounts.push(selected[i]);
     }
@@ -492,7 +554,7 @@ export async function getPaidData(fromRaw?: string, toRaw?: string, days = 30): 
       cur.impressions += r.impressions;
       dayAcc.set(d, cur);
     }
-    const key = `${r.platform}|${r.accountId}|${r.campaign}`;
+    const key = `${r.platform}|${r.accountId}|${r.campaign}|${r.adset ?? ""}|${r.ad ?? ""}`;
     const prev = campAcc.get(key);
     if (!prev) {
       campAcc.set(key, { ...r });
