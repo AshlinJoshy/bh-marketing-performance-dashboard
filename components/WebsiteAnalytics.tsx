@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState, useTransition } from "react";
+import { useCallback, useEffect, useRef, useState, useTransition } from "react";
 import ChartBox from "@/components/Chart";
 import HelpTip from "@/components/HelpTip";
 import DateRangePicker from "@/components/DateRangePicker";
@@ -66,39 +66,56 @@ export default function WebsiteAnalytics({ initial }: { initial: WebMetrics }) {
   }, [live, qsFor, load]);
 
   /**
-   * Pop-up lead count, from the CRM via the SEO leads endpoint. Kept in its own
-   * request keyed to the current range: the CRM view is slow and sometimes times
-   * out, and this one number must never be able to delay or blank the PostHog
-   * KPIs it sits beneath.
+   * Pop-up lead count, from the CRM. Fetched alongside the PostHog metrics and
+   * committed with them rather than on its own: landing separately made the
+   * page fill in in stages, with this number appearing seconds after the
+   * traffic KPIs it sits beside.
    */
-  const [popupRes, setPopupRes] = useState<{ qs: string; n: number | null; err: boolean } | null>(null);
-  const leadsQs = rangeQs();
+  const [popup, setPopup] = useState<number | null>(null);
+  const [popupErr, setPopupErr] = useState(false);
+  const fetchPopup = useCallback(async (f: string, t: string): Promise<{ n: number | null; err: boolean }> => {
+    try {
+      const res = await fetch(`/api/seo/leads?from=${f}&to=${t}`, { cache: "no-store" });
+      const json = await res.json();
+      const ok = res.ok && typeof json?.popup === "number" && !json.error;
+      return { n: ok ? json.popup : null, err: !ok };
+    } catch {
+      return { n: null, err: true };
+    }
+  }, []);
+
+  /**
+   * Both sources for a range, committed together. The sequence guard stops an
+   * older in-flight load from overwriting a newer one.
+   */
+  const seq = useRef(0);
+  const loadAll = useCallback(
+    async (f: string, t: string, suffix: string) => {
+      const mine = ++seq.current;
+      setLoading(true);
+      const [, pop] = await Promise.all([load(`from=${f}&to=${t}${suffix}`, true), fetchPopup(f, t)]);
+      if (mine !== seq.current) return;
+      setPopup(pop.n);
+      setPopupErr(pop.err);
+      setLoading(false);
+    },
+    [load, fetchPopup],
+  );
+
+  // Both sources load on mount ON PURPOSE: the server renders PostHog metrics,
+  // but the CRM pop-up figure is client-side, and it should appear with the rest
+  // rather than after it.
   useEffect(() => {
-    let stale = false;
-    (async () => {
-      try {
-        const res = await fetch(`/api/seo/leads?${leadsQs}`, { cache: "no-store" });
-        const json = await res.json();
-        if (stale) return;
-        const ok = res.ok && typeof json?.popup === "number" && !json.error;
-        setPopupRes({ qs: leadsQs, n: ok ? json.popup : null, err: !ok });
-      } catch {
-        if (!stale) setPopupRes({ qs: leadsQs, n: null, err: true });
-      }
-    })();
-    return () => { stale = true; };
-  }, [leadsQs]);
-  // Tagging the result with the range it answers means a result for a range the
-  // user has already moved on from reads as "loading", not as a wrong number.
-  const popupFresh = popupRes?.qs === leadsQs;
-  const popup = popupFresh ? popupRes!.n : null;
-  const popupErr = popupFresh && popupRes!.err;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    loadAll(from, to, tail());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function applyRange(f: string, t: string) {
     setFrom(f);
     setTo(t);
     setDays(Math.max(1, Math.round((new Date(t).getTime() - new Date(f).getTime()) / 864e5) + 1));
-    load(`from=${f}&to=${t}${tail()}`, false);
+    loadAll(f, t, tail());
   }
   function toggleHumans() {
     const next = !humansOnly;

@@ -68,6 +68,17 @@ function addStage(a: StageAgg, stage: string, state: string, n: number) {
 // Default range = this month, resolved once at module load (never during render).
 const INIT_RANGE = rangeFor("this_month");
 
+/**
+ * A renderable payload for a failed media fetch. Without this a failure left
+ * `data` null forever, which the skeleton reads as "still loading" — the page
+ * would spin indefinitely instead of saying what went wrong.
+ */
+const failedPaid = (from: string, to: string, error: string): PaidData => ({
+  connected: true, label: `${from} → ${to}`, from, to, level: "ad",
+  rows: [], truncated: false, byDateFine: [], currencies: [],
+  accountsUsed: [], emptyAccounts: [], failures: [], unconfigured: false, error,
+});
+
 // ─── Searchable filter dropdown ───────────────────────────────────────────────
 function FilterSelect({
   label,
@@ -147,13 +158,18 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   // serve — and every coarser view (campaigns, ad sets, the tree) is a client-
   // side regroup of the same rows. Switching levels is instant and free.
   const [data, setData] = useState<PaidData | null>(initial);
+  const [crm, setCrm] = useState<CampaignLeadsData | null>(null);
   const [viewLevel, setViewLevel] = useState<PaidLevel>("campaign");
   const [from, setFrom] = useState(initial?.from ?? INIT_RANGE.from);
   const [to, setTo] = useState(initial?.to ?? INIT_RANGE.to);
-  const [loading, setLoading] = useState(false);
-
-  const [crm, setCrm] = useState<CampaignLeadsData | null>(null);
-  const [crmLoading, setCrmLoading] = useState(true);
+  /**
+   * One flag for the whole page. Media (Supermetrics) and leads (Engage) are
+   * fetched concurrently but committed together, so the page never fills in
+   * piecemeal — it shows the skeleton until every source has answered, then
+   * swaps to a complete view. The cost of that is the page is as slow as its
+   * slowest source; the benefit is no half-populated numbers to misread.
+   */
+  const [busy, setBusy] = useState(true);
 
   // ── Account picker (⚙) ─────────────────────────────────────────────────────
   const initialSel = useMemo<Record<PaidPlatform, string[]>>(
@@ -188,49 +204,66 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   const [treeOpen, setTreeOpen] = useState(true);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
-  const loadMedia = useCallback(async (f: string, t: string) => {
-    setLoading(true);
+  // Pure fetchers: they return payloads and write no state, so the caller decides
+  // when anything appears on screen. Neither ever rejects — a failure comes back
+  // as a payload carrying its reason.
+  const fetchMedia = useCallback(async (f: string, t: string): Promise<PaidData> => {
     try {
       const res = await fetch(`/api/digital?from=${f}&to=${t}&level=ad`, { cache: "no-store" });
       const json = await res.json();
-      if (res.ok && json && Array.isArray(json.rows)) setData(json as PaidData);
-      else console.error("[digital] refresh failed", json?.error ?? res.status);
+      if (res.ok && json && Array.isArray(json.rows)) return json as PaidData;
+      return failedPaid(f, t, json?.error || `Media request failed (HTTP ${res.status}).`);
     } catch (e) {
-      console.error("[digital] refresh failed", e);
-    } finally {
-      setLoading(false);
+      return failedPaid(f, t, String(e));
     }
   }, []);
 
-  const loadCrm = useCallback(async (f: string, t: string) => {
-    setCrmLoading(true);
+  const fetchCrm = useCallback(async (f: string, t: string): Promise<CampaignLeadsData> => {
+    const empty = (error: string): CampaignLeadsData => ({ connected: true, label: `${f} → ${t}`, rows: [], codeRows: [], truncated: false, error });
     try {
       const res = await fetch(`/api/digital/crm?from=${f}&to=${t}`, { cache: "no-store" });
       const json = await res.json();
-      if (res.ok && json && Array.isArray(json.rows)) setCrm(json as CampaignLeadsData);
-      else setCrm({ connected: true, label: "", rows: [], codeRows: [], truncated: false, error: json?.error || `HTTP ${res.status}` });
+      if (res.ok && json && Array.isArray(json.rows)) return json as CampaignLeadsData;
+      return empty(json?.error || `HTTP ${res.status}`);
     } catch (e) {
-      setCrm({ connected: true, label: "", rows: [], codeRows: [], truncated: false, error: String(e) });
-    } finally {
-      setCrmLoading(false);
+      return empty(String(e));
     }
   }, []);
 
-  // Both halves load on mount ON PURPOSE — media because the server no longer
-  // blocks navigation on Supermetrics, CRM because the Metabase view is slow.
-  // Flipping loading flags during the mount effect is intended, not a cascade.
+  /**
+   * Load everything for a range and commit it in one go.
+   *
+   * The sequence guard matters: changing the range twice quickly leaves two
+   * loads in flight, and without it the slower (older) one can land last and
+   * overwrite the newer data with stale numbers.
+   */
+  const seq = useRef(0);
+  const loadAll = useCallback(
+    async (f: string, t: string) => {
+      const mine = ++seq.current;
+      setBusy(true);
+      const [media, crmData] = await Promise.all([fetchMedia(f, t), fetchCrm(f, t)]);
+      if (mine !== seq.current) return; // superseded by a newer load
+      setData(media);
+      setCrm(crmData);
+      setBusy(false);
+    },
+    [fetchMedia, fetchCrm],
+  );
+
+  // Loads on mount ON PURPOSE — the server renders the shell without waiting on
+  // Supermetrics. Flipping the busy flag during the mount effect is intended
+  // behaviour here, not a cascading render.
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    loadMedia(from, to);
-    loadCrm(from, to);
+    loadAll(from, to);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function applyRange(f: string, t: string) {
     setFrom(f);
     setTo(t);
-    loadMedia(f, t);
-    loadCrm(f, t);
+    loadAll(f, t);
   }
 
   // ── Account picker actions ──────────────────────────────────────────────────
@@ -262,7 +295,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
       setSavedSel(sel);
       setCfgMsg(null);
       setCfgOpen(false);
-      await loadMedia(from, to);
+      await loadAll(from, to);
     });
   }
 
@@ -642,8 +675,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
         <div>
           <h1>Digital Performance</h1>
           <p className="page-sub">
-            Paid media via Supermetrics · lead funnel via Engage (Metabase) · {data ? data.label : "loading…"}
-            {data && loading ? " · refreshing…" : ""}
+            Paid media via Supermetrics · lead funnel via Engage (Metabase) · {busy ? "loading…" : data?.label}
           </p>
         </div>
         <div className="filter-row" style={{ flexWrap: "wrap" }}>
@@ -701,19 +733,8 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
         </div>
       )}
 
-      {!data ? (
-        nothingSelected && !loading ? (
-          <div className="chart-card">
-            <div className="empty-state" style={{ height: "auto", padding: "26px 20px", display: "block", textAlign: "center" }}>
-              <div style={{ fontWeight: 600, color: C.dark, marginBottom: 8 }}>No accounts selected yet</div>
-              <div style={{ fontSize: 12, color: C.mid, lineHeight: 1.7, maxWidth: 520, margin: "0 auto" }}>
-                Open <strong>⚙</strong> above and tick the ad accounts you want on this dashboard.
-              </div>
-            </div>
-          </div>
-        ) : (
-          <DigitalSkeleton />
-        )
+      {busy || !data ? (
+        <DigitalSkeleton />
       ) : !data.connected ? (
         <div className="chart-card">
           <div className="empty-state" style={{ height: "auto", padding: "26px 20px", display: "block", textAlign: "center" }}>
@@ -785,19 +806,19 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
             </div>
             <div className="kpi-card">
               <div className="kpi-label">Leads <HelpTip text="Campaign-tagged leads created in the CRM in this range, excluding closed ones. With only a campaign_code selected this includes the code's untagged leads (WhatsApp/email buttons); UTM filters narrow to tagged leads. Source: Engage via Metabase." /></div>
-              <div className="kpi-value" style={{ color: C.green }}>{crmLoading ? "…" : crm?.error && !crm.rows.length ? "—" : fmt(crmAgg.leads)}</div>
+              <div className="kpi-value" style={{ color: C.green }}>{crm?.error && !crm.rows.length ? "—" : fmt(crmAgg.leads)}</div>
             </div>
             <div className="kpi-card">
               <div className="kpi-label">Qualified <HelpTip text="Leads sitting at the Qualified stage right now, still open. Closed leads are dropped." /></div>
-              <div className="kpi-value">{crmLoading ? "…" : fmt(crmAgg.qualified)}</div>
+              <div className="kpi-value">{fmt(crmAgg.qualified)}</div>
             </div>
             <div className="kpi-card">
               <div className="kpi-label">Viewing <HelpTip text="Leads at the Viewing stage right now, still open." /></div>
-              <div className="kpi-value">{crmLoading ? "…" : fmt(crmAgg.viewing)}</div>
+              <div className="kpi-value">{fmt(crmAgg.viewing)}</div>
             </div>
             <div className="kpi-card">
               <div className="kpi-label">Deal stage <HelpTip text="Leads currently at the Deal stage of the pipeline (not closed). A stage snapshot — not the same as a signed transaction in the deals table." /></div>
-              <div className="kpi-value">{crmLoading ? "…" : fmt(crmAgg.deals)}</div>
+              <div className="kpi-value">{fmt(crmAgg.deals)}</div>
             </div>
             <div className="kpi-card">
               <div className="kpi-label">Cost / lead <HelpTip text={totals.singleCurrency ? "Filtered spend divided by leads, and by currently-qualified leads." : "Hidden while the filtered accounts span multiple currencies."} /></div>
@@ -829,7 +850,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
               Lead funnel <HelpTip text="Campaign-tagged CRM leads by the pipeline stage they sit at today, closed leads dropped. Each stage shows its share of leads." />
             </div>
             <div className="chart-sub">
-              {crmLoading ? "CRM loading…" : crm?.error && !crm.rows.length ? `CRM unavailable: ${crm.error}` : `${fmt(crmAgg.leads)} open leads${code !== "all" ? ` · code ${code}` : ""} · ${crm?.label ?? ""}${crm?.truncated ? " · largest groups only (row cap hit)" : ""}${crm?.error ? ` · ${crm.error}` : ""}`}
+              {crm?.error && !crm.rows.length ? `CRM unavailable: ${crm.error}` : `${fmt(crmAgg.leads)} open leads${code !== "all" ? ` · code ${code}` : ""} · ${crm?.label ?? ""}${crm?.truncated ? " · largest groups only (row cap hit)" : ""}${crm?.error ? ` · ${crm.error}` : ""}`}
             </div>
             <div style={{ display: "grid", gap: 6, marginTop: 12 }}>
               {funnel.map((s, i) => (
@@ -965,7 +986,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
                       );
                     })}
                     {!tree.length && (
-                      <tr><td colSpan={9} className="muted">{crmLoading ? "Loading from Engage…" : "No campaign codes match the filters."}</td></tr>
+                      <tr><td colSpan={9} className="muted">No campaign codes match the filters.</td></tr>
                     )}
                   </tbody>
                 </table>

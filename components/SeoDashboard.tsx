@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, useTransition } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import ChartBox from "@/components/Chart";
 import HelpTip from "@/components/HelpTip";
@@ -64,7 +64,9 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
   const [loading, setLoading] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
 
-  // Leads load SEPARATELY (slow Metabase view) so it can't stall PostHog/GSC.
+  // Leads come from the slow Metabase view, but are committed together with the
+  // PostHog/GSC half so the page never paints one range's traffic beside another
+  // range's leads. See loadAll below.
   const [leads, setLeads] = useState<LeadsData | null>(null);
   const [leadsLoading, setLeadsLoading] = useState(true);
 
@@ -77,46 +79,64 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
 
   const rangeQs = useCallback(() => `from=${from}&to=${to}`, [from, to]);
 
-  // fast half — PostHog + GSC
-  const load = useCallback(async (qs: string) => {
-    setLoading(true);
+  // Pure fetchers — no state writes, so the caller controls when data appears.
+  const fetchTraffic = useCallback(async (qs: string): Promise<SeoData | null> => {
     try {
       const res = await fetch(`/api/seo?${qs}`, { cache: "no-store" });
       const json = await res.json();
-      if (res.ok && json && json.traffic) {
-        setData(json as SeoData);
-        setUpdatedAt(new Date().toLocaleTimeString());
-      } else {
-        console.error("[seo] refresh returned an error", json?.error ?? res.status);
-      }
+      if (res.ok && json && json.traffic) return json as SeoData;
+      console.error("[seo] refresh returned an error", json?.error ?? res.status);
+      return null;
     } catch (e) {
       console.error("[seo] refresh failed", e);
-    } finally {
-      setLoading(false);
+      return null;
     }
   }, []);
 
-  // slow half — Metabase leads (independent request)
-  const loadLeads = useCallback(async (qs: string) => {
-    setLeadsLoading(true);
-    // A fresh payload carries no audit rows, so collapse the table rather than
-    // leaving it open and empty against the previous range.
-    setAuditOpen(false);
+  const fetchLeads = useCallback(async (qs: string): Promise<LeadsData> => {
     try {
       const res = await fetch(`/api/seo/leads?${qs}`, { cache: "no-store" });
       const json = await res.json();
-      if (res.ok && json && typeof json.connected === "boolean") setLeads(json as LeadsData);
-      else {
-        console.error("[seo] leads returned an error", json?.error ?? res.status);
-        setLeads(emptyLeads(json?.error || `HTTP ${res.status}`));
-      }
+      if (res.ok && json && typeof json.connected === "boolean") return json as LeadsData;
+      console.error("[seo] leads returned an error", json?.error ?? res.status);
+      return emptyLeads(json?.error || `HTTP ${res.status}`);
     } catch (e) {
       console.error("[seo] leads fetch failed", e);
-      setLeads(emptyLeads(String(e)));
-    } finally {
-      setLeadsLoading(false);
+      return emptyLeads(String(e));
     }
   }, []);
+
+  /**
+   * Fetch the fast half (PostHog + GSC) and the slow half (the Metabase leads
+   * view) concurrently, then commit both at once.
+   *
+   * They used to land independently, so a refresh repainted the traffic numbers
+   * and left the lead numbers to arrive seconds later — the page filled in in
+   * stages and looked, briefly, like it was reporting a different range for each
+   * half. The sequence guard stops an older in-flight load from overwriting a
+   * newer one when the range is changed twice quickly.
+   */
+  const seq = useRef(0);
+  const loadAll = useCallback(
+    async (qs: string) => {
+      const mine = ++seq.current;
+      setLoading(true);
+      setLeadsLoading(true);
+      // A fresh payload carries no audit rows, so collapse the table rather than
+      // leaving it open and empty against the previous range.
+      setAuditOpen(false);
+      const [traffic, leadRows] = await Promise.all([fetchTraffic(qs), fetchLeads(qs)]);
+      if (mine !== seq.current) return; // superseded
+      if (traffic) {
+        setData(traffic);
+        setUpdatedAt(new Date().toLocaleTimeString());
+      }
+      setLeads(leadRows);
+      setLeadsLoading(false);
+      setLoading(false);
+    },
+    [fetchTraffic, fetchLeads],
+  );
 
   /**
    * Buy / rent filter for the individual-property card. Rows come from PostHog
@@ -186,21 +206,17 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
   // mount effect, which is the intended behaviour here, not a cascading render.
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    loadLeads(rangeQs());
+    loadAll(rangeQs());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function applyRange(f: string, t: string) {
     setFrom(f);
     setTo(t);
-    const qs = `from=${f}&to=${t}`;
-    load(qs);
-    loadLeads(qs);
+    loadAll(`from=${f}&to=${t}`);
   }
   function refresh() {
-    const qs = rangeQs();
-    load(qs);
-    loadLeads(qs);
+    loadAll(rangeQs());
   }
   function saveKeywords() {
     setKwMsg(null);
@@ -210,7 +226,7 @@ export default function SeoDashboard({ initial }: { initial: SeoData }) {
       setKwMsg(r.ok ? "Saved — refreshing rankings…" : r.error);
       if (r.ok) {
         router.refresh();
-        load(rangeQs());
+        loadAll(rangeQs());
       }
     });
   }
