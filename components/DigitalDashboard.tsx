@@ -32,8 +32,47 @@ const GOAL_COLOR: Record<CampaignGoal, string> = {
 };
 
 const norm = (s: string) => s.toLowerCase().trim();
-/** A lead still in play. Closed = dropped/lost, and drops out of the funnel. */
-const inPlay = (state: string) => norm(state) !== "closed";
+
+/**
+ * Which bucket a lead falls in, from its stage and state together.
+ *
+ * 'notq' is the disqualified bucket as defined by the business: a lead that sat
+ * at New, Qualified or Viewing and was then CLOSED. Those are not qualified
+ * leads — counting them as qualified would flatter every stage — but they are
+ * not nothing either, so they get their own bucket rather than being discarded.
+ *
+ * 'lost' is a lead closed further down (Offer, Reserved, Deal). It is out of the
+ * forward funnel but is deliberately NOT folded into 'notq', which is defined
+ * only over the three early stages.
+ *
+ * Completed counts as in play — a completed Deal is a won deal, not a lost one.
+ */
+export type StageBucket = "new" | "qualified" | "viewing" | "offerRes" | "deal" | "notq" | "lost" | "other";
+export function bucketOf(stage: string, state: string): StageBucket {
+  const st = norm(stage);
+  const early = st === "new" || st === "qualified" || st === "viewing";
+  if (norm(state) === "closed") return early ? "notq" : "lost";
+  if (st === "new") return "new";
+  if (st === "qualified") return "qualified";
+  if (st === "viewing") return "viewing";
+  if (st === "offer" || st === "reserved") return "offerRes";
+  if (st === "deal") return "deal";
+  return "other";
+}
+/** In the forward funnel — i.e. still live, neither disqualified nor lost. */
+const isOpen = (b: StageBucket) => b !== "notq" && b !== "lost";
+
+/** The pickable lead-stage filter values. */
+type StageFilter = "all" | StageBucket;
+const STAGE_FILTERS: { key: StageFilter; label: string }[] = [
+  { key: "all", label: "All stages" },
+  { key: "new", label: "New" },
+  { key: "qualified", label: "Qualified" },
+  { key: "viewing", label: "Viewing" },
+  { key: "offerRes", label: "Offer / Reserved" },
+  { key: "deal", label: "Deal" },
+  { key: "notq", label: "Not qualified" },
+];
 
 /**
  * Does a utm_source spelling belong to a platform? Matches the spellings seen
@@ -52,17 +91,32 @@ const LEVEL_LABEL: Record<PaidLevel, string> = { campaign: "Campaigns", adset: "
 const DEPTH: Record<PaidLevel, number> = { campaign: 0, adset: 1, ad: 2 };
 
 type CrmJoin = { leads: number; qualified: number; deals: number };
-type StageAgg = { leads: number; qualified: number; viewing: number; offerRes: number; deals: number };
+type StageAgg = {
+  /** Every row counted, whatever its bucket — the total after filtering. */
+  matched: number;
+  /** Still in the forward funnel (not disqualified, not lost). */
+  leads: number;
+  newLeads: number;
+  qualified: number;
+  viewing: number;
+  offerRes: number;
+  deals: number;
+  notq: number;
+  lost: number;
+};
 
-const emptyStages = (): StageAgg => ({ leads: 0, qualified: 0, viewing: 0, offerRes: 0, deals: 0 });
+const emptyStages = (): StageAgg => ({ matched: 0, leads: 0, newLeads: 0, qualified: 0, viewing: 0, offerRes: 0, deals: 0, notq: 0, lost: 0 });
 function addStage(a: StageAgg, stage: string, state: string, n: number) {
-  if (!inPlay(state)) return;
-  a.leads += n;
-  const st = norm(stage);
-  if (st === "qualified") a.qualified += n;
-  else if (st === "viewing") a.viewing += n;
-  else if (st === "offer" || st === "reserved") a.offerRes += n;
-  else if (st === "deal") a.deals += n;
+  const b = bucketOf(stage, state);
+  a.matched += n;
+  if (isOpen(b)) a.leads += n;
+  if (b === "new") a.newLeads += n;
+  else if (b === "qualified") a.qualified += n;
+  else if (b === "viewing") a.viewing += n;
+  else if (b === "offerRes") a.offerRes += n;
+  else if (b === "deal") a.deals += n;
+  else if (b === "notq") a.notq += n;
+  else if (b === "lost") a.lost += n;
 }
 
 // ─── Trend bucketing ─────────────────────────────────────────────────────────
@@ -149,7 +203,6 @@ function FilterSelect({
   options,
   onToggle,
   onClear,
-  width = 190,
 }: {
   label: string;
   /** Empty means "all" — no narrowing on this dimension. */
@@ -157,7 +210,6 @@ function FilterSelect({
   options: [string, number][];
   onToggle: (v: string) => void;
   onClear: () => void;
-  width?: number;
 }) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -181,17 +233,17 @@ function FilterSelect({
         : `${label}: ${selected.length} selected`;
 
   return (
-    <div ref={boxRef} style={{ position: "relative", width }}>
+    <div ref={boxRef} style={{ position: "relative", minWidth: 0 }}>
       <button
         className={`search-box${selected.length ? " active" : ""}`}
-        style={{ width: "100%", textAlign: "left", cursor: "pointer", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: selected.length ? 600 : 400 }}
+        style={{ width: "100%", minWidth: 0, textAlign: "left", cursor: "pointer", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: selected.length ? 600 : 400 }}
         onClick={() => { setOpen((v) => !v); setSearch(""); }}
         title={selected.length ? `${label}: ${selected.join(", ")}` : `${label}: all`}
       >
         {summary} <span className="muted">▾</span>
       </button>
       {open && (
-        <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 40, width: Math.max(width, 300), maxHeight: 320, overflowY: "auto", background: "#fff", border: "1px solid var(--border)", borderRadius: 8, boxShadow: "0 6px 18px rgba(0,0,0,.08)", padding: 6 }}>
+        <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 40, width: 320, maxWidth: "90vw", maxHeight: 320, overflowY: "auto", background: "#fff", border: "1px solid var(--border)", borderRadius: 8, boxShadow: "0 6px 18px rgba(0,0,0,.08)", padding: 6 }}>
           <input
             autoFocus
             className="search-box"
@@ -273,6 +325,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   const [utmSrcs, setUtmSrcs] = useState<string[]>([]);
   const [utmMeds, setUtmMeds] = useState<string[]>([]);
   const [utmContents, setUtmContents] = useState<string[]>([]);
+  const [stageFilter, setStageFilter] = useState<StageFilter>("all");
   const toggleIn = (setter: (f: (prev: string[]) => string[]) => void) => (v: string) =>
     setter((prev) => (prev.includes(v) ? prev.filter((x) => x !== v) : [...prev, v]));
   const [q, setQ] = useState("");
@@ -515,10 +568,11 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
           (!activeCamps.length || activeCamps.includes(norm(r.campaign))) &&
           (!activeSrcs.length || activeSrcs.includes(norm(r.source))) &&
           (!activeMeds.length || activeMeds.includes(norm(r.medium))) &&
-          (!activeContents.length || activeContents.includes(norm(r.content))),
+          (!activeContents.length || activeContents.includes(norm(r.content))) &&
+          (stageFilter === "all" || bucketOf(r.stage, r.state) === stageFilter),
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [crmBase, campsKey, srcsKey, medsKey, contentsKey],
+    [crmBase, campsKey, srcsKey, medsKey, contentsKey, stageFilter],
   );
 
   const utmFiltersIdle =
@@ -530,17 +584,54 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
    * button leads carrying no utm) are included; any UTM filter narrows to
    * utm-tagged leads by construction.
    */
-  const crmAgg = useMemo(() => {
-    const agg = emptyStages();
+  /**
+   * The rows the funnel and its hover breakdown are both built from — so the
+   * tooltip can never disagree with the bar it belongs to.
+   *
+   * With only codes selected these are the membership rows, which include the
+   * code's untagged leads (WhatsApp/email buttons); otherwise they are the
+   * per-lead utm rows.
+   */
+  const funnelRows = useMemo(() => {
     if (activeCodes.length && utmFiltersIdle) {
       const chosen = new Set(activeCodes);
-      for (const r of crm?.codeRows ?? []) if (chosen.has(norm(r.code))) addStage(agg, r.stage, r.state, r.n);
-    } else {
-      for (const r of crmFiltered) addStage(agg, r.stage, r.state, r.n);
+      return (crm?.codeRows ?? [])
+        .filter((r) => chosen.has(norm(r.code)) && (stageFilter === "all" || bucketOf(r.stage, r.state) === stageFilter))
+        .map((r) => ({ campaign: r.campaign, stage: r.stage, state: r.state, n: r.n }));
     }
-    return agg;
+    return crmFiltered.map((r) => ({ campaign: r.campaign, stage: r.stage, state: r.state, n: r.n }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [crm?.codeRows, codesKey, utmFiltersIdle, crmFiltered]);
+  }, [crm?.codeRows, codesKey, utmFiltersIdle, crmFiltered, stageFilter]);
+
+  const crmAgg = useMemo(() => {
+    const agg = emptyStages();
+    for (const r of funnelRows) addStage(agg, r.stage, r.state, r.n);
+    return agg;
+  }, [funnelRows]);
+
+  /**
+   * Top campaigns per funnel bucket, for the hover breakdown. Built from the
+   * same rows as the bar heights, so a bar of 14 always breaks down to 14.
+   */
+  const funnelTop = useMemo(() => {
+    const acc = new Map<StageBucket | "leads", Map<string, number>>();
+    const bump = (k: StageBucket | "leads", camp: string, n: number) => {
+      const m = acc.get(k) ?? new Map<string, number>();
+      m.set(camp, (m.get(camp) ?? 0) + n);
+      acc.set(k, m);
+    };
+    for (const r of funnelRows) {
+      const b = bucketOf(r.stage, r.state);
+      const camp = r.campaign || "(none)";
+      bump(b, camp, r.n);
+      if (isOpen(b)) bump("leads", camp, r.n);
+    }
+    const out = {} as Record<string, { campaign: string; n: number }[]>;
+    for (const [k, m] of acc) {
+      out[k] = [...m].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([campaign, n]) => ({ campaign, n }));
+    }
+    return out;
+  }, [funnelRows]);
 
   /**
    * Do the selected codes share leads?
@@ -569,13 +660,13 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   const crmByCampaign = useMemo(() => {
     const m = new Map<string, CrmJoin>();
     for (const r of crmFiltered) {
-      if (!inPlay(r.state)) continue;
+      const b = bucketOf(r.stage, r.state);
+      if (!isOpen(b)) continue;
       const k = norm(r.campaign);
       const cur = m.get(k) ?? { leads: 0, qualified: 0, deals: 0 };
       cur.leads += r.n;
-      const st = norm(r.stage);
-      if (st === "qualified") cur.qualified += r.n;
-      if (st === "deal") cur.deals += r.n;
+      if (b === "qualified") cur.qualified += r.n;
+      if (b === "deal") cur.deals += r.n;
       m.set(k, cur);
     }
     return m;
@@ -594,15 +685,25 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   // ── Funnel ──────────────────────────────────────────────────────────────────
   const funnel = useMemo(
     () => [
-      { label: "Leads", n: crmAgg.leads, note: "campaign-tagged, not closed" },
-      { label: "Qualified", n: crmAgg.qualified, note: "at Qualified now" },
-      { label: "Viewing", n: crmAgg.viewing, note: "at Viewing now" },
-      { label: "Offer / Reserved", n: crmAgg.offerRes, note: "in negotiation" },
-      { label: "Deal", n: crmAgg.deals, note: "reached Deal stage" },
+      { key: "leads" as const, label: "Leads", n: crmAgg.leads, note: "campaign-tagged, still live", lost: false },
+      { key: "qualified" as const, label: "Qualified", n: crmAgg.qualified, note: "at Qualified now", lost: false },
+      { key: "viewing" as const, label: "Viewing", n: crmAgg.viewing, note: "at Viewing now", lost: false },
+      { key: "offerRes" as const, label: "Offer / Reserved", n: crmAgg.offerRes, note: "in negotiation", lost: false },
+      { key: "deal" as const, label: "Deal", n: crmAgg.deals, note: "reached Deal stage", lost: false },
+      { key: "notq" as const, label: "Not qualified", n: crmAgg.notq, note: "closed at New / Qualified / Viewing", lost: true },
     ],
     [crmAgg],
   );
-  const funnelMax = Math.max(...funnel.map((s) => s.n), 1);
+  // Scale on the live funnel only: a big disqualified count would otherwise
+  // flatten every bar above it.
+  const funnelMax = Math.max(...funnel.filter((s) => !s.lost).map((s) => s.n), 1);
+  const [hoverStage, setHoverStage] = useState<string | null>(null);
+
+  // With a stage filter on, "Leads" would read 0 for a disqualified-only view,
+  // so the card names what it is actually counting.
+  const stageLabel = STAGE_FILTERS.find((f) => f.key === stageFilter)?.label ?? "All stages";
+  const leadLabel = stageFilter === "all" ? "Leads" : `${stageLabel} leads`;
+  const leadCount = stageFilter === "all" ? crmAgg.leads : crmAgg.matched;
 
   const cur = totals.singleCurrency ?? "—";
   const cpl = crmAgg.leads > 0 && totals.singleCurrency ? totals.spend / crmAgg.leads : null;
@@ -728,6 +829,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
       const c = norm(r.code);
       if (activeCodes.length && !activeCodes.includes(c)) continue;
       if (activeCamps.length && !activeCamps.includes(norm(r.campaign))) continue;
+      if (stageFilter !== "all" && bucketOf(r.stage, r.state) !== stageFilter) continue;
       const needle = norm(q);
       if (needle && !c.includes(needle) && !norm(r.campaign).includes(needle)) continue;
       const entry = codes.get(c) ?? { agg: emptyStages(), campaigns: new Map<string, StageAgg>() };
@@ -747,7 +849,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
       .sort((a, b) => b.agg.leads - a.agg.leads)
       .slice(0, 40);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [crm?.codeRows, codesKey, campsKey, q, mediaIndex]);
+  }, [crm?.codeRows, codesKey, campsKey, q, mediaIndex, stageFilter]);
 
   const toggleNode = (key: string) =>
     setExpanded((s) => {
@@ -762,10 +864,11 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     viewLevel === "ad" ? [r.campaign, r.adset].filter(Boolean).join(" › ") : viewLevel === "adset" ? r.campaign : null;
 
   const filtersActive =
-    platformFilter !== "all" || activeCodes.length > 0 || activeCamps.length > 0 || activeSrcs.length > 0 ||
-    activeMeds.length > 0 || activeContents.length > 0 || q.trim() !== "";
+    platformFilter !== "all" || stageFilter !== "all" || activeCodes.length > 0 || activeCamps.length > 0 ||
+    activeSrcs.length > 0 || activeMeds.length > 0 || activeContents.length > 0 || q.trim() !== "";
   function clearAll() {
     setPlatformFilter("all");
+    setStageFilter("all");
     setCodes([]); setUtmCamps([]); setUtmSrcs([]); setUtmMeds([]); setUtmContents([]);
     setQ("");
   }
@@ -785,15 +888,14 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
       <td style={{ textAlign: "right" }}>{fmt(a.viewing)}</td>
       <td style={{ textAlign: "right" }}>{fmt(a.offerRes)}</td>
       <td style={{ textAlign: "right" }}>{fmt(a.deals)}</td>
+      <td style={{ textAlign: "right", color: a.notq ? C.coral : undefined }}>{fmt(a.notq)}</td>
     </>
   );
   const emptyStageCells = (
     <>
-      <td style={{ textAlign: "right" }} className="muted">—</td>
-      <td style={{ textAlign: "right" }} className="muted">—</td>
-      <td style={{ textAlign: "right" }} className="muted">—</td>
-      <td style={{ textAlign: "right" }} className="muted">—</td>
-      <td style={{ textAlign: "right" }} className="muted">—</td>
+      {Array.from({ length: 6 }).map((_, i) => (
+        <td key={i} style={{ textAlign: "right" }} className="muted">—</td>
+      ))}
     </>
   );
 
@@ -908,29 +1010,51 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
             </div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8, alignItems: "center" }}>
               <span className="muted" style={{ fontSize: 11 }}>
-                Engage <HelpTip text="Straight from Engage: campaign_code is the campaign entity's reference (a code groups several utm_campaigns); the four utm_* fields are what each lead's record carries. All five are searchable and interlinked — each offers only values that exist under the other active filters." />
+                Lead stage <HelpTip text="Narrows every CRM figure to leads sitting in one stage. 'Not qualified' is a lead that was at New, Qualified or Viewing and then closed — disqualified rather than progressed. Leads closed further down (Offer, Reserved, Deal) are counted as lost, not as not-qualified." />
               </span>
-              <FilterSelect label="campaign_code" selected={activeCodes} options={codeOptions} onToggle={toggleIn(setCodes)} onClear={() => setCodes([])} width={230} />
-              <FilterSelect label="utm_campaign" selected={activeCamps} options={campOptions} onToggle={toggleIn(setUtmCamps)} onClear={() => setUtmCamps([])} width={230} />
-              <FilterSelect label="utm_source" selected={activeSrcs} options={srcOptions} onToggle={toggleIn(setUtmSrcs)} onClear={() => setUtmSrcs([])} width={170} />
-              <FilterSelect label="utm_medium" selected={activeMeds} options={medOptions} onToggle={toggleIn(setUtmMeds)} onClear={() => setUtmMeds([])} width={165} />
-              <FilterSelect label="utm_content" selected={activeContents} options={contentOptions} onToggle={toggleIn(setUtmContents)} onClear={() => setUtmContents([])} width={190} />
-              <input className="search-box" style={{ flex: 1, minWidth: 150 }} placeholder="Search everything…" value={q} onChange={(e) => setQ(e.target.value)} />
+              {STAGE_FILTERS.map((sf) => (
+                <button
+                  key={sf.key}
+                  className={`filter-btn${stageFilter === sf.key ? " active" : ""}`}
+                  onClick={() => setStageFilter(sf.key)}
+                  style={stageFilter === sf.key && sf.key === "notq" ? { background: C.coral, borderColor: C.coral } : undefined}
+                >
+                  {sf.label}
+                </button>
+              ))}
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8 }}>
+              <span className="muted" style={{ fontSize: 11, whiteSpace: "nowrap" }}>
+                Engage <HelpTip text="Straight from Engage: campaign_code is the campaign entity's reference (a code groups several utm_campaigns); the four utm_* fields are what each lead's record carries. All five are multi-select, searchable and interlinked — each offers only values that exist under the other active filters." />
+              </span>
+            </div>
+            {/* A wrapping grid, not a flex row: `.search-box` carries a 240px
+                floor, so six controls on one line overflowed the card and left
+                the search box a sliver. */}
+            <div className="filter-grid" style={{ marginTop: 6 }}>
+              <FilterSelect label="campaign_code" selected={activeCodes} options={codeOptions} onToggle={toggleIn(setCodes)} onClear={() => setCodes([])} />
+              <FilterSelect label="utm_campaign" selected={activeCamps} options={campOptions} onToggle={toggleIn(setUtmCamps)} onClear={() => setUtmCamps([])} />
+              <FilterSelect label="utm_source" selected={activeSrcs} options={srcOptions} onToggle={toggleIn(setUtmSrcs)} onClear={() => setUtmSrcs([])} />
+              <FilterSelect label="utm_medium" selected={activeMeds} options={medOptions} onToggle={toggleIn(setUtmMeds)} onClear={() => setUtmMeds([])} />
+              <FilterSelect label="utm_content" selected={activeContents} options={contentOptions} onToggle={toggleIn(setUtmContents)} onClear={() => setUtmContents([])} />
+              <input className="search-box" placeholder="Search everything…" value={q} onChange={(e) => setQ(e.target.value)} />
             </div>
           </div>
 
           {/* ── KPIs ─────────────────────────────────────────────────────────── */}
-          <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(3,1fr)" }}>
+          <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(4,1fr)" }}>
             <div className="kpi-card">
               <div className="kpi-label">Spend <HelpTip text={totals.singleCurrency ? `Media spend for the current filters, in ${totals.singleCurrency}.` : "The filtered accounts bill in more than one currency; the split is shown below and nothing is summed across currencies."} /></div>
               <div className="kpi-value">{totals.singleCurrency ? money(totals.spend, cur) : <span style={{ fontSize: 15 }}>Mixed currency</span>}</div>
             </div>
             <div className="kpi-card">
-              <div className="kpi-label">Leads <HelpTip text="Campaign-tagged leads created in the CRM in this range, excluding closed ones. With only a campaign_code selected this includes the code's untagged leads (WhatsApp/email buttons); UTM filters narrow to tagged leads. Source: Engage via Metabase." /></div>
-              <div className="kpi-value" style={{ color: C.green }}>{crm?.error && !crm.rows.length ? "—" : fmt(crmAgg.leads)}</div>
+              <div className="kpi-label">
+                {leadLabel} <HelpTip text="Campaign-tagged leads created in the CRM in this range, excluding disqualified and lost ones. With only a campaign_code selected this includes the code's untagged leads (WhatsApp/email buttons); UTM filters narrow to tagged leads. Source: Engage via Metabase." />
+              </div>
+              <div className="kpi-value" style={{ color: C.green }}>{crm?.error && !crm.rows.length ? "—" : fmt(leadCount)}</div>
             </div>
             <div className="kpi-card">
-              <div className="kpi-label">Qualified <HelpTip text="Leads sitting at the Qualified stage right now, still open. Closed leads are dropped." /></div>
+              <div className="kpi-label">Qualified <HelpTip text="Leads sitting at the Qualified stage right now, still open." /></div>
               <div className="kpi-value">{fmt(crmAgg.qualified)}</div>
             </div>
             <div className="kpi-card">
@@ -938,8 +1062,18 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
               <div className="kpi-value">{fmt(crmAgg.viewing)}</div>
             </div>
             <div className="kpi-card">
-              <div className="kpi-label">Deal stage <HelpTip text="Leads currently at the Deal stage of the pipeline (not closed). A stage snapshot — not the same as a signed transaction in the deals table." /></div>
+              <div className="kpi-label">Offer / Reserved <HelpTip text="Leads in negotiation — at the Offer or Reserved stage, still open." /></div>
+              <div className="kpi-value">{fmt(crmAgg.offerRes)}</div>
+            </div>
+            <div className="kpi-card">
+              <div className="kpi-label">Deal stage <HelpTip text="Leads currently at the Deal stage of the pipeline. A stage snapshot — not the same as a signed transaction in the deals table." /></div>
               <div className="kpi-value">{fmt(crmAgg.deals)}</div>
+            </div>
+            <div className="kpi-card">
+              <div className="kpi-label">
+                Not qualified <HelpTip text="Leads that sat at New, Qualified or Viewing and were then closed — disqualified rather than progressed. Leads closed further down the pipeline count as lost instead, and are shown in the funnel note." />
+              </div>
+              <div className="kpi-value" style={{ color: C.coral }}>{fmt(crmAgg.notq)}</div>
             </div>
             <div className="kpi-card">
               <div className="kpi-label">Cost / lead <HelpTip text={totals.singleCurrency ? "Filtered spend divided by leads, and by currently-qualified leads." : "Hidden while the filtered accounts span multiple currencies."} /></div>
@@ -971,7 +1105,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
               Lead funnel <HelpTip text="Campaign-tagged CRM leads by the pipeline stage they sit at today, closed leads dropped. Each stage shows its share of leads." />
             </div>
             <div className="chart-sub">
-              {crm?.error && !crm.rows.length ? `CRM unavailable: ${crm.error}` : `${fmt(crmAgg.leads)} open leads${activeCodes.length === 1 ? ` · code ${activeCodes[0]}` : activeCodes.length > 1 ? ` · ${activeCodes.length} codes` : ""} · ${crm?.label ?? ""}${crm?.truncated ? " · largest groups only (row cap hit)" : ""}${crm?.error ? ` · ${crm.error}` : ""}`}
+              {crm?.error && !crm.rows.length ? `CRM unavailable: ${crm.error}` : `${fmt(crmAgg.leads)} open leads${activeCodes.length === 1 ? ` · code ${activeCodes[0]}` : activeCodes.length > 1 ? ` · ${activeCodes.length} codes` : ""} · ${crm?.label ?? ""}${crmAgg.lost ? ` · ${fmt(crmAgg.lost)} closed later in the pipeline (lost)` : ""}${crm?.truncated ? " · largest groups only (row cap hit)" : ""}${crm?.error ? ` · ${crm.error}` : ""}`}
             </div>
             {codesOverlap && (
               <div className="chart-sub" style={{ marginTop: 8, color: C.coral }}>
@@ -981,21 +1115,51 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
               </div>
             )}
             <div style={{ display: "grid", gap: 6, marginTop: 12 }}>
-              {funnel.map((s, i) => (
-                <div key={s.label} style={{ display: "grid", gridTemplateColumns: "150px 1fr 170px", alignItems: "center", gap: 10 }}>
-                  <div style={{ fontSize: 12, fontWeight: 600, color: C.green }}>
-                    {s.label}
-                    <div className="muted" style={{ fontSize: 10, fontWeight: 400 }}>{s.note}</div>
+              {funnel.map((st, i) => {
+                const colour = st.lost ? C.coral : C.green;
+                const top = funnelTop[st.key] ?? [];
+                return (
+                  <div
+                    key={st.key}
+                    style={{ display: "grid", gridTemplateColumns: "minmax(120px,150px) 1fr minmax(130px,170px)", alignItems: "center", gap: 10, position: "relative", borderTop: st.lost ? "1px dashed var(--border)" : undefined, paddingTop: st.lost ? 8 : 0, marginTop: st.lost ? 4 : 0 }}
+                    onMouseEnter={() => setHoverStage(st.key)}
+                    onMouseLeave={() => setHoverStage(null)}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 600, color: colour }}>
+                      {st.label}
+                      <div className="muted" style={{ fontSize: 10, fontWeight: 400 }}>{st.note}</div>
+                    </div>
+                    <div style={{ background: "var(--warm-white)", borderRadius: 5, height: 26, position: "relative", overflow: "hidden", cursor: top.length ? "help" : "default" }}>
+                      <div style={{ width: `${Math.max((st.n / funnelMax) * 100, st.n > 0 ? 1.5 : 0)}%`, background: colour, opacity: i === 0 ? 0.9 : 0.7, height: "100%", borderRadius: 5, transition: "width .3s" }} />
+                    </div>
+                    <div style={{ fontSize: 12, textAlign: "right" }}>
+                      <strong>{fmt(st.n)}</strong>
+                      {!st.lost && i > 0 && funnel[0].n > 0 && <span className="muted"> · {pct0(st.n / funnel[0].n)} of leads</span>}
+                      {st.lost && crmAgg.matched > 0 && <span className="muted"> · {pct0(st.n / crmAgg.matched)} of all</span>}
+                    </div>
+                    {/* Top campaigns behind this bar, from the same rows that set
+                        its height — so the breakdown always reconciles. */}
+                    {hoverStage === st.key && top.length > 0 && (
+                      <div style={{ position: "absolute", left: 150, top: "100%", zIndex: 30, minWidth: 300, maxWidth: 460, background: "#fff", border: "1px solid var(--border)", borderRadius: 8, boxShadow: "0 8px 22px rgba(0,0,0,.10)", padding: "8px 10px", pointerEvents: "none" }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6, color: colour }}>
+                          Top campaigns · {st.label}
+                        </div>
+                        {top.map((t) => (
+                          <div key={t.campaign} style={{ display: "flex", gap: 10, fontSize: 11, padding: "2px 0" }}>
+                            <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={t.campaign}>{t.campaign}</span>
+                            <strong>{fmt(t.n)}</strong>
+                          </div>
+                        ))}
+                        {st.n > top.reduce((a, t) => a + t.n, 0) && (
+                          <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
+                            + {fmt(st.n - top.reduce((a, t) => a + t.n, 0))} across other campaigns
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
-                  <div style={{ background: "var(--warm-white)", borderRadius: 5, height: 26, position: "relative", overflow: "hidden" }}>
-                    <div style={{ width: `${Math.max((s.n / funnelMax) * 100, s.n > 0 ? 1.5 : 0)}%`, background: C.green, opacity: i === 0 ? 0.9 : 0.7, height: "100%", borderRadius: 5, transition: "width .3s" }} />
-                  </div>
-                  <div style={{ fontSize: 12, textAlign: "right" }}>
-                    <strong>{fmt(s.n)}</strong>
-                    {i > 0 && funnel[0].n > 0 && <span className="muted"> · {pct0(s.n / funnel[0].n)} of leads</span>}
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
 
@@ -1022,6 +1186,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
                       <th style={{ textAlign: "right" }}>Viewing</th>
                       <th style={{ textAlign: "right" }}>Offer/Res.</th>
                       <th style={{ textAlign: "right" }}>Deal</th>
+                      <th style={{ textAlign: "right" }}>Not qual.</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1114,7 +1279,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
                       );
                     })}
                     {!tree.length && (
-                      <tr><td colSpan={9} className="muted">No campaign codes match the filters.</td></tr>
+                      <tr><td colSpan={10} className="muted">No campaign codes match the filters.</td></tr>
                     )}
                   </tbody>
                 </table>
@@ -1186,7 +1351,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
               <div className="chart-sub">
                 {totals.singleCurrency ? `Spend share by platform (${cur})` : "Impression share by platform — spend spans multiple currencies"} · and by campaign goal
               </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 8 }}>
                 <div className="chart-canvas-wrap">
                   {platformTable.list.some((p) => p.cost > 0 || p.impressions > 0) ? (
                     <ChartBox
