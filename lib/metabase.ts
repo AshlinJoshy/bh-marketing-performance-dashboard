@@ -211,6 +211,22 @@ export interface CampaignLeadCell {
   campaign: string;
   source: string;
   medium: string;
+  content: string;
+  stage: string;
+  state: string;
+  n: number;
+}
+/**
+ * One row per (lead, campaign-entity) membership. Engage attaches leads to
+ * campaign ENTITIES via lead_campaigns, and an entity's `reference` is the
+ * campaign_code. A lead typically links both to the entity mirroring its
+ * utm_campaign and to an umbrella project code, so these rows deliberately
+ * count a lead once per code — correct when reading one code, and exactly why
+ * the page-wide totals come from `rows` (one row per lead) instead.
+ */
+export interface CodeLeadCell {
+  code: string;
+  campaign: string;
   stage: string;
   state: string;
   n: number;
@@ -218,7 +234,10 @@ export interface CampaignLeadCell {
 export interface CampaignLeadsData {
   connected: boolean;
   label: string;
+  /** Per-lead groups over the utm tags — the page-wide truth. */
   rows: CampaignLeadCell[];
+  /** Per-(lead × code) groups — the campaign_code facet and the tree. */
+  codeRows: CodeLeadCell[];
   /** Hit the row cap — smallest groups are missing. */
   truncated: boolean;
   error?: string;
@@ -229,7 +248,7 @@ export async function getCampaignLeads(fromRaw: string, toRaw: string): Promise<
     process.env.METABASE_URL &&
     (process.env.METABASE_API_KEY || (process.env.METABASE_USERNAME && process.env.METABASE_PASSWORD))
   );
-  const base: CampaignLeadsData = { connected, label: `${fromRaw} → ${toRaw}`, rows: [], truncated: false };
+  const base: CampaignLeadsData = { connected, label: `${fromRaw} → ${toRaw}`, rows: [], codeRows: [], truncated: false };
   if (!connected) return base;
   if (!isDate(fromRaw) || !isDate(toRaw)) return { ...base, error: "bad date range" };
   if (!process.env.METABASE_API_KEY) {
@@ -238,30 +257,61 @@ export async function getCampaignLeads(fromRaw: string, toRaw: string): Promise<
       return { ...base, error: "Metabase login failed — check METABASE_URL / METABASE_USERNAME / METABASE_PASSWORD." };
     }
   }
-  const range = `created_at >= '${fromRaw} 00:00:00' AND created_at <= '${toRaw} 23:59:59'`;
-  const utmCampaign = utmJson("campaign");
-  // Same single-scan discipline as getLeadsData: one pass over the view, grouped
-  // by low-cardinality dimensions, roll-ups done by the caller.
-  const res = await mbQueryEx(
-    `SELECT COALESCE(NULLIF(TRIM(${utmCampaign}), ''), '(none)') camp, ` +
-      `COALESCE(NULLIF(TRIM(${utmSource}), ''), '(none)') src, ` +
-      `COALESCE(NULLIF(TRIM(${utmMedium}), ''), '(none)') med, ` +
-      `CAST(status AS CHAR) stage, CAST(state AS CHAR) st, COUNT(*) n ` +
-      `FROM leads WHERE ${range} AND ${utmCampaign} IS NOT NULL AND TRIM(${utmCampaign}) <> '' ` +
-      `GROUP BY 1,2,3,4,5 ORDER BY n DESC LIMIT 4000`,
-    true,
-    35000,
-  );
-  if ("error" in res) return { ...base, error: `Metabase reachable, but the campaign-leads query failed: ${res.error}` };
-  base.rows = res.rows.map((r) => ({
+  const range = `l.created_at >= '${fromRaw} 00:00:00' AND l.created_at <= '${toRaw} 23:59:59'`;
+  const j = (key: string) => `NULLIF(CASE WHEN JSON_VALID(l.utm) THEN LOWER(JSON_UNQUOTE(JSON_EXTRACT(l.utm,'$.${key}'))) END, 'null')`;
+  const clean = (e: string) => `COALESCE(NULLIF(TRIM(${e}), ''), '(none)')`;
+
+  // Two grouped reads of the same range, in parallel:
+  //  1. per-lead utm groups — page-wide totals, one row per lead, so nothing is
+  //     double-counted;
+  //  2. per-(lead × campaign-entity) groups via lead_campaigns → campaigns,
+  //     whose `reference` is the campaign_code. The LEFT JOINs keep utm-tagged
+  //     leads with no entity link, filed under '(unlinked)'.
+  const [utmRes, codeRes] = await Promise.all([
+    mbQueryEx(
+      `SELECT ${clean(j("campaign"))} camp, ${clean(j("source"))} src, ${clean(j("medium"))} med, ${clean(j("content"))} content, ` +
+        `CAST(l.status AS CHAR) stage, CAST(l.state AS CHAR) st, COUNT(*) n ` +
+        `FROM leads l WHERE ${range} AND ${j("campaign")} IS NOT NULL AND TRIM(${j("campaign")}) <> '' ` +
+        `GROUP BY 1,2,3,4,5,6 ORDER BY n DESC LIMIT 6000`,
+      true,
+      35000,
+    ),
+    mbQueryEx(
+      `SELECT COALESCE(NULLIF(TRIM(LOWER(c.reference)), ''), '(unlinked)') code, ${clean(j("campaign"))} camp, ` +
+        `CAST(l.status AS CHAR) stage, CAST(l.state AS CHAR) st, COUNT(*) n ` +
+        `FROM leads l ` +
+        `LEFT JOIN lead_campaigns lc ON lc.lead_id = l.id ` +
+        `LEFT JOIN campaigns c ON c.id = lc.campaign_id ` +
+        `WHERE ${range} AND (lc.lead_id IS NOT NULL OR ${j("campaign")} IS NOT NULL) ` +
+        `GROUP BY 1,2,3,4 ORDER BY n DESC LIMIT 6000`,
+      true,
+      35000,
+    ),
+  ]);
+  if ("error" in utmRes) return { ...base, error: `Metabase reachable, but the campaign-leads query failed: ${utmRes.error}` };
+  base.rows = utmRes.rows.map((r) => ({
     campaign: String(r[0] ?? ""),
     source: String(r[1] ?? ""),
     medium: String(r[2] ?? ""),
-    stage: String(r[3] ?? ""),
-    state: String(r[4] ?? ""),
-    n: Number(r[5] ?? 0),
+    content: String(r[3] ?? ""),
+    stage: String(r[4] ?? ""),
+    state: String(r[5] ?? ""),
+    n: Number(r[6] ?? 0),
   }));
-  base.truncated = base.rows.length >= 4000;
+  if ("error" in codeRes) {
+    // The utm half is still useful on its own; say what's missing instead of
+    // failing the whole payload.
+    base.error = `Campaign-code mapping unavailable: ${codeRes.error}`;
+  } else {
+    base.codeRows = codeRes.rows.map((r) => ({
+      code: String(r[0] ?? ""),
+      campaign: String(r[1] ?? ""),
+      stage: String(r[2] ?? ""),
+      state: String(r[3] ?? ""),
+      n: Number(r[4] ?? 0),
+    }));
+  }
+  base.truncated = base.rows.length >= 6000 || base.codeRows.length >= 6000;
   return base;
 }
 
