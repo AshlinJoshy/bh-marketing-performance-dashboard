@@ -104,13 +104,15 @@ export interface PaidData {
   /** Some account hit the 10k-row cap, so totals may undercount. */
   truncated: boolean;
   /**
-   * Daily series kept at (date × platform × goal) granularity so the client's
-   * dashboard-level filters apply to the trend charts too, instead of the trend
-   * silently ignoring them. `leads` is platform-reported: Meta website + form
-   * leads; Google/LinkedIn conversions (their lead proxy) — never link clicks,
-   * which are traffic, not leads.
+   * Daily series at (date × platform × campaign) granularity, so the trend
+   * charts narrow with the dashboard's campaign filters instead of quietly
+   * plotting every campaign whatever is selected. Carries campaignId as well,
+   * since Meta leads can join on either.
+   *
+   * `leads` is platform-reported: Meta website + form leads; Google/LinkedIn
+   * conversions (their lead proxy) — never link clicks, which are traffic.
    */
-  byDateFine: { date: string; platform: PaidPlatform; goal: CampaignGoal; cost: number; leads: number }[];
+  byDateFine: { date: string; platform: PaidPlatform; campaign: string; campaignId: string | null; cost: number; leads: number }[];
   /** Distinct currencies present. More than one means spend must not be summed. */
   currencies: string[];
   accountsUsed: PaidAccount[];
@@ -550,13 +552,13 @@ export async function getPaidData(fromRaw?: string, toRaw?: string, days = 30, l
 
   // Roll the per-day rows up to one row per campaign, and build the trend from
   // the same data before collapsing it.
-  const dayAcc = new Map<string, { date: string; platform: PaidPlatform; goal: CampaignGoal; cost: number; leads: number }>();
+  const dayAcc = new Map<string, { date: string; platform: PaidPlatform; campaign: string; campaignId: string | null; cost: number; leads: number }>();
   const campAcc = new Map<string, CampaignRow>();
   for (const r of rows) {
     const d = (r as CampaignRow & { _date?: string })._date;
     if (d) {
-      const k = `${d}|${r.platform}|${r.goal}`;
-      const cur = dayAcc.get(k) ?? { date: d, platform: r.platform, goal: r.goal, cost: 0, leads: 0 };
+      const k = `${d}|${r.platform}|${r.campaign}`;
+      const cur = dayAcc.get(k) ?? { date: d, platform: r.platform, campaign: r.campaign, campaignId: r.campaignId, cost: 0, leads: 0 };
       cur.cost += r.cost;
       cur.leads += r.platform === "meta" ? (r.websiteLeads ?? 0) + (r.facebookLeads ?? 0) : (r.conversions ?? 0);
       dayAcc.set(k, cur);
