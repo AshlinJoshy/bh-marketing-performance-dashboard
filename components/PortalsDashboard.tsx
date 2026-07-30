@@ -12,14 +12,18 @@
 // view. A rate rather than a month-exact lookup, so ranges the workbook doesn't
 // cover still cost something instead of silently reading as free.
 //
-// Only the range and brand refetch (they change the SQL). Spend recomputes
-// client-side, so editing a rate is instant.
+// Range, brand and the Sale/Leasing side all refetch — each changes the SQL on
+// both sides of every ratio. Spend recomputes client-side, so editing a rate is
+// instant.
+//
+// Area = locations.name, one level above communities: a community is a building
+// ("Al Meraikhi Tower"), a location is the area ("Dubai Marina"). See lib/portals.ts.
 import { useCallback, useMemo, useState } from "react";
 import ChartBox from "@/components/Chart";
 import HelpTip from "@/components/HelpTip";
 import DateRangePicker from "@/components/DateRangePicker";
 import { C } from "@/lib/theme";
-import type { PortalsData } from "@/lib/portals";
+import type { PortalsData, Side } from "@/lib/portals";
 import { SPEND_IS_MONTHLY, SPEND_MONTHS, SPEND_SOURCE_LABEL, avgMonthlySpend, avgMonthlySpendTotal } from "@/lib/portalSpend";
 
 const fmtInt = (n: number) => new Intl.NumberFormat("en-US").format(Math.round(n || 0));
@@ -77,6 +81,7 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
   const [from, setFrom] = useState(initial.from);
   const [to, setTo] = useState(initial.to);
   const [brand, setBrand] = useState(initial.brand);
+  const [side, setSide] = useState<Side>(initial.side);
 
   /**
    * Per-portal monthly spend override, AED. Empty = the real average from the
@@ -87,10 +92,10 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
   const [metric, setMetric] = useState<Metric>("leads");
   const [areaQuery, setAreaQuery] = useState("");
 
-  const load = useCallback(async (f: string, t: string, b: string) => {
+  const load = useCallback(async (f: string, t: string, b: string, sd: Side) => {
     setLoading(true);
     try {
-      const qs = new URLSearchParams({ from: f, to: t });
+      const qs = new URLSearchParams({ from: f, to: t, side: sd });
       if (b) qs.set("brand", b);
       const res = await fetch(`/api/portals?${qs}`, { cache: "no-store" });
       const j = (await res.json()) as PortalsData;
@@ -110,11 +115,16 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
   const pickRange = (f: string, t: string) => {
     setFrom(f);
     setTo(t);
-    load(f, t, brand);
+    load(f, t, brand, side);
   };
   const pickBrand = (b: string) => {
     setBrand(b);
-    load(from, to, b);
+    load(from, to, b, side);
+  };
+  /** Leasing / Sale changes the SQL on both sides of every ratio, so it refetches. */
+  const pickSide = (sd: Side) => {
+    setSide(sd);
+    load(from, to, brand, sd);
   };
 
   const rows = data.rows;
@@ -228,15 +238,19 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
     return q ? data.areas.filter((a) => a.area.toLowerCase().includes(q)) : data.areas;
   }, [data.areas, areaQuery]);
 
+  /** Shares are of the AREA-attributable total, not the headline deal count —
+   *  deals with no linked property have no area and would make the shares
+   *  silently sum to less than 100%. */
+  const areaDealTotal = useMemo(() => data.areas.reduce((s, a) => s + a.deals, 0), [data.areas]);
+  const topArea = data.areas.length ? data.areas[0] : null;
+
   const areaChart = useMemo(() => {
     const top = areas.slice(0, 15);
     return {
       labels: top.map((a) => a.area),
-      datasets: [{ label: "Listings", data: top.map((a) => a.listings), backgroundColor: C.blue, borderRadius: 4 }],
+      datasets: [{ label: "Deals", data: top.map((a) => a.deals), backgroundColor: C.blue, borderRadius: 4 }],
     };
   }, [areas]);
-
-  const totalListings = data.areas.reduce((s, a) => s + a.listings, 0);
 
   const baseOpts = {
     responsive: true,
@@ -261,6 +275,13 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
       {/* ── controls ─────────────────────────────────────────────── */}
       <div className="filter-grid" style={{ marginBottom: 18 }}>
         <DateRangePicker initialKey="this_year" initialFrom={from} initialTo={to} onApply={pickRange} />
+        <div style={{ display: "flex", gap: 4, alignSelf: "center" }} role="tablist" aria-label="Business side">
+          {([["all", "All"], ["sale", "Sale"], ["leasing", "Leasing"]] as [Side, string][]).map(([k, lbl]) => (
+            <button key={k} role="tab" aria-selected={side === k} className={`filter-btn${side === k ? " active" : ""}`} onClick={() => pickSide(k)}>
+              {lbl}
+            </button>
+          ))}
+        </div>
         <select className="search-box" style={{ width: 150 }} value={brand} onChange={(e) => pickBrand(e.target.value)} aria-label="Brand">
           {data.brands.map((b) => (
             <option key={b.key} value={b.key}>{b.label}</option>
@@ -308,12 +329,6 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
           {SPEND_MONTHS} months — right in size, assumed in shape. And an average rate means a range shorter
           than a full year won&apos;t reflect a mid-year rate change (Property Finder&apos;s April 2025 spike,
           Bayut&apos;s June 2025 increase); override the rate in the table to model a specific period.
-        </div>
-        <div style={{ fontSize: 11.5, color: C.mid, marginTop: 8 }}>
-          For the record, the CRM itself was searched for spend:{" "}
-          {data.spendCandidates.length === 0
-            ? "nothing in its schema names spend, cost, budget, invoice or subscription — the workbook is the only source."
-            : `possible fields exist (${data.spendCandidates.slice(0, 6).join(", ")}); the workbook is used in preference, but say the word and one of those can be read live instead.`}
         </div>
       </div>
 
@@ -450,18 +465,12 @@ Toggle &ldquo;Cost / deal&rdquo; in the legend — it&apos;s an order of magnitu
         </div>
       </div>
 
-      {/* ── listings by area ─────────────────────────────────────── */}
+      {/* ── areas, ranked by deals ───────────────────────────────── */}
       <div className="chart-card" style={{ marginBottom: 20 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 6 }}>
           <h3 style={{ margin: 0 }}>
-            Listings by area{" "}
-            <HelpTip
-              text={
-                data.areaSource
-                  ? `Live listings grouped by ${data.areaSource}, discovered from the database schema rather than hardcoded. Not filtered by the date range — a listing count is a snapshot of now, not a period total.`
-                  : "No area column could be found on properties or listings."
-              }
-            />
+            Areas by deals{" "}
+            <HelpTip text={`Portal deals grouped by area, biggest first. Area is ${data.areaSource} — properties sit in a community (a building or sub-development) which sits in a location, and the location is the area. Grouping by community would list towers, not areas. Deals and commission respect the date range; the listing count is a snapshot of now, because listing_portals keeps no history.`} />
           </h3>
           <input
             className="search-box"
@@ -472,35 +481,45 @@ Toggle &ldquo;Cost / deal&rdquo; in the legend — it&apos;s an order of magnitu
           />
         </div>
         <p style={{ fontSize: 11, color: C.mid, marginBottom: 10 }}>
-          {fmtInt(totalListings)} listings across {fmtInt(data.areas.length)} areas
-          {data.areaSource ? <> · grouped by <code>{data.areaSource}</code></> : null} · a snapshot of now, not
-          the selected period.
+          {topArea ? (
+            <>
+              <strong>{topArea.area}</strong> leads on {fmtInt(topArea.deals)} deals ({fmtAED(topArea.commission)}) ·{" "}
+            </>
+          ) : null}
+          {fmtInt(areas.length)} areas · grouped by <code>{data.areaSource}</code>
         </p>
-        {data.listingsNote && (
-          <p style={{ fontSize: 12, color: C.amber, marginBottom: 10 }}>⚠ {data.listingsNote}</p>
-        )}
         {areas.length === 0 ? (
-          <p style={{ fontSize: 13, color: C.mid }}>No areas to show.</p>
+          <p style={{ fontSize: 13, color: C.mid }}>No areas to show for this selection.</p>
         ) : (
           <>
-            <div style={{ height: 300, marginBottom: 14 }}>
-              <ChartBox type="bar" data={areaChart} options={{ ...baseOpts, indexAxis: "y" as const, plugins: { legend: { display: false } } }} />
+            <div style={{ height: 320, marginBottom: 14 }}>
+              <ChartBox
+                type="bar"
+                data={areaChart}
+                options={{ ...baseOpts, indexAxis: "y" as const, plugins: { legend: { display: false } } }}
+              />
             </div>
-            <div style={{ overflowX: "auto", maxHeight: 320, overflowY: "auto" }}>
-              <table className="perf-table" style={{ minWidth: 320 }}>
+            <div style={{ overflowX: "auto", maxHeight: 340, overflowY: "auto" }}>
+              <table className="perf-table" style={{ minWidth: 520 }}>
                 <thead>
                   <tr>
                     <th>Area</th>
-                    <th>Listings</th>
-                    <th>Share</th>
+                    <th>Deals</th>
+                    <th>Share of deals</th>
+                    <th>Gross commission</th>
+                    <th>Comm / deal</th>
+                    <th>Listings live</th>
                   </tr>
                 </thead>
                 <tbody>
                   {areas.map((a) => (
                     <tr key={a.area}>
                       <td>{a.area}</td>
-                      <td>{fmtInt(a.listings)}</td>
-                      <td>{totalListings ? fmtPct(a.listings / totalListings) : "—"}</td>
+                      <td>{fmtInt(a.deals)}</td>
+                      <td>{areaDealTotal ? fmtPct(a.deals / areaDealTotal) : "—"}</td>
+                      <td style={{ color: C.green }}>{fmtAED(a.commission)}</td>
+                      <td>{a.deals > 0 ? fmtAEDExact(a.commission / a.deals) : "—"}</td>
+                      <td>{a.listings ? fmtInt(a.listings) : "—"}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -510,27 +529,34 @@ Toggle &ldquo;Cost / deal&rdquo; in the legend — it&apos;s an order of magnitu
         )}
       </div>
 
-      {/* ── what ISN'T counted as a portal ───────────────────────── */}
-      {data.unmappedSources.length > 0 && (
-        <div className="chart-card">
+      {/* ── how portal_id was resolved, and what stayed unmapped ── */}
+      {(data.portalIdsAssumed || data.unmappedPortalIds.length > 0) && (
+        <div className="chart-card" style={{ borderColor: C.sand }}>
           <h3 style={{ marginBottom: 4 }}>
-            Other lead sources, not counted as portals <HelpTip text="Every enquiry_source in this period that isn't Property Finder, Bayut or Dubizzle. Listed so a portal we haven't mapped — a new one, or a spelling variant — shows up as a number to ask about instead of quietly missing from the figures above." />
+            How listings were attributed to portals{" "}
+            <HelpTip text="This database has no portals lookup table, so listing_portals.portal_id had to be resolved from the data itself. Shown here because the listing counts depend on it." />
           </h3>
-          <p style={{ fontSize: 11, color: C.mid, marginBottom: 10 }}>
-            If a portal is missing from the table above, it will be in this list. Tell me which and it gets mapped.
-          </p>
-          <div style={{ overflowX: "auto", maxHeight: 260, overflowY: "auto" }}>
-            <table className="perf-table" style={{ minWidth: 300 }}>
-              <thead><tr><th>enquiry_source</th><th>Leads</th></tr></thead>
-              <tbody>
-                {data.unmappedSources.map((s) => (
-                  <tr key={s.source}><td>{s.source}</td><td>{fmtInt(s.n)}</td></tr>
-                ))}
-              </tbody>
-            </table>
+          <div style={{ fontSize: 12, color: C.mid, lineHeight: 1.6 }}>
+            Listing counts come from <code>listing_portals</code> where <code>status = &apos;Published&apos;</code>. There
+            is no portals lookup table, so <code>portal_id</code> was resolved from evidence:{" "}
+            <strong>1 → Property Finder</strong> (its external ids are 26-character ULIDs, a format no other portal
+            uses, and it shares ids with none of them). <strong>2 → Bayut, 3 → Dubizzle</strong> — those two carry
+            8-digit numeric ids from one range and share the same id on 2,576 listings, which is Bayut and dubizzle
+            being one platform. Which of the pair is which <em>cannot</em> be derived; 2 has more published listings
+            (3,541 vs 2,523), matching Bayut&apos;s far larger spend, so 2 is taken as Bayut.{" "}
+            <strong>If that&apos;s the wrong way round, set <code>ENGAGE_PORTAL_IDS=1=Property Finder,2=Dubizzle,3=Bayut</code></strong>{" "}
+            and it flips without a deploy.
+            {data.unmappedPortalIds.length > 0 && (
+              <>
+                {" "}Also present but unmapped:{" "}
+                {data.unmappedPortalIds.map((u) => `portal_id ${u.id} (${fmtInt(u.published)} published)`).join(", ")} —
+                left out rather than guessed. Tell me what they are and they can be added.
+              </>
+            )}
           </div>
         </div>
       )}
+
         </>
       )}
     </>

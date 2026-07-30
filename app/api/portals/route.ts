@@ -9,8 +9,9 @@ export async function GET(req: Request) {
   const from = searchParams.get("from") || undefined;
   const to = searchParams.get("to") || undefined;
   const brand = searchParams.get("brand") || undefined;
+  const side = searchParams.get("side") || undefined;
   try {
-    const data = await getPortalsData(from, to, brand);
+    const data = await getPortalsData(from, to, brand, side);
     return Response.json(data, { headers: { "cache-control": "no-store" } });
   } catch (e) {
     console.error(`[api/portals] ${e instanceof Error ? e.message : String(e)}`);

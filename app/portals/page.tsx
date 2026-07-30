@@ -16,8 +16,8 @@ export default async function PortalsPage() {
     <>
       <div className="page-title">Portals</div>
       <div className="page-sub">
-        Property Finder, Bayut and Dubizzle — leads, deals and commission from the CRM, with cost per lead
-        and cost per deal against an assumed spend.
+        Property Finder, Bayut and Dubizzle — leads, deals and commission from the CRM against actual portal
+        spend, split by Sale and Leasing, and ranked by the areas producing the deals.
       </div>
       <PortalsDashboard initial={initial} />
     </>
