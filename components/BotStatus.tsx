@@ -12,12 +12,30 @@ function ago(iso: string): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
+/**
+ * The schedule in vercel.json, stated here so the UI can't drift from it. The
+ * cron is "17 2 * * *" UTC; Dubai is UTC+4, so 06:17 local.
+ */
+const SCHEDULE_LABEL = "daily at 06:17 Dubai";
+
+/**
+ * Flag a run that's older than the schedule should allow.
+ *
+ * This exists because the old label just read "runs on demand", which was
+ * accurate but meant a bot that had silently stopped looked identical to one
+ * working normally — the only clue being a number of days most people wouldn't
+ * question. 30h gives the daily run a 6h grace window for retries and drift.
+ */
+const STALE_AFTER_H = 30;
+const hoursSince = (iso: string) => (Date.now() - new Date(iso).getTime()) / 3.6e6;
+
 export default function BotStatus({ runs }: { runs: IngestRun[] }) {
   const [running, setRunning] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const logRef = useRef<HTMLDivElement>(null);
   const router = useRouter();
   const last = runs[0];
+  const stale = !!last && hoursSince(last.ran_at) > STALE_AFTER_H;
 
   async function run() {
     setRunning(true);
@@ -69,12 +87,22 @@ export default function BotStatus({ runs }: { runs: IngestRun[] }) {
         <div className="bot-left">
           <span className="pulse-dot" />
           <div>
-            <div className="bot-title">News bot {last && !last.ok ? "⚠️" : ""}</div>
+            <div className="bot-title">
+              News bot {last && !last.ok ? "⚠️" : ""}
+              {stale ? <span title={`No run in over ${STALE_AFTER_H}h — the schedule may not be firing.`}> ⏰</span> : null}
+            </div>
             <div className="bot-sub">
               {last
-                ? `Last run ${ago(last.ran_at)} · +${last.inserted} new · ${last.updated} dated · runs on demand`
-                : "Hasn't run yet · click Run now"}
+                ? `Last run ${ago(last.ran_at)} · +${last.inserted} new · ${last.updated} dated · ${SCHEDULE_LABEL}`
+                : `Hasn't run yet · scheduled ${SCHEDULE_LABEL} · or click Run now`}
             </div>
+            {stale && (
+              <div className="bot-sub" style={{ color: "var(--red)" }}>
+                Overdue — expected {SCHEDULE_LABEL}, but the last run was {ago(last!.ran_at)}. If this persists,
+                CRON_SECRET is probably missing from the Vercel environment: the endpoint answers 401 without it and
+                the scheduled run fails silently.
+              </div>
+            )}
           </div>
         </div>
         <div className="bot-right">
