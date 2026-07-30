@@ -24,7 +24,7 @@ import HelpTip from "@/components/HelpTip";
 import DateRangePicker from "@/components/DateRangePicker";
 import { C } from "@/lib/theme";
 import type { PortalsData, Side } from "@/lib/portals";
-import { SPEND_IS_MONTHLY, SPEND_MONTHS, SPEND_SOURCE_LABEL, avgMonthlySpend, avgMonthlySpendTotal } from "@/lib/portalSpend";
+import { SPEND_MONTHS, SPEND_SOURCE_LABEL, avgMonthlySpend, avgMonthlySpendTotal } from "@/lib/portalSpend";
 
 const fmtInt = (n: number) => new Intl.NumberFormat("en-US").format(Math.round(n || 0));
 const fmtAED = (n: number) => {
@@ -274,7 +274,7 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
     <>
       {/* ── controls ─────────────────────────────────────────────── */}
       <div className="filter-grid" style={{ marginBottom: 18 }}>
-        <DateRangePicker initialKey="this_year" initialFrom={from} initialTo={to} onApply={pickRange} />
+        <DateRangePicker initialKey="custom" initialFrom={from} initialTo={to} onApply={pickRange} />
         <div style={{ display: "flex", gap: 4, alignSelf: "center" }} role="tablist" aria-label="Business side">
           {([["all", "All"], ["sale", "Sale"], ["leasing", "Leasing"]] as [Side, string][]).map(([k, lbl]) => (
             <button key={k} role="tab" aria-selected={side === k} className={`filter-btn${side === k ? " active" : ""}`} onClick={() => pickSide(k)}>
@@ -307,30 +307,6 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
           <strong style={{ color: C.red }}>CRM error.</strong> <span style={{ fontSize: 13 }}>{data.error}</span>
         </div>
       )}
-      {data.warnings.map((w) => (
-        <div key={w} className="chart-card" style={{ marginBottom: 12, borderColor: C.amber }}>
-          <span style={{ fontSize: 13 }}>⚠ {w}</span>
-        </div>
-      ))}
-
-      {/* ── where spend comes from ─────────────────────────────── */}
-      <div className="chart-card" style={{ marginBottom: 18, borderColor: C.sage, background: "#f8fbf8" }}>
-        <div style={{ fontSize: 13, lineHeight: 1.6 }}>
-          <strong>Spend is actual, not assumed.</strong> Monthly portal spend comes from{" "}
-          <strong>{SPEND_SOURCE_LABEL}</strong> — {fmtAED(avgMonthlySpendTotal())}/month on average across the
-          three portals ({fmtAED(avgMonthlySpendTotal() * 12)} a year). Each portal&apos;s average rate is
-          applied to the <strong>{monthCount} month{monthCount === 1 ? "" : "s"}</strong> in view, giving{" "}
-          <strong>{fmtAED(tot.spend)}</strong>. Deals, leads and commission are live CRM figures, so cost per
-          deal divides measured spend by a measured deal count.
-        </div>
-        <div style={{ fontSize: 12, color: C.mid, marginTop: 10, paddingTop: 10, borderTop: "1px solid var(--border)" }}>
-          <strong>Two caveats.</strong> Property Finder and Bayut have true month-by-month schedules; Dubizzle
-          appears in the workbook only as a period total, so its monthly figure is that total spread evenly over{" "}
-          {SPEND_MONTHS} months — right in size, assumed in shape. And an average rate means a range shorter
-          than a full year won&apos;t reflect a mid-year rate change (Property Finder&apos;s April 2025 spike,
-          Bayut&apos;s June 2025 increase); override the rate in the table to model a specific period.
-        </div>
-      </div>
 
       {/* ── KPIs ─────────────────────────────────────────────────── */}
       <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(4,1fr)", marginBottom: 18 }}>
@@ -397,9 +373,6 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
                       style={{ width: 82, textAlign: "right", fontSize: 11, padding: "2px 4px", border: "1px solid var(--border)", borderRadius: 4 }}
                       aria-label={`${r.portal} monthly spend in AED`}
                     />
-                    {!SPEND_IS_MONTHLY[r.portal] && (
-                      <span title="Period total spread evenly — the workbook has no monthly column for this portal." style={{ fontSize: 10, color: C.amber, marginLeft: 4 }}>~</span>
-                    )}
                   </td>
                   <td>{fmtAED(r.spend)}</td>
                   <td>{fmtAEDExact(r.cpl)}</td>
@@ -557,6 +530,50 @@ Toggle &ldquo;Cost / deal&rdquo; in the legend — it&apos;s an order of magnitu
         </div>
       )}
 
+      {/* ── notes, deliberately last: context, not headline ─────── */}
+      <div className="chart-card" style={{ marginTop: 20 }}>
+        <h3 style={{ marginBottom: 8 }}>Notes</h3>
+        <ul style={{ fontSize: 12, color: C.mid, lineHeight: 1.7, paddingLeft: 18, margin: 0 }}>
+          {data.warnings.map((w) => (
+            <li key={w} style={{ color: C.amber }}>{w}</li>
+          ))}
+          <li>
+            <strong>Spend source.</strong> Monthly portal spend is actual, from {SPEND_SOURCE_LABEL} —{" "}
+            {fmtAED(avgMonthlySpendTotal())}/month on average across the three portals (
+            {fmtAED(avgMonthlySpendTotal() * 12)} a year). Each portal&apos;s average rate is applied to the{" "}
+            {monthCount} month{monthCount === 1 ? "" : "s"} in view, giving {fmtAED(tot.spend)}. Deals, leads and
+            commission are live CRM figures, so cost per deal divides a measured spend by a measured deal count.
+          </li>
+          <li>
+            <strong>Dubizzle&apos;s monthly figure is derived.</strong> Property Finder and Bayut have true
+            month-by-month schedules in the workbook; Dubizzle appears only as a period total, so its monthly rate is
+            that total spread evenly over {SPEND_MONTHS} months — right in size, assumed in shape.
+          </li>
+          <li>
+            <strong>An average rate smooths mid-year changes.</strong> A range shorter than a full year won&apos;t
+            reflect Property Finder&apos;s April 2025 spike or Bayut&apos;s June 2025 increase. Override a
+            portal&apos;s rate in the table above to model a specific period.
+          </li>
+          {monthCount > SPEND_MONTHS && (
+            <li>
+              <strong>This range runs past the spend schedule.</strong> The workbook covers {SPEND_MONTHS} months;
+              you have {monthCount} selected, so the later months carry the average rate rather than a recorded
+              figure.
+            </li>
+          )}
+          <li>
+            <strong>Deal counts here will not match the PPA workbook.</strong> The workbook holds about 4,600 deals
+            across all sources; the CRM has more than that from portals alone. This page uses the CRM definition —
+            status Reserved/Closed/Completed, not Withdrawn, dated by reservation — which reproduces the verified
+            &ldquo;Leads &amp; deals by channel&rdquo; report to the dirham (Jan 2025: 970 deals / AED 9,502,546).
+            The workbook&apos;s extract is narrower, so its cost per deal reads higher.
+          </li>
+          <li>
+            <strong>Lead → deal is a period ratio, not a cohort.</strong> A deal can be reserved in a later month
+            than its lead arrived, so it divides deals in the period by leads in the same period.
+          </li>
+        </ul>
+      </div>
         </>
       )}
     </>
