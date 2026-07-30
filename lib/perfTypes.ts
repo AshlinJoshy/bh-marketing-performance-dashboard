@@ -123,7 +123,9 @@ export const DEFAULT_PERF_CONFIG: PerfConfig = {
     instagram: "apify/instagram-profile-scraper",
     tiktok: "clockworks/tiktok-scraper",
     facebook: "apify/facebook-posts-scraper",
-    linkedin: "harvestapi/linkedin-post-search",
+    // A COMPANY-posts actor, not the post-SEARCH one: search returns anyone's
+    // posts that mention the brand, which is not what a brand benchmark measures.
+    linkedin: "harvestapi/linkedin-company-posts",
   },
   defaults: { window: "month", maxItems: 24 },
 };

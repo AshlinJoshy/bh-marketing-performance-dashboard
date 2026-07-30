@@ -48,6 +48,37 @@ async function loadConfig(db: any): Promise<PerfConfig> {
 }
 
 // Plain-English "why it failed + what to do", shown under the error in the log.
+/**
+ * How many simultaneous Apify actor runs we allow.
+ *
+ * Apify caps the TOTAL memory reserved across an account's running actors (16 GB
+ * on the plan this uses) and refuses the next launch with HTTP 402
+ * "actor-memory-limit-exceeded" rather than queueing it. At ~4 GB reserved per
+ * run that is four at once, so four is the default. Raise it via env if the
+ * Apify plan's memory goes up.
+ */
+const MAX_APIFY_RUNS = Math.max(1, Number(process.env.SOCIAL_MAX_APIFY_RUNS || 4));
+
+/** Actor runs each platform launches per account — Facebook needs page stats too. */
+const RUNS_PER_ACCOUNT: Record<PerfPlatform, number> = {
+  instagram: 1,
+  tiktok: 1,
+  facebook: 2,
+  linkedin: 1,
+};
+
+/** Run `fn` over `items` with at most `limit` in flight. Order of completion is free. */
+async function mapLimit<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
+
 function failureHint(platform: string, msg: string): string {
   const m = msg.toLowerCase();
   if (m.includes("timed out")) return "the actor ran past its time budget. Lower Items/platform or disable it; it retries next run.";
@@ -193,12 +224,16 @@ export async function runPerfIngest(
   // Platform-major: finish a whole platform (all brands) before the next, so a
   // completed platform is fully comparable even if we later run out of time.
   //
-  // Within a platform the accounts run CONCURRENTLY. They're independent — one
-  // Apify run and one upsert each — and running them serially was what made the
-  // whole job miss its deadline: 16 accounts sharing 285s left ~18s apiece, and
-  // one slow Facebook page would eat the remainder so later platforms never ran.
-  // Concurrency doesn't change the number of actor runs, so it costs no extra
-  // Apify credit; it just stops them queueing behind each other.
+  // Within a platform the accounts run CONCURRENTLY — they're independent, one
+  // upsert each — because running them serially made the job miss its deadline:
+  // 16 accounts sharing 285s left ~18s apiece, and one slow Facebook page ate
+  // the remainder so later platforms never ran. Concurrency doesn't change the
+  // number of actor runs, so it costs no extra Apify credit.
+  //
+  // But it IS capped, because Apify bills memory across all your simultaneous
+  // runs and rejects the next launch with HTTP 402 once they exceed the account
+  // limit. So the cap is on concurrent ACTOR RUNS, not accounts — Facebook
+  // launches two per account (posts + page stats), so it gets half the fan-out.
   for (const platform of platforms) {
     const actor = cfg.actors[platform];
     const accounts = brands.filter((b) => (b.handles?.[platform] ?? "").trim());
@@ -212,12 +247,15 @@ export async function runPerfIngest(
       p(`⏱ Time budget reached — ${platform} and any platform after it were skipped (run again to continue).`);
       break;
     }
-    p(`▶ ${platform} — ${accounts.length} account(s) via ${actor}, in parallel`);
 
-    // Every account in the platform gets the whole remaining window: they run
-    // together, so the platform takes as long as its slowest account, not the sum.
+    const limit = Math.max(1, Math.floor(MAX_APIFY_RUNS / RUNS_PER_ACCOUNT[platform]));
+    const lanes = Math.min(limit, accounts.length);
+    p(`▶ ${platform} — ${accounts.length} account(s) via ${actor}, ${lanes} at a time`);
+
+    // Accounts in a lane get the whole remaining window: they run together, so a
+    // wave takes as long as its slowest account rather than the sum.
     const timeoutMs = Math.min(120_000, remaining - 8_000);
-    await Promise.all(accounts.map((brand) => runAccount(platform, actor, brand, timeoutMs)));
+    await mapLimit(accounts, lanes, (brand) => runAccount(platform, actor, brand, timeoutMs));
   }
 
   if (runId != null) {

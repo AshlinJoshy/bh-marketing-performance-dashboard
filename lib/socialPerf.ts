@@ -130,22 +130,25 @@ function toFacebookUrl(handle: string): string {
   return `https://www.facebook.com/${h.replace(/^@/, "").replace(/\/+$/, "")}`;
 }
 /**
- * Turn a LinkedIn company URL or slug into a search phrase.
+ * Reduce a LinkedIn company URL to its bare slug, which is what a company-posts
+ * actor identifies a page by.
  *
- * The actor is a POST SEARCH, not a page scraper — it wants a company name, so
- * a raw slug ("allsopp-&-allsopp") searches badly. Hyphens become spaces to
- * recover the name. Any regional host (ae./uk./de.linkedin.com) is stripped
- * too: LinkedIn serves the same page under every country subdomain, so a URL
- * copied from a local search result must not leak "ae.linkedin.com" into the
- * query.
+ * Hyphens are KEPT — the slug is an identifier, not a search phrase. Any
+ * regional host (ae./uk./de.linkedin.com) is stripped: LinkedIn serves the same
+ * page under every country subdomain, so a URL copied out of a local search
+ * result must not carry "ae.linkedin.com" into the actor input.
  */
-function toLinkedInQuery(handle: string): string {
+function toLinkedInCompany(handle: string): string {
   return handle
     .trim()
     .replace(/^https?:\/\/([a-z]{2}\.|www\.)?linkedin\.com\/(company|in|school)\//i, "")
     .replace(/[/?#].*$/, "")
-    .replace(/-+/g, " ")
     .trim();
+}
+
+/** Window start as YYYY-MM-DD, for actors that can filter server-side. */
+function windowStartISO(window: TimeWindow): string {
+  return new Date(Date.now() - WINDOW_DAYS[window] * 864e5).toISOString().slice(0, 10);
 }
 
 // ── mapping helpers ─────────────────────────────────────────────
@@ -300,19 +303,33 @@ async function scrapeFacebook(actor: string, handle: string, ctx: PerfScrapeCtx)
 }
 
 async function scrapeLinkedIn(actor: string, handle: string, ctx: PerfScrapeCtx): Promise<PerfScrapeResult> {
-  // Best-effort: public LinkedIn exposes no play counts and follower counts are
-  // unreliable via search. We pull the company's recent posts by name and read
-  // reactions/comments; plays stay null.
-  const query = toLinkedInQuery(handle);
+  // `companies`, NOT `searchQueries`. The old input ran a KEYWORD SEARCH across
+  // all of LinkedIn, so it returned whatever posts happened to mention the brand
+  // — anyone's posts, not the company's. Every brand came back with exactly
+  // maxItems posts and no follower count, which is the signature of that bug.
+  //
+  // A company-posts actor takes the page itself and returns its own posts plus
+  // the company profile (which carries the follower count).
+  const company = toLinkedInCompany(handle);
   const items = await runApify(
     actor,
-    { searchQueries: [query], maxPosts: ctx.maxItems, sortBy: "date", profileScraperMode: "short" },
+    {
+      companies: [company],
+      maxPosts: ctx.maxItems,
+      postedLimitDate: windowStartISO(ctx.window),
+      includeReposts: false, // a repost isn't the brand's own content
+      includeQuotePosts: true,
+    },
     ctx.timeoutMs,
   );
   let followers: number | null = null;
   const posts: RawPerfPost[] = [];
   for (const it of items) {
-    const f = firstNumOrNull(it, ["followers", "followerCount", "companyFollowers"]);
+    // The actor merges company profile + posts, so the follower count can sit on
+    // the item, on a nested company object, or arrive as its own profile-only row.
+    const f =
+      firstNumOrNull(it, ["followers", "followerCount", "followersCount", "companyFollowers"]) ??
+      firstNumOrNull(it.company ?? it.companyProfile ?? it.author ?? {}, ["followers", "followerCount", "followersCount"]);
     if (f != null && followers == null) followers = f;
     const content = firstStr(it, ["content", "text", "postContent", "description"]);
     if (!content) continue;
@@ -331,7 +348,10 @@ async function scrapeLinkedIn(actor: string, handle: string, ctx: PerfScrapeCtx)
       caption: content,
     });
   }
-  return { followers, posts };
+  const note = posts.length
+    ? undefined
+    : `no posts returned for company "${company}" — check the LinkedIn slug in Advanced`;
+  return { followers, posts, note };
 }
 
 const SCRAPERS: Record<PerfPlatform, (actor: string, handle: string, ctx: PerfScrapeCtx) => Promise<PerfScrapeResult>> = {
