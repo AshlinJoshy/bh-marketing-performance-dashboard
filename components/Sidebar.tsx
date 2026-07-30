@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
+import { useCallback, useState } from "react";
 
 type NavItem = { href: string; label: string; icon: string; soon?: boolean };
 
@@ -18,6 +19,30 @@ const NAV: NavItem[] = [
 
 export default function Sidebar() {
   const pathname = usePathname();
+  const router = useRouter();
+  /**
+   * Routes already warmed. State, not a ref: the prefetch prop is read during
+   * render, and refs must not be.
+   */
+  const [warmed, setWarmed] = useState<ReadonlySet<string>>(() => new Set());
+
+  /**
+   * Warm a tab when the pointer reaches it, rather than warming all of them on
+   * load. Every tab is force-dynamic, so a prefetch is a real server render —
+   * six of those fired eagerly would mean six Metabase and Supermetrics reads
+   * per visit for tabs nobody opened. On intent it's one, for a tab about to be
+   * opened, and it makes the click feel instant.
+   */
+  const warm = useCallback(
+    (href: string) => {
+      if (href === pathname || warmed.has(href)) return;
+      // Outside the updater on purpose: a state updater must be pure, and
+      // StrictMode invokes it twice — which would fire two prefetches.
+      router.prefetch(href);
+      setWarmed((prev) => new Set(prev).add(href));
+    },
+    [router, pathname, warmed],
+  );
 
   return (
     <div id="sidebar">
@@ -37,7 +62,16 @@ export default function Sidebar() {
             );
           }
           return (
-            <Link key={item.href} href={item.href} className={`nav-item${active ? " active" : ""}`}>
+            <Link
+              key={item.href}
+              href={item.href}
+              className={`nav-item${active ? " active" : ""}`}
+              // false until intent, then null restores Next's default prefetch.
+              prefetch={warmed.has(item.href) ? null : false}
+              onMouseEnter={() => warm(item.href)}
+              onFocus={() => warm(item.href)}
+              onTouchStart={() => warm(item.href)}
+            >
               {item.icon} <span>{item.label}</span>
             </Link>
           );
