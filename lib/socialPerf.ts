@@ -123,6 +123,24 @@ function toFacebookUrl(handle: string): string {
   if (/^https?:\/\//i.test(h)) return h;
   return `https://www.facebook.com/${h.replace(/^@/, "").replace(/\/+$/, "")}`;
 }
+/**
+ * Turn a LinkedIn company URL or slug into a search phrase.
+ *
+ * The actor is a POST SEARCH, not a page scraper — it wants a company name, so
+ * a raw slug ("allsopp-&-allsopp") searches badly. Hyphens become spaces to
+ * recover the name. Any regional host (ae./uk./de.linkedin.com) is stripped
+ * too: LinkedIn serves the same page under every country subdomain, so a URL
+ * copied from a local search result must not leak "ae.linkedin.com" into the
+ * query.
+ */
+function toLinkedInQuery(handle: string): string {
+  return handle
+    .trim()
+    .replace(/^https?:\/\/([a-z]{2}\.|www\.)?linkedin\.com\/(company|in|school)\//i, "")
+    .replace(/[/?#].*$/, "")
+    .replace(/-+/g, " ")
+    .trim();
+}
 
 // ── mapping helpers ─────────────────────────────────────────────
 function igType(raw: string | null): PostType {
@@ -234,7 +252,7 @@ async function scrapeLinkedIn(actor: string, handle: string, ctx: PerfScrapeCtx)
   // Best-effort: public LinkedIn exposes no play counts and follower counts are
   // unreliable via search. We pull the company's recent posts by name and read
   // reactions/comments; plays stay null.
-  const query = handle.replace(/^https?:\/\/(www\.)?linkedin\.com\/(company|in)\//i, "").replace(/\/+$/, "");
+  const query = toLinkedInQuery(handle);
   const items = await runApify(
     actor,
     { searchQueries: [query], maxPosts: ctx.maxItems, sortBy: "date", profileScraperMode: "short" },
