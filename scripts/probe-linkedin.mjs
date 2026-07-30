@@ -34,18 +34,26 @@ function bothForms(handle) {
 
 const { url, slug } = bothForms(RAW);
 
-// Only actor ids seen as real Apify store URLs — none invented.
+// KNOWN GOOD, confirmed against a live run: harvestapi/linkedin-company-posts
+// takes `targetUrls` and returned 5 real posts for better-homes-llc. It's first
+// so a re-run confirms the wiring in one attempt.
+//
+// The rest stay as fallbacks for when an actor changes. Heed the warning below:
+// this actor's schema declares NO required fields, so a wrong key is dropped and
+// the run SUCCEEDS with 0 rows. An EMPTY line here therefore means "wrong key OR
+// dead URL" — it is never proof the page is wrong. Apify bills for empty
+// queries too (~$0.001 each), so don't loop on this blindly.
 const CANDIDATES = [
+  ["harvestapi/linkedin-company-posts", { targetUrls: [url], maxPosts: MAX_POSTS }],
+  ["harvestapi/linkedin-company-posts", { targetUrls: [slug], maxPosts: MAX_POSTS }],
   ["harvestapi/linkedin-company-posts", { companies: [url], maxPosts: MAX_POSTS }],
-  ["harvestapi/linkedin-company-posts", { companies: [slug], maxPosts: MAX_POSTS }],
   ["harvestapi/linkedin-company-posts", { companyUrls: [url], maxPosts: MAX_POSTS }],
   ["harvestapi/linkedin-company-posts", { startUrls: [{ url }], maxPosts: MAX_POSTS }],
+  ["harvestapi/linkedin-post-search", { targetUrls: [url], maxPosts: MAX_POSTS }],
   ["harvestapi/linkedin-post-search", { authorsCompanies: [url], maxPosts: MAX_POSTS }],
-  ["harvestapi/linkedin-post-search", { authorsCompanies: [slug], maxPosts: MAX_POSTS }],
-  ["unseenuser/company-posts", { companies: [url], maxPosts: MAX_POSTS }],
+  ["unseenuser/company-posts", { targetUrls: [url], maxPosts: MAX_POSTS }],
   ["unseenuser/company-posts", { startUrls: [{ url }], maxPosts: MAX_POSTS }],
   ["calm_builder/linkedin-company-scraper", { startUrls: [{ url }], maxPosts: MAX_POSTS }],
-  ["calm_builder/linkedin-company-scraper", { companyUrls: [url], maxPosts: MAX_POSTS }],
 ];
 
 async function runActor(actor, input, timeoutMs) {

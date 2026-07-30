@@ -163,9 +163,47 @@ function toLinkedInCompanyUrl(handle: string): string {
  * deploy per attempt, so the row's own keys go in the log — that names the
  * fields to map instead of leaving it to be inferred.
  */
+/** Our window mapped to the LinkedIn actor's fixed postedLimit enum. */
+const LINKEDIN_POSTED_LIMIT: Record<TimeWindow, string> = {
+  month: "month",
+  quarter: "3months",
+  year: "year",
+};
+
+/**
+ * Read a follower count out of LinkedIn's author byline, e.g. "137,393 followers".
+ *
+ * The actor exposes no numeric follower field — only this formatted string — so
+ * it has to be parsed. The /follower/ guard matters: the same slot reads
+ * "12 employees" or a tagline on some pages, and storing an employee count as
+ * followers would silently corrupt every engagement rate computed from it.
+ */
+function followersFromInfo(info: unknown): number | null {
+  if (typeof info !== "string" || !/follower/i.test(info)) return null;
+  const m = info.replace(/,/g, "").match(/(\d+(?:\.\d+)?)\s*([KMB])?/i);
+  if (!m) return null;
+  const mult = { k: 1e3, m: 1e6, b: 1e9 }[(m[2] ?? "").toLowerCase()] ?? 1;
+  const n = Math.round(parseFloat(m[1]) * mult);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** Classify a LinkedIn post from the fields the actor actually returns. */
+function linkedInType(it: any, plays: number | null): PostType {
+  if (plays != null && plays > 0) return "video";
+  const images = Array.isArray(it.postImages) ? it.postImages.length : 0;
+  // A multi-page document (their PDF carousel) counts as a carousel, not an image.
+  if (it.document?.totalPageCount > 1 || images > 1) return "carousel";
+  if (images === 1 || it.document) return "image";
+  return "text";
+}
+
 function emptyNote(items: any[], target: string, kept: number): string | undefined {
   if (kept > 0) return undefined;
-  if (!items.length) return `the actor returned no rows at all for "${target}" — check the URL opens, and that this actor takes it as input`;
+  // Zero rows is NOT proof the page is wrong. Actors that declare no required
+  // input fields drop an unrecognised key and exit 0 with an empty dataset, so a
+  // schema mismatch and a dead URL look identical from out here — and Apify
+  // charges for the empty query either way. Name both suspects.
+  if (!items.length) return `the actor returned no rows at all for "${target}" — either the URL doesn't resolve, or this actor doesn't accept the input key we sent (it fails silently, not with an error)`;
   const keys = Object.keys(items[0] ?? {});
   const err = firstStr(items[0] ?? {}, ["error", "message", "errorMessage"]);
   if (err) return `the actor returned an error row for "${target}": ${err}`;
@@ -336,38 +374,46 @@ async function scrapeLinkedIn(actor: string, handle: string, ctx: PerfScrapeCtx)
   const items = await runApify(
     actor,
     {
-      companies: [company],
-      maxPosts: ctx.maxItems,
+      // `targetUrls` — verified against the actor's own input schema. Note it
+      // declares NO required array, so a wrong key is silently dropped and the
+      // run SUCCEEDS with zero rows: no validation error to read, and Apify
+      // still bills for the empty query. That is why three guessed key names
+      // (companies / companyUrls / startUrls) each looked like a dead page.
+      targetUrls: [company],
+      maxPosts: ctx.maxItems, // per URL; 0 would mean "all"
+      // Server-side window, so we don't pay per post for rows withinWindow()
+      // would throw away. Enum values are fixed by the schema.
+      postedLimit: LINKEDIN_POSTED_LIMIT[ctx.window],
       includeReposts: false, // a repost isn't the brand's own content
       includeQuotePosts: true,
-      // No date filter on purpose: withinWindow() already trims client-side, and
-      // a date the actor parses differently to us would silently drop everything
-      // — an empty result that looks exactly like a wrong URL.
     },
     ctx.timeoutMs,
   );
   let followers: number | null = null;
   const posts: RawPerfPost[] = [];
   for (const it of items) {
-    // The actor merges company profile + posts, so the follower count can sit on
-    // the item, on a nested company object, or arrive as its own profile-only row.
-    const f =
-      firstNumOrNull(it, ["followers", "followerCount", "followersCount", "companyFollowers"]) ??
-      firstNumOrNull(it.company ?? it.companyProfile ?? it.author ?? {}, ["followers", "followerCount", "followersCount"]);
-    if (f != null && followers == null) followers = f;
+    // Followers is a FORMATTED STRING on the post's author ("137,393 followers"),
+    // not a number anywhere — every numeric lookup missed it. It repeats on every
+    // row, so the first parse wins.
+    if (followers == null) followers = followersFromInfo(it.author?.info);
     const content = firstStr(it, ["content", "text", "postContent", "description"]);
     if (!content) continue;
     const posted = toISO(it.postedAt?.date ?? it.postedAtISO ?? it.date ?? it.time ?? it.publishedAt);
     if (!withinWindow(posted, ctx.window)) continue;
     const plays = firstNumOrNull(it, ["videoViewCount", "views", "impressions"]);
     posts.push({
-      external_id: firstStr(it, ["id", "urn", "linkedinUrl", "url"]),
+      external_id: firstStr(it, ["id", "entityId", "shareUrn", "urn", "linkedinUrl"]),
       url: firstStr(it, ["linkedinUrl", "url", "postUrl"]),
-      type: plays != null ? "video" : "text",
+      type: linkedInType(it, plays),
       posted_at: posted,
-      likes: num(it.engagement?.likes) || firstNum(it, ["reactions", "likes", "numLikes", "reactionsCount"]),
-      comments: num(it.engagement?.comments) || firstNum(it, ["comments", "numComments", "commentsCount"]),
-      shares: num(it.engagement?.shares) || firstNum(it, ["shares", "reposts"]),
+      // engagement.* is authoritative and read with ?? so a genuine 0 isn't
+      // treated as missing. The fallbacks deliberately exclude top-level
+      // `comments` and `reactions`: on this actor those are ARRAYS of comment and
+      // reaction objects, not counts, and Number([...]) would quietly yield 0 or
+      // a nonsense figure.
+      likes: firstNumOrNull(it.engagement ?? {}, ["likes"]) ?? firstNum(it, ["numLikes", "likesCount", "reactionsCount"]),
+      comments: firstNumOrNull(it.engagement ?? {}, ["comments"]) ?? firstNum(it, ["numComments", "commentsCount"]),
+      shares: firstNumOrNull(it.engagement ?? {}, ["shares"]) ?? firstNum(it, ["sharesCount", "reposts"]),
       plays,
       caption: content,
     });
