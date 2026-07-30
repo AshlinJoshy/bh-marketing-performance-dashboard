@@ -1,0 +1,44 @@
+# Run the LinkedIn actor hunt on a GitHub runner.
+#
+# Why a workflow: the sandbox this repo is developed in has api.apify.com blocked
+# by network policy, so actor candidates can't be tried there — only guessed at,
+# which has already been wrong three times. A runner has normal internet access,
+# so the probe can be run for real and its output read back from the job log.
+#
+# One-time setup: add APIFY_TOKEN under
+#   Settings → Secrets and variables → Actions → New repository secret
+# After that this can be triggered on demand with no further setup.
+name: Apify LinkedIn probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      handle:
+        description: "LinkedIn company URL or slug to probe"
+        required: false
+        default: "https://www.linkedin.com/company/better-homes-llc"
+      max_posts:
+        description: "Posts to request per attempt (small — this is a schema hunt)"
+        required: false
+        default: "5"
+
+# Read-only: the probe never writes to the database or changes app config.
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Probe LinkedIn actors
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          MAX_POSTS: ${{ inputs.max_posts }}
+        run: node scripts/probe-linkedin.mjs "${{ inputs.handle }}"
