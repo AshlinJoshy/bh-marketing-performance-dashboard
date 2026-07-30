@@ -3,21 +3,24 @@
 // Portals — the listing-portal channel (Property Finder, Bayut, Dubizzle) and
 // the unit economics of it.
 //
-// The CRM holds NO spend data, so spend is an input: an annual figure (default
-// AED 10M) pro-rated to the selected window and split across portals. Everything
-// derived from it — cost per lead, cost per deal, return on spend — is therefore
-// an ESTIMATE, and is labelled as one everywhere it appears. The alternative was
-// leaving the tab without unit economics at all, which is what Company
-// Performance does today.
+// Spend is REAL, from the PPA workbook's monthly expense schedule (see
+// lib/portalSpend.ts) — not an assumption. Only spend is taken from that
+// workbook; deals, leads and commission stay live from the CRM, so cost per deal
+// is a measured spend over a measured deal count and the two can't drift apart.
 //
-// Only the range and brand refetch (they change the SQL). Spend and its split
-// recompute client-side, so dragging the spend figure is instant.
+// Spend is applied as each portal's AVERAGE monthly rate times the months in
+// view. A rate rather than a month-exact lookup, so ranges the workbook doesn't
+// cover still cost something instead of silently reading as free.
+//
+// Only the range and brand refetch (they change the SQL). Spend recomputes
+// client-side, so editing a rate is instant.
 import { useCallback, useMemo, useState } from "react";
 import ChartBox from "@/components/Chart";
 import HelpTip from "@/components/HelpTip";
 import DateRangePicker from "@/components/DateRangePicker";
 import { C } from "@/lib/theme";
-import { DEFAULT_ANNUAL_SPEND, defaultSplit, spendForPeriod, type PortalsData } from "@/lib/portals";
+import type { PortalsData } from "@/lib/portals";
+import { SPEND_IS_MONTHLY, SPEND_MONTHS, SPEND_SOURCE_LABEL, avgMonthlySpend, avgMonthlySpendTotal } from "@/lib/portalSpend";
 
 const fmtInt = (n: number) => new Intl.NumberFormat("en-US").format(Math.round(n || 0));
 const fmtAED = (n: number) => {
@@ -75,11 +78,12 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
   const [to, setTo] = useState(initial.to);
   const [brand, setBrand] = useState(initial.brand);
 
-  // Spend inputs. Held as a string so a half-typed figure doesn't snap to 0.
-  const [annualStr, setAnnualStr] = useState(String(DEFAULT_ANNUAL_SPEND));
-  const annual = Math.max(0, Number(annualStr.replace(/[^0-9.]/g, "")) || 0);
-  /** Manual per-portal share overrides, as percentages. Empty = use the lead-share default. */
-  const [splitOverride, setSplitOverride] = useState<Record<string, string>>({});
+  /**
+   * Per-portal monthly spend override, AED. Empty = the real average from the
+   * PPA workbook. There is no single "total spend" input any more: spend is
+   * known per portal, so a total would have to be split by a guess.
+   */
+  const [rateOverride, setRateOverride] = useState<Record<string, string>>({});
   const [metric, setMetric] = useState<Metric>("leads");
   const [areaQuery, setAreaQuery] = useState("");
 
@@ -115,50 +119,41 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
 
   const rows = data.rows;
 
-  /** Effective share per portal: manual override where given, lead share otherwise. */
-  const shares = useMemo(() => {
-    const auto = defaultSplit(rows);
-    const manual: Record<string, number> = {};
-    let manualTotal = 0;
-    for (const r of rows) {
-      const raw = splitOverride[r.portal];
-      if (raw != null && raw !== "") {
-        const v = Math.max(0, Number(raw) || 0) / 100;
-        manual[r.portal] = v;
-        manualTotal += v;
-      }
-    }
-    const untouched = rows.filter((r) => manual[r.portal] == null);
-    // Whatever the manual entries didn't claim is shared out by lead weight, so
-    // the split always sums to 1 and spend is never quietly lost or doubled.
-    const remaining = Math.max(0, 1 - manualTotal);
-    const autoWeight = untouched.reduce((s, r) => s + (auto[r.portal] ?? 0), 0);
-    const out: Record<string, number> = { ...manual };
-    for (const r of untouched) {
-      out[r.portal] = autoWeight > 0 ? remaining * ((auto[r.portal] ?? 0) / autoWeight) : remaining / (untouched.length || 1);
-    }
-    return out;
-  }, [rows, splitOverride]);
+  /** Monthly rate per portal: the override if given, else the workbook average. */
+  const rateFor = useCallback(
+    (portal: string) => {
+      const raw = rateOverride[portal];
+      if (raw != null && raw !== "") return Math.max(0, Number(raw.replace(/[^0-9.]/g, "")) || 0);
+      return avgMonthlySpend(portal);
+    },
+    [rateOverride],
+  );
 
-  const periodSpend = spendForPeriod(annual, data.months.length);
+  const monthCount = data.months.length;
+  const anyOverride = Object.values(rateOverride).some((v) => v !== "");
 
-  /** Per-portal economics. Rates are null rather than 0 when the denominator is 0. */
+  /**
+   * Per-portal economics. Spend is the portal's monthly rate times the months in
+   * view — measured, not apportioned. Rates are null rather than 0 when the
+   * denominator is 0, so "no deals" never renders as "zero cost".
+   */
   const econ = useMemo(
     () =>
       rows.map((r) => {
-        const spend = periodSpend * (shares[r.portal] ?? 0);
+        const rate = rateFor(r.portal);
+        const spend = rate * monthCount;
         return {
           ...r,
+          rate,
           spend,
           cpl: r.leads > 0 ? spend / r.leads : null,
           cpd: r.deals > 0 ? spend / r.deals : null,
           conv: r.leads > 0 ? r.deals / r.leads : null,
           net: r.commission - spend,
           roas: spend > 0 ? r.commission / spend : null,
-          share: shares[r.portal] ?? 0,
         };
       }),
-    [rows, shares, periodSpend],
+    [rows, rateFor, monthCount],
   );
 
   const tot = useMemo(() => {
@@ -221,7 +216,7 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
     () => ({
       labels: econ.map((r) => r.portal),
       datasets: [
-        { label: "Estimated spend", data: econ.map((r) => r.spend), backgroundColor: C.sand, borderRadius: 4 },
+        { label: "Portal spend", data: econ.map((r) => r.spend), backgroundColor: C.sand, borderRadius: 4 },
         { label: "Gross commission", data: econ.map((r) => r.commission), backgroundColor: C.green, borderRadius: 4 },
       ],
     }),
@@ -271,19 +266,11 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
             <option key={b.key} value={b.key}>{b.label}</option>
           ))}
         </select>
-        <label className="search-box" style={{ display: "flex", alignItems: "center", gap: 6, width: 250 }}>
-          <span style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: ".5px", color: C.mid, whiteSpace: "nowrap" }}>
-            Annual spend
-          </span>
-          <input
-            value={annualStr}
-            onChange={(e) => setAnnualStr(e.target.value)}
-            inputMode="numeric"
-            style={{ border: 0, outline: "none", background: "transparent", width: "100%", fontSize: 12, color: C.dark }}
-            aria-label="Annual portal spend in AED"
-          />
-        </label>
-        <HelpTip text="Total portal spend for a full year, in AED. The CRM holds no spend data, so this is your figure — it defaults to AED 10M. It is pro-rated to the selected period by month count, so cost per lead stays comparable when you change the range." />
+        <span style={{ fontSize: 12, color: C.mid, alignSelf: "center" }}>
+          Spend: {fmtAED(avgMonthlySpendTotal())}/month avg
+          {anyOverride ? <strong style={{ color: C.amber }}> (edited)</strong> : null}
+        </span>
+        <HelpTip text={`Real monthly portal spend from ${SPEND_SOURCE_LABEL}. Each portal's average monthly rate is multiplied by the months in view. Override any portal's rate in the table below.`} />
       </div>
 
       {/* Everything below waits for the whole payload — a partial fill would show
@@ -305,33 +292,28 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
         </div>
       ))}
 
-      {/* ── the estimate banner. Every figure below leans on this. ── */}
-      <div className="chart-card" style={{ marginBottom: 18, borderColor: C.sand, background: "#fffdf7" }}>
+      {/* ── where spend comes from ─────────────────────────────── */}
+      <div className="chart-card" style={{ marginBottom: 18, borderColor: C.sage, background: "#f8fbf8" }}>
         <div style={{ fontSize: 13, lineHeight: 1.6 }}>
-          <strong>Cost figures are estimates.</strong> The CRM records no portal spend, so{" "}
-          <strong>{fmtAED(annual)}/year</strong> is an assumption — pro-rated to{" "}
-          <strong>{fmtAED(periodSpend)}</strong> over the {data.months.length} month
-          {data.months.length === 1 ? "" : "s"} in view, then split across portals. Leads, deals and
-          commission are live CRM figures; cost per lead, cost per deal and return on spend are derived
-          from the assumption and move with it.
+          <strong>Spend is actual, not assumed.</strong> Monthly portal spend comes from{" "}
+          <strong>{SPEND_SOURCE_LABEL}</strong> — {fmtAED(avgMonthlySpendTotal())}/month on average across the
+          three portals ({fmtAED(avgMonthlySpendTotal() * 12)} a year). Each portal&apos;s average rate is
+          applied to the <strong>{monthCount} month{monthCount === 1 ? "" : "s"}</strong> in view, giving{" "}
+          <strong>{fmtAED(tot.spend)}</strong>. Deals, leads and commission are live CRM figures, so cost per
+          deal divides measured spend by a measured deal count.
         </div>
-        {/* Result of actually looking for spend in the CRM, rather than assuming it isn't there. */}
         <div style={{ fontSize: 12, color: C.mid, marginTop: 10, paddingTop: 10, borderTop: "1px solid var(--border)" }}>
-          {data.spendCandidates.length === 0 ? (
-            <>
-              <strong>Checked:</strong> nothing in the CRM schema names spend, cost, budget, invoice or
-              subscription, so there is no recorded portal spend to read. The assumption above is the only
-              source available.
-            </>
-          ) : (
-            <>
-              <strong>Checked — possible spend fields exist:</strong>{" "}
-              <code style={{ fontSize: 11 }}>{data.spendCandidates.slice(0, 10).join(", ")}</code>
-              {data.spendCandidates.length > 10 ? ` (+${data.spendCandidates.length - 10} more)` : null}. None
-              are wired in — tell me which one holds portal spend and the estimate can be replaced with the
-              real figure.
-            </>
-          )}
+          <strong>Two caveats.</strong> Property Finder and Bayut have true month-by-month schedules; Dubizzle
+          appears in the workbook only as a period total, so its monthly figure is that total spread evenly over{" "}
+          {SPEND_MONTHS} months — right in size, assumed in shape. And an average rate means a range shorter
+          than a full year won&apos;t reflect a mid-year rate change (Property Finder&apos;s April 2025 spike,
+          Bayut&apos;s June 2025 increase); override the rate in the table to model a specific period.
+        </div>
+        <div style={{ fontSize: 11.5, color: C.mid, marginTop: 8 }}>
+          For the record, the CRM itself was searched for spend:{" "}
+          {data.spendCandidates.length === 0
+            ? "nothing in its schema names spend, cost, budget, invoice or subscription — the workbook is the only source."
+            : `possible fields exist (${data.spendCandidates.slice(0, 6).join(", ")}); the workbook is used in preference, but say the word and one of those can be read live instead.`}
         </div>
       </div>
 
@@ -342,10 +324,10 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
           { label: "Portal deals", value: fmtInt(tot.deals), tip: "Deals (Reserved/Closed/Completed, not Withdrawn) dated by reservation, whose originating lead came from a portal." },
           { label: "Lead → deal", value: fmtPct(tot.conv), tip: "Portal deals ÷ portal leads in the same period. A deal can be reserved in a later month than its lead arrived, so this is a period ratio, not a cohort conversion." },
           { label: "Gross commission", value: fmtAED(tot.commission), color: C.green, tip: "final_gross_commission_amount summed over portal deals." },
-          { label: "Estimated spend", value: fmtAED(tot.spend), tip: "Your annual figure pro-rated to this period." },
-          { label: "Cost / lead", value: fmtAEDExact(tot.cpl), tip: "Estimated spend ÷ portal leads. Estimate." },
-          { label: "Cost / deal", value: fmtAEDExact(tot.cpd), tip: "Estimated spend ÷ portal deals. Estimate." },
-          { label: "Return on spend", value: fmtX(tot.roas), color: (tot.roas ?? 0) >= 1 ? C.green : C.red, tip: "Gross commission ÷ estimated spend. Above 1× means commission exceeded the assumed spend. Estimate." },
+          { label: "Portal spend", value: fmtAED(tot.spend), tip: `Actual spend from ${SPEND_SOURCE_LABEL} — each portal's average monthly rate times the months in view.` },
+          { label: "Cost / lead", value: fmtAEDExact(tot.cpl), tip: "Portal spend ÷ portal leads." },
+          { label: "Cost / deal", value: fmtAEDExact(tot.cpd), tip: "Portal spend ÷ portal deals. Both sides measured: spend from the workbook, deals from the CRM." },
+          { label: "Return on spend", value: fmtX(tot.roas), color: (tot.roas ?? 0) >= 1 ? C.green : C.red, tip: "Gross commission ÷ portal spend. Above 1× means commission exceeded spend." },
         ].map((k) => (
           <div className="kpi-card" key={k.label}>
             <div className="kpi-label">
@@ -360,9 +342,8 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
       <div className="chart-card" style={{ marginBottom: 20 }}>
         <h3 style={{ marginBottom: 4 }}>By portal</h3>
         <p style={{ fontSize: 11, color: C.mid, marginBottom: 10 }}>
-          Spend share defaults to each portal&apos;s share of leads — the only portal-relative volume the CRM
-          has. Real invoices track listing credits, so override the share if you know the actual split.
-          Anything you leave blank shares out the remainder by lead weight.
+          Monthly spend is the actual figure from the workbook. Override a portal&apos;s rate to model a
+          different period or a renegotiated contract — blank uses the workbook average.
         </p>
         <div style={{ overflowX: "auto" }}>
           <table className="perf-table" style={{ minWidth: 860 }}>
@@ -373,8 +354,8 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
                 <th>Deals</th>
                 <th>Lead → deal</th>
                 <th>Gross commission</th>
-                <th>Spend share</th>
-                <th>Est. spend</th>
+                <th>Spend / month</th>
+                <th>Spend in period</th>
                 <th>Cost / lead</th>
                 <th>Cost / deal</th>
                 <th>Net</th>
@@ -394,14 +375,16 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
                   <td style={{ color: C.green }}>{fmtAED(r.commission)}</td>
                   <td>
                     <input
-                      value={splitOverride[r.portal] ?? ""}
-                      placeholder={(r.share * 100).toFixed(0)}
-                      onChange={(e) => setSplitOverride((s) => ({ ...s, [r.portal]: e.target.value }))}
+                      value={rateOverride[r.portal] ?? ""}
+                      placeholder={fmtInt(avgMonthlySpend(r.portal))}
+                      onChange={(e) => setRateOverride((prev) => ({ ...prev, [r.portal]: e.target.value }))}
                       inputMode="numeric"
-                      style={{ width: 52, textAlign: "right" as const, fontSize: 11, padding: "2px 4px", border: `1px solid var(--border)`, borderRadius: 4 }}
-                      aria-label={`${r.portal} spend share, percent`}
+                      style={{ width: 82, textAlign: "right", fontSize: 11, padding: "2px 4px", border: "1px solid var(--border)", borderRadius: 4 }}
+                      aria-label={`${r.portal} monthly spend in AED`}
                     />
-                    <span style={{ fontSize: 10, color: C.mid }}> %</span>
+                    {!SPEND_IS_MONTHLY[r.portal] && (
+                      <span title="Period total spread evenly — the workbook has no monthly column for this portal." style={{ fontSize: 10, color: C.amber, marginLeft: 4 }}>~</span>
+                    )}
                   </td>
                   <td>{fmtAED(r.spend)}</td>
                   <td>{fmtAEDExact(r.cpl)}</td>
@@ -416,7 +399,7 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
                 <td>{fmtInt(tot.deals)}</td>
                 <td>{fmtPct(tot.conv)}</td>
                 <td style={{ color: C.green }}>{fmtAED(tot.commission)}</td>
-                <td>100 %</td>
+                <td>{fmtAED(econ.reduce((a, r) => a + r.rate, 0))}</td>
                 <td>{fmtAED(tot.spend)}</td>
                 <td>{fmtAEDExact(tot.cpl)}</td>
                 <td>{fmtAEDExact(tot.cpd)}</td>
@@ -449,7 +432,7 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
         <div className="chart-card">
           <h3 style={{ marginBottom: 4 }}>Cost per lead & per deal</h3>
           <p style={{ fontSize: 11, color: C.mid, marginBottom: 8 }}>
-            Estimated. Toggle &ldquo;Cost / deal&rdquo; in the legend — it&apos;s an order of magnitude larger, so
+Toggle &ldquo;Cost / deal&rdquo; in the legend — it&apos;s an order of magnitude larger, so
             it starts hidden to keep the lead bars readable.
           </p>
           <div style={{ height: 260 }}>
@@ -457,9 +440,9 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
           </div>
         </div>
         <div className="chart-card">
-          <h3 style={{ marginBottom: 4 }}>Estimated spend vs gross commission</h3>
+          <h3 style={{ marginBottom: 4 }}>Spend vs gross commission</h3>
           <p style={{ fontSize: 11, color: C.mid, marginBottom: 8 }}>
-            Commission is live; spend is your assumption apportioned per portal.
+            Both measured — commission from the CRM, spend from the workbook.
           </p>
           <div style={{ height: 260 }}>
             <ChartBox type="bar" data={spendVsComm} options={baseOpts} />
