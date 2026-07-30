@@ -130,20 +130,26 @@ function toFacebookUrl(handle: string): string {
   return `https://www.facebook.com/${h.replace(/^@/, "").replace(/\/+$/, "")}`;
 }
 /**
- * Reduce a LinkedIn company URL to its bare slug, which is what a company-posts
- * actor identifies a page by.
+ * Normalise the stored handle to a full LinkedIn company URL, passed to the
+ * actor AS-IS.
  *
- * Hyphens are KEPT — the slug is an identifier, not a search phrase. Any
- * regional host (ae./uk./de.linkedin.com) is stripped: LinkedIn serves the same
- * page under every country subdomain, so a URL copied out of a local search
- * result must not carry "ae.linkedin.com" into the actor input.
+ * Deliberately NOT a slug lookup. A slug makes the actor resolve a name, and a
+ * name it can't resolve silently yields zero posts — indistinguishable from a
+ * page that hasn't posted. An exact page URL removes that ambiguity: whatever is
+ * typed in the Advanced field is what gets scraped, and it can be pasted
+ * straight from the browser where it's known to load.
+ *
+ * The only edit is the host: LinkedIn serves the same page under every country
+ * subdomain (ae./uk./de.), so those are folded to www to keep one canonical form.
+ * The path is left exactly as given — including any "&", which is legal in a
+ * LinkedIn universal name and must not be "cleaned up".
  */
-function toLinkedInCompany(handle: string): string {
-  return handle
-    .trim()
-    .replace(/^https?:\/\/([a-z]{2}\.|www\.)?linkedin\.com\/(company|in|school)\//i, "")
-    .replace(/[/?#].*$/, "")
-    .trim();
+function toLinkedInCompanyUrl(handle: string): string {
+  const h = handle.trim().replace(/[?#].*$/, "").replace(/\/+$/, "");
+  const m = h.match(/^https?:\/\/(?:[a-z]{2}\.|www\.)?linkedin\.com\/(.+)$/i);
+  if (m) return `https://www.linkedin.com/${m[1]}`;
+  // A bare handle: assume a company page, which is what this benchmark tracks.
+  return `https://www.linkedin.com/company/${h.replace(/^@/, "")}`;
 }
 
 /** Window start as YYYY-MM-DD, for actors that can filter server-side. */
@@ -303,14 +309,15 @@ async function scrapeFacebook(actor: string, handle: string, ctx: PerfScrapeCtx)
 }
 
 async function scrapeLinkedIn(actor: string, handle: string, ctx: PerfScrapeCtx): Promise<PerfScrapeResult> {
-  // `companies`, NOT `searchQueries`. The old input ran a KEYWORD SEARCH across
-  // all of LinkedIn, so it returned whatever posts happened to mention the brand
-  // — anyone's posts, not the company's. Every brand came back with exactly
-  // maxItems posts and no follower count, which is the signature of that bug.
+  // `companies` with a full page URL, NOT `searchQueries`. The old input ran a
+  // KEYWORD SEARCH across all of LinkedIn, so it returned whatever posts
+  // happened to mention the brand — anyone's posts, not the company's. Every
+  // brand came back with exactly maxItems posts and no follower count, which is
+  // the signature of that bug.
   //
-  // A company-posts actor takes the page itself and returns its own posts plus
-  // the company profile (which carries the follower count).
-  const company = toLinkedInCompany(handle);
+  // A company-posts actor takes the page URL and returns that page's own posts
+  // plus the company profile (which carries the follower count).
+  const company = toLinkedInCompanyUrl(handle);
   const items = await runApify(
     actor,
     {
