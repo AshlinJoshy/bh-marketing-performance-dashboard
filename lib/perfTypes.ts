@@ -116,7 +116,9 @@ export const DEFAULT_PERF_CONFIG: PerfConfig = {
   brands: [
     { name: "betterhomes",        isUs: true,  handles: { instagram: "betterhomesuae",      tiktok: "betterhomesdubai",     facebook: "https://www.facebook.com/betterhomesuae",     linkedin: "https://www.linkedin.com/company/better-homes-llc" } },
     { name: "Allsopp & Allsopp",  isUs: false, handles: { instagram: "allsoppandallsopp",   tiktok: "allsoppandallsopp",    facebook: "https://www.facebook.com/AllsoppAndAllsopp",  linkedin: "https://www.linkedin.com/company/allsopp-&-allsopp" } },
-    { name: "haus & haus",        isUs: false, handles: { instagram: "hausandhaus",         tiktok: "hausandhaus",          facebook: "https://www.facebook.com/hausandhaus",        linkedin: "https://www.linkedin.com/company/haus-&-haus" } },
+    // LinkedIn slug is "hausandhaus", NOT "haus-&-haus" — the latter is indexed by
+    // search engines but isn't the page's universal name, and returns nothing.
+    { name: "haus & haus",        isUs: false, handles: { instagram: "hausandhaus",         tiktok: "hausandhaus",          facebook: "https://www.facebook.com/hausandhaus",        linkedin: "https://www.linkedin.com/company/hausandhaus" } },
     { name: "White & Co",         isUs: false, handles: { instagram: "whiteandcodxb",       tiktok: "whiteandcorealestate", facebook: "https://www.facebook.com/whiteandcodxb",      linkedin: "https://www.linkedin.com/company/white-co-real-estate-llc" } },
   ],
   actors: {
