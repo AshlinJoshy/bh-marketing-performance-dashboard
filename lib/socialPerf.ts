@@ -82,7 +82,7 @@ function withinWindow(iso: string | null, window: TimeWindow): boolean {
 }
 
 /** Run an Apify actor synchronously and return its dataset items. Throws on failure. */
-async function runApify(actor: string, input: unknown, timeoutMs = 110_000): Promise<any[]> {
+export async function runApify(actor: string, input: unknown, timeoutMs = 110_000): Promise<any[]> {
   const token = process.env.APIFY_TOKEN;
   if (!token) throw new Error("APIFY_TOKEN not set");
   const secs = Math.max(20, Math.round(timeoutMs / 1000));
@@ -100,7 +100,9 @@ async function runApify(actor: string, input: unknown, timeoutMs = 110_000): Pro
       signal: ctrl.signal,
     });
     if (!res.ok) {
-      const body = (await res.text()).slice(0, 200);
+      // Keep a generous slice: Apify's input-validation errors name the fields it
+      // expected, which is the fastest way to learn an actor's real schema.
+      const body = (await res.text()).slice(0, 600);
       throw new Error(`HTTP ${res.status} ${body}`);
     }
     const items = await res.json();
@@ -152,9 +154,22 @@ function toLinkedInCompanyUrl(handle: string): string {
   return `https://www.linkedin.com/company/${h.replace(/^@/, "")}`;
 }
 
-/** Window start as YYYY-MM-DD, for actors that can filter server-side. */
-function windowStartISO(window: TimeWindow): string {
-  return new Date(Date.now() - WINDOW_DAYS[window] * 864e5).toISOString().slice(0, 10);
+/**
+ * Explain an empty result by reporting what the actor actually sent back.
+ *
+ * "0 posts" has two completely different causes and they need opposite fixes:
+ * the actor returned nothing (wrong page, wrong input key, blocked), or it
+ * returned rows whose field names we don't map. Guessing between them costs a
+ * deploy per attempt, so the row's own keys go in the log — that names the
+ * fields to map instead of leaving it to be inferred.
+ */
+function emptyNote(items: any[], target: string, kept: number): string | undefined {
+  if (kept > 0) return undefined;
+  if (!items.length) return `the actor returned no rows at all for "${target}" — check the URL opens, and that this actor takes it as input`;
+  const keys = Object.keys(items[0] ?? {});
+  const err = firstStr(items[0] ?? {}, ["error", "message", "errorMessage"]);
+  if (err) return `the actor returned an error row for "${target}": ${err}`;
+  return `the actor returned ${items.length} row(s) for "${target}" but none parsed as posts — fields on the first row: ${keys.slice(0, 25).join(", ") || "(none)"}`;
 }
 
 // ── mapping helpers ─────────────────────────────────────────────
@@ -202,7 +217,7 @@ async function scrapeInstagram(actor: string, handle: string, ctx: PerfScrapeCtx
       caption: firstStr(it, ["caption", "text"]),
     });
   }
-  return { followers, posts };
+  return { followers, posts, note: emptyNote(items, username, posts.length) };
 }
 
 async function scrapeTikTok(actor: string, handle: string, ctx: PerfScrapeCtx): Promise<PerfScrapeResult> {
@@ -232,7 +247,7 @@ async function scrapeTikTok(actor: string, handle: string, ctx: PerfScrapeCtx): 
       caption: firstStr(it, ["text", "caption", "desc"]),
     });
   }
-  return { followers, posts };
+  return { followers, posts, note: emptyNote(items, username, posts.length) };
 }
 
 /**
@@ -323,9 +338,11 @@ async function scrapeLinkedIn(actor: string, handle: string, ctx: PerfScrapeCtx)
     {
       companies: [company],
       maxPosts: ctx.maxItems,
-      postedLimitDate: windowStartISO(ctx.window),
       includeReposts: false, // a repost isn't the brand's own content
       includeQuotePosts: true,
+      // No date filter on purpose: withinWindow() already trims client-side, and
+      // a date the actor parses differently to us would silently drop everything
+      // — an empty result that looks exactly like a wrong URL.
     },
     ctx.timeoutMs,
   );
@@ -355,10 +372,7 @@ async function scrapeLinkedIn(actor: string, handle: string, ctx: PerfScrapeCtx)
       caption: content,
     });
   }
-  const note = posts.length
-    ? undefined
-    : `no posts returned for company "${company}" — check the LinkedIn slug in Advanced`;
-  return { followers, posts, note };
+  return { followers, posts, note: emptyNote(items, company, posts.length) };
 }
 
 const SCRAPERS: Record<PerfPlatform, (actor: string, handle: string, ctx: PerfScrapeCtx) => Promise<PerfScrapeResult>> = {
