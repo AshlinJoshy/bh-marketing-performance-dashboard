@@ -315,6 +315,24 @@ export default function PortalsDashboard({ initial }: { initial: PortalsData }) 
           commission are live CRM figures; cost per lead, cost per deal and return on spend are derived
           from the assumption and move with it.
         </div>
+        {/* Result of actually looking for spend in the CRM, rather than assuming it isn't there. */}
+        <div style={{ fontSize: 12, color: C.mid, marginTop: 10, paddingTop: 10, borderTop: "1px solid var(--border)" }}>
+          {data.spendCandidates.length === 0 ? (
+            <>
+              <strong>Checked:</strong> nothing in the CRM schema names spend, cost, budget, invoice or
+              subscription, so there is no recorded portal spend to read. The assumption above is the only
+              source available.
+            </>
+          ) : (
+            <>
+              <strong>Checked — possible spend fields exist:</strong>{" "}
+              <code style={{ fontSize: 11 }}>{data.spendCandidates.slice(0, 10).join(", ")}</code>
+              {data.spendCandidates.length > 10 ? ` (+${data.spendCandidates.length - 10} more)` : null}. None
+              are wired in — tell me which one holds portal spend and the estimate can be replaced with the
+              real figure.
+            </>
+          )}
+        </div>
       </div>
 
       {/* ── KPIs ─────────────────────────────────────────────────── */}

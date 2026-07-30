@@ -77,6 +77,14 @@ export interface PortalsData {
    */
   unmappedSources: { source: string; n: number }[];
 
+  /**
+   * Tables/columns in the CRM whose name suggests spend, cost, budget, invoice
+   * or subscription. Reported so "the CRM has no spend data" is a checked fact
+   * rather than an inherited assumption — if something turns up here, the
+   * estimate can be replaced with a real figure.
+   */
+  spendCandidates: string[];
+
   error?: string;
   /** Non-fatal problems — one card failing must not blank the page. */
   warnings: string[];
@@ -149,14 +157,32 @@ export function portalsRange(fromRaw?: string, toRaw?: string): { from: string; 
  */
 const AREA_CANDIDATES = ["community", "sub_community", "area", "district", "neighbourhood", "neighborhood", "location", "city"];
 
-async function discoverAreaColumn(): Promise<{ table: string; column: string } | null> {
+/**
+ * Where a discovered area column lives, and how to reach it from `listings`.
+ *
+ * `join` is null when the column is on listings itself. It's a full JOIN clause
+ * when the area lives on another table — Engage stores locations relationally in
+ * some installs, so restricting the search to properties/listings (as the first
+ * version did) found nothing at all.
+ */
+interface AreaSource {
+  table: string;
+  column: string;
+  join: string | null;
+}
+
+async function discoverAreaColumn(): Promise<AreaSource | null> {
+  // Search the WHOLE schema, not just two tables. A dedicated locations table is
+  // as likely as a text column on properties, and either is a valid grouping.
   const sql = `
     SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
     FROM information_schema.COLUMNS
     WHERE TABLE_SCHEMA = DATABASE()
-      AND TABLE_NAME IN ('properties','listings')
       AND DATA_TYPE IN ('varchar','char','text','tinytext','mediumtext','enum')
-    ORDER BY TABLE_NAME, ORDINAL_POSITION`;
+      AND (${AREA_CANDIDATES.map((c) => `LOWER(COLUMN_NAME) LIKE '%${c}%'`).join(" OR ")}
+           OR LOWER(TABLE_NAME) IN ('locations','location','communities','community','areas','area'))
+    ORDER BY TABLE_NAME, ORDINAL_POSITION
+    LIMIT 200`;
   const rows = await mbQuery(sql, true, 15000);
   if (!rows?.length) return null;
   const cols = rows.map((r) => ({
@@ -164,19 +190,73 @@ async function discoverAreaColumn(): Promise<{ table: string; column: string } |
     column: String(r[1] ?? ""),
     lc: String(r[1] ?? "").toLowerCase(),
   }));
-  // Prefer `properties` (the physical thing has the area) then listings.
+
+  const PROP_JOIN = "JOIN properties ON properties.id = li.listable_id AND li.listable_type = 'Property'";
+
+  // 1. On listings itself — no join needed, so nothing can go wrong.
   for (const want of AREA_CANDIDATES) {
-    for (const table of ["properties", "listings"]) {
-      const hit = cols.find((c) => c.table === table && c.lc === want);
-      if (hit) return { table: hit.table, column: hit.column };
+    const hit = cols.find((c) => c.table === "listings" && c.lc === want);
+    if (hit) return { table: "listings", column: hit.column, join: null };
+  }
+  // 2. On properties — one hop through the polymorphic listable.
+  for (const want of AREA_CANDIDATES) {
+    const hit = cols.find((c) => c.table === "properties" && c.lc === want);
+    if (hit) return { table: "properties", column: hit.column, join: PROP_JOIN };
+  }
+  // 3. A dedicated locations/communities table, reached from properties by a
+  //    conventionally-named FK. Only taken when both sides are present, so a
+  //    speculative join is never emitted.
+  const locTable = cols.find((c) => ["locations", "location", "communities", "community", "areas"].includes(c.table.toLowerCase()));
+  if (locTable) {
+    const fkSql = `
+      SELECT COLUMN_NAME FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'properties'
+        AND LOWER(COLUMN_NAME) IN ('location_id','community_id','area_id')
+      LIMIT 1`;
+    const fk = await mbQuery(fkSql, true, 10000);
+    const fkCol = fk?.[0]?.[0] ? String(fk[0][0]) : null;
+    if (fkCol) {
+      const nameCol =
+        cols.find((c) => c.table === locTable.table && ["name", "title", "community", "area"].includes(c.lc))?.column ??
+        locTable.column;
+      return {
+        table: locTable.table,
+        column: nameCol,
+        join: `${PROP_JOIN} JOIN \`${locTable.table}\` ON \`${locTable.table}\`.id = properties.\`${fkCol}\``,
+      };
     }
   }
-  // Nothing matched exactly — try a contains match before giving up.
-  for (const want of AREA_CANDIDATES) {
-    const hit = cols.find((c) => c.lc.includes(want));
-    if (hit) return { table: hit.table, column: hit.column };
-  }
-  return null;
+  // 4. Last resort: any table with an area-ish text column, reported but not
+  //    joined — we can't invent a join path, so say so rather than guess one.
+  const loose = cols[0];
+  return loose ? { table: loose.table, column: loose.column, join: null } : null;
+}
+
+/**
+ * Does the CRM hold ANY spend/cost/budget figure we could use instead of the
+ * assumption? lib/company.ts recorded that it doesn't (the old report hardcoded
+ * spend from a spreadsheet), but that was a note, not a check — so this looks.
+ */
+async function discoverSpendColumns(): Promise<string[]> {
+  const sql = `
+    SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND (LOWER(COLUMN_NAME) LIKE '%spend%'
+        OR LOWER(COLUMN_NAME) LIKE '%budget%'
+        OR LOWER(COLUMN_NAME) LIKE '%invoice%'
+        OR LOWER(COLUMN_NAME) LIKE '%subscription%'
+        OR LOWER(COLUMN_NAME) LIKE '%expense%'
+        OR LOWER(COLUMN_NAME) LIKE '%cost%'
+        OR LOWER(TABLE_NAME) LIKE '%spend%'
+        OR LOWER(TABLE_NAME) LIKE '%invoice%'
+        OR LOWER(TABLE_NAME) LIKE '%expense%'
+        OR LOWER(TABLE_NAME) LIKE '%budget%'
+        OR LOWER(TABLE_NAME) LIKE '%subscription%')
+    ORDER BY TABLE_NAME, ORDINAL_POSITION
+    LIMIT 80`;
+  const rows = await mbQuery(sql, true, 15000);
+  return (rows ?? []).map((r) => `${r[0]}.${r[1]} (${r[2]})`);
 }
 
 /** Does the CRM record which portal a listing is published to? */
@@ -232,6 +312,7 @@ export async function getPortalsData(fromRaw?: string, toRaw?: string, brandRaw?
     areaSource: null,
     listingsNote: null,
     unmappedSources: [],
+    spendCandidates: [],
     warnings: [],
   };
   if (!connected) return base;
@@ -266,13 +347,15 @@ export async function getPortalsData(fromRaw?: string, toRaw?: string, brandRaw?
       ${brandFilter(names, "l.division_id")}
     GROUP BY 1 ORDER BY 2 DESC LIMIT 25`;
 
-  const [leadsRes, dealsRes, unmappedRows, area, portalCols] = await Promise.all([
+  const [leadsRes, dealsRes, unmappedRows, area, portalCols, spendCols] = await Promise.all([
     mbQueryEx(leadsSql, true, 30000),
     mbQueryEx(dealsSql, true, 30000),
     mbQuery(unmappedSql, true, 25000),
     discoverAreaColumn(),
     discoverPortalLinkage(),
+    discoverSpendColumns(),
   ]);
+  base.spendCandidates = spendCols;
 
   const leadRows = "rows" in leadsRes ? leadsRes.rows : null;
   const dealRows = "rows" in dealsRes ? dealsRes.rows : null;
@@ -314,12 +397,12 @@ export async function getPortalsData(fromRaw?: string, toRaw?: string, brandRaw?
   if (area) {
     base.areaSource = `${area.table}.${area.column}`;
     const col = `\`${area.table}\`.\`${area.column}\``;
-    // Count listings of properties, grouped by the discovered area column.
-    // listable_type = 'Property' mirrors lib/company.ts's join.
+    // The join comes from discovery, so a relational locations table works as
+    // well as a plain text column and no join is ever invented.
     const areaSql = `
       SELECT COALESCE(NULLIF(TRIM(${col}), ''), '(no area)') AS area, COUNT(*) AS n
       FROM listings li
-      ${area.table === "properties" ? "JOIN properties ON properties.id = li.listable_id AND li.listable_type = 'Property'" : ""}
+      ${area.join ?? ""}
       GROUP BY 1 ORDER BY 2 DESC LIMIT 60`;
     const areaRows = await mbQuery(areaSql, true, 30000);
     if (areaRows) {
