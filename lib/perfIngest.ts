@@ -118,87 +118,106 @@ export async function runPerfIngest(
   const t0 = Date.now();
   const MAX_TOTAL = Number(process.env.SOCIAL_MAX_MS || 285_000);
 
+  // One account: scrape it, store its posts, upsert its snapshot. Never throws —
+  // a brand that fails is reported and the rest of the platform carries on.
+  // An arrow const, not a `function` declaration: declarations hoist above the
+  // `if (!db) throw` guard, which loses db's non-null narrowing inside the body.
+  const runAccount = async (platform: PerfPlatform, actor: string, brand: PerfBrand, timeoutMs: number) => {
+    const handle = (brand.handles[platform] as string).trim();
+    const ctx = { window, maxItems, p, timeoutMs };
+    let followers: number | null = null;
+    let posts: RawPerfPost[] = [];
+    try {
+      const res = await scrapePerfAccount(platform, actor, handle, ctx);
+      followers = res.followers;
+      posts = res.posts;
+      p(`  ✓ ${brand.name}: ${posts.length} posts · ${followers != null ? followers.toLocaleString() : "?"} followers`);
+      // Say why it was empty, so "0 posts" is never ambiguous.
+      if (res.note) p(`     note: ${res.note}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      p(`  ✗ ${brand.name} (${platform}) failed: ${msg}`);
+      p(`     why: ${failureHint(platform, msg)}`);
+      return;
+    }
+    result.postsFound += posts.length;
+
+    const agg = aggregate(posts, followers);
+
+    // Store the individual posts (top-post cards + audit).
+    if (posts.length) {
+      const rows = posts.map((it) => {
+        const ext = it.external_id ?? it.url ?? (it.caption ?? "").slice(0, 60);
+        return {
+          id: hashId(`${brand.name}|${platform}|${ext}`),
+          brand: brand.name,
+          is_us: brand.isUs,
+          platform,
+          external_id: it.external_id,
+          url: it.url,
+          type: it.type,
+          posted_at: it.posted_at,
+          likes: it.likes,
+          comments: it.comments,
+          shares: it.shares,
+          plays: it.plays,
+          caption: it.caption?.slice(0, 500) ?? null,
+          source_actor: actor,
+          run_id: runId,
+        };
+      });
+      const { error } = await db.from("social_perf_posts").upsert(rows, { onConflict: "id" });
+      if (error) p(`     ⚠ ${brand.name}: post store failed: ${error.message}`);
+    }
+
+    // Upsert the aggregate snapshot for this brand+platform.
+    const { error: mErr } = await db.from("social_perf_metrics").upsert(
+      {
+        brand: brand.name,
+        is_us: brand.isUs,
+        platform,
+        followers,
+        ...agg,
+        time_window: window,
+        period_label: periodLabel,
+        source: "live",
+        run_id: runId,
+        captured_at: new Date().toISOString(),
+      },
+      { onConflict: "brand,platform" },
+    );
+    if (mErr) p(`     ⚠ ${brand.name}: metrics store failed: ${mErr.message}`);
+    else result.metricsWritten++;
+  };
+
   // Platform-major: finish a whole platform (all brands) before the next, so a
   // completed platform is fully comparable even if we later run out of time.
-  outer: for (const platform of platforms) {
+  //
+  // Within a platform the accounts run CONCURRENTLY. They're independent — one
+  // Apify run and one upsert each — and running them serially was what made the
+  // whole job miss its deadline: 16 accounts sharing 285s left ~18s apiece, and
+  // one slow Facebook page would eat the remainder so later platforms never ran.
+  // Concurrency doesn't change the number of actor runs, so it costs no extra
+  // Apify credit; it just stops them queueing behind each other.
+  for (const platform of platforms) {
     const actor = cfg.actors[platform];
     const accounts = brands.filter((b) => (b.handles?.[platform] ?? "").trim());
     if (!accounts.length) {
       p(`▶ ${platform}: no handles set — skipped (add them in Advanced).`);
       continue;
     }
-    p(`▶ ${platform} — ${accounts.length} account(s) via ${actor}`);
 
-    for (const brand of accounts) {
-      const remaining = MAX_TOTAL - (Date.now() - t0);
-      if (remaining < 30_000) {
-        p(`⏱ Time budget reached — skipping the rest (run again to continue).`);
-        break outer;
-      }
-      const handle = (brand.handles[platform] as string).trim();
-      const ctx = { window, maxItems, p, timeoutMs: Math.min(120_000, remaining - 8_000) };
-      let followers: number | null = null;
-      let posts: RawPerfPost[] = [];
-      try {
-        const res = await scrapePerfAccount(platform, actor, handle, ctx);
-        followers = res.followers;
-        posts = res.posts;
-        p(`  ✓ ${brand.name}: ${posts.length} posts · ${followers != null ? followers.toLocaleString() : "?"} followers`);
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        p(`  ✗ ${brand.name} (${platform}) failed: ${msg}`);
-        p(`     why: ${failureHint(platform, msg)}`);
-        continue;
-      }
-      result.postsFound += posts.length;
-
-      const agg = aggregate(posts, followers);
-
-      // Store the individual posts (top-post cards + audit).
-      if (posts.length) {
-        const rows = posts.map((it) => {
-          const ext = it.external_id ?? it.url ?? (it.caption ?? "").slice(0, 60);
-          return {
-            id: hashId(`${brand.name}|${platform}|${ext}`),
-            brand: brand.name,
-            is_us: brand.isUs,
-            platform,
-            external_id: it.external_id,
-            url: it.url,
-            type: it.type,
-            posted_at: it.posted_at,
-            likes: it.likes,
-            comments: it.comments,
-            shares: it.shares,
-            plays: it.plays,
-            caption: it.caption?.slice(0, 500) ?? null,
-            source_actor: actor,
-            run_id: runId,
-          };
-        });
-        const { error } = await db.from("social_perf_posts").upsert(rows, { onConflict: "id" });
-        if (error) p(`     ⚠ ${brand.name}: post store failed: ${error.message}`);
-      }
-
-      // Upsert the aggregate snapshot for this brand+platform.
-      const { error: mErr } = await db.from("social_perf_metrics").upsert(
-        {
-          brand: brand.name,
-          is_us: brand.isUs,
-          platform,
-          followers,
-          ...agg,
-          time_window: window,
-          period_label: periodLabel,
-          source: "live",
-          run_id: runId,
-          captured_at: new Date().toISOString(),
-        },
-        { onConflict: "brand,platform" },
-      );
-      if (mErr) p(`     ⚠ ${brand.name}: metrics store failed: ${mErr.message}`);
-      else result.metricsWritten++;
+    const remaining = MAX_TOTAL - (Date.now() - t0);
+    if (remaining < 30_000) {
+      p(`⏱ Time budget reached — ${platform} and any platform after it were skipped (run again to continue).`);
+      break;
     }
+    p(`▶ ${platform} — ${accounts.length} account(s) via ${actor}, in parallel`);
+
+    // Every account in the platform gets the whole remaining window: they run
+    // together, so the platform takes as long as its slowest account, not the sum.
+    const timeoutMs = Math.min(120_000, remaining - 8_000);
+    await Promise.all(accounts.map((brand) => runAccount(platform, actor, brand, timeoutMs)));
   }
 
   if (runId != null) {

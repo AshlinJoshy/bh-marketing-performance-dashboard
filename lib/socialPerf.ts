@@ -24,6 +24,12 @@ export interface RawPerfPost {
 export interface PerfScrapeResult {
   followers: number | null;
   posts: RawPerfPost[];
+  /**
+   * Set when the account resolved but returned nothing usable, so the caller can
+   * say WHY it logged "0 posts". Without this, a dead handle and a page that
+   * simply hasn't posted this month look identical in the run log.
+   */
+  note?: string;
 }
 
 export interface PerfScrapeCtx {
@@ -220,10 +226,48 @@ async function scrapeTikTok(actor: string, handle: string, ctx: PerfScrapeCtx): 
   return { followers, posts };
 }
 
+/**
+ * Facebook page-level metadata (follower count).
+ *
+ * The posts scraper returns POSTS — its items carry no page follower figure at
+ * all, which is why every Facebook row rendered "? followers". Page stats live
+ * in a separate actor, so we pay for a second (small, one-page) run to get them.
+ *
+ * Returns null on any failure: a missing follower count must never fail the
+ * whole account, because the posts are the more valuable half.
+ */
+const FB_PAGE_ACTOR = process.env.APIFY_FB_PAGE_ACTOR || "apify/facebook-pages-scraper";
+
+async function scrapeFacebookPage(
+  pageUrl: string,
+  ctx: PerfScrapeCtx,
+): Promise<{ followers: number | null; exists: boolean }> {
+  try {
+    const items = await runApify(
+      FB_PAGE_ACTOR,
+      { startUrls: [{ url: pageUrl }] },
+      Math.min(60_000, ctx.timeoutMs ?? 60_000),
+    );
+    const page = items.find((it) => it && !it.error) ?? items[0];
+    if (!page) return { followers: null, exists: false };
+    // Prefer followers; "likes" is the older page-likes metric and runs a little
+    // lower, but it beats showing nothing.
+    const followers = firstNumOrNull(page, ["followers", "followersCount", "followerCount", "likes", "likesCount"]);
+    return { followers, exists: true };
+  } catch {
+    return { followers: null, exists: false };
+  }
+}
+
 async function scrapeFacebook(actor: string, handle: string, ctx: PerfScrapeCtx): Promise<PerfScrapeResult> {
   const pageUrl = toFacebookUrl(handle);
-  const items = await runApify(actor, { startUrls: [{ url: pageUrl }], resultsLimit: ctx.maxItems }, ctx.timeoutMs);
-  let followers: number | null = null;
+  // Both runs at once — the page scrape is small and shouldn't extend the wall
+  // clock of an already-slow posts scrape.
+  const [items, page] = await Promise.all([
+    runApify(actor, { startUrls: [{ url: pageUrl }], resultsLimit: ctx.maxItems }, ctx.timeoutMs),
+    scrapeFacebookPage(pageUrl, ctx),
+  ]);
+  let followers: number | null = page.followers;
   const posts: RawPerfPost[] = [];
   for (const it of items) {
     const f =
@@ -245,7 +289,14 @@ async function scrapeFacebook(actor: string, handle: string, ctx: PerfScrapeCtx)
       caption: firstStr(it, ["text", "message", "postText", "caption"]),
     });
   }
-  return { followers, posts };
+  // Distinguish the three ways Facebook can give us nothing.
+  let note: string | undefined;
+  if (!posts.length) {
+    if (!page.exists && !items.length) note = "page not reachable — check the URL is the public page";
+    else if (!items.length) note = "page found but the posts scraper returned nothing (often a login wall)";
+    else note = `page found, ${items.length} post(s) fetched but none inside the window`;
+  }
+  return { followers, posts, note };
 }
 
 async function scrapeLinkedIn(actor: string, handle: string, ctx: PerfScrapeCtx): Promise<PerfScrapeResult> {
