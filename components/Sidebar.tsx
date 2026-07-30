@@ -6,7 +6,7 @@ import { usePathname } from "next/navigation";
 type NavItem = { href: string; label: string; icon: string; soon?: boolean };
 
 const NAV: NavItem[] = [
-  { href: "/", label: "Dashboard", icon: "📊", soon: true },
+  { href: "/", label: "Dashboard", icon: "📊" },
   { href: "/company", label: "Company Performance", icon: "🏢" },
   { href: "/pr", label: "PR & Media", icon: "📰" },
   { href: "/people", label: "People Sentiment", icon: "💬" },

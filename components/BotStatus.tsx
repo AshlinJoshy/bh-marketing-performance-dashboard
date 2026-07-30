@@ -14,17 +14,17 @@ function ago(iso: string): string {
 
 /**
  * The schedule in vercel.json, stated here so the UI can't drift from it. The
- * cron is "17 2 * * *" UTC; Dubai is UTC+4, so 06:17 local.
+ * cron is "0 4 * * *" UTC; Dubai is UTC+4, so 08:00 local.
  */
-const SCHEDULE_LABEL = "daily at 06:17 Dubai";
+const SCHEDULE_LABEL = "daily at 08:00 Dubai";
 
 /**
- * Flag a run that's older than the schedule should allow.
+ * A run older than this marks the bot overdue. 30h gives the daily schedule a
+ * 6h grace window for retries and drift.
  *
- * This exists because the old label just read "runs on demand", which was
- * accurate but meant a bot that had silently stopped looked identical to one
- * working normally — the only clue being a number of days most people wouldn't
- * question. 30h gives the daily run a 6h grace window for retries and drift.
+ * Deliberately just a marker on the title — no banner. An always-visible warning
+ * block became wallpaper, and it can't diagnose the cause anyway: the cron has
+ * failed before both with the config missing AND with it present.
  */
 const STALE_AFTER_H = 30;
 const hoursSince = (iso: string) => (Date.now() - new Date(iso).getTime()) / 3.6e6;
@@ -89,20 +89,13 @@ export default function BotStatus({ runs }: { runs: IngestRun[] }) {
           <div>
             <div className="bot-title">
               News bot {last && !last.ok ? "⚠️" : ""}
-              {stale ? <span title={`No run in over ${STALE_AFTER_H}h — the schedule may not be firing.`}> ⏰</span> : null}
+              {stale ? <span title={`Overdue — no run in over ${STALE_AFTER_H}h.`}> ⏰</span> : null}
             </div>
             <div className="bot-sub">
               {last
                 ? `Last run ${ago(last.ran_at)} · +${last.inserted} new · ${last.updated} dated · ${SCHEDULE_LABEL}`
                 : `Hasn't run yet · scheduled ${SCHEDULE_LABEL} · or click Run now`}
             </div>
-            {stale && (
-              <div className="bot-sub" style={{ color: "var(--red)" }}>
-                Overdue — expected {SCHEDULE_LABEL}, but the last run was {ago(last!.ran_at)}. If this persists,
-                CRON_SECRET is probably missing from the Vercel environment: the endpoint answers 401 without it and
-                the scheduled run fails silently.
-              </div>
-            )}
           </div>
         </div>
         <div className="bot-right">
