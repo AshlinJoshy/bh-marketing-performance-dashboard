@@ -17,6 +17,8 @@ import { C } from "@/lib/theme";
 import type { CompanyData } from "@/lib/company";
 import type { PortalsData } from "@/lib/portals";
 import { avgMonthlySpendTotal } from "@/lib/portalSpend";
+import type { SummaryData } from "@/app/api/summary/route";
+import type { SeoData } from "@/lib/seo";
 
 const fmtInt = (n: number) => new Intl.NumberFormat("en-US").format(Math.round(n || 0));
 const fmtAED = (n: number) => {
@@ -54,12 +56,14 @@ function Kpi({ label, value, sub, href, color, loading }: {
   );
 }
 
-type PaidSummary = { spend: number; leads: number; error?: string };
+type PaidSummary = { spend: number; leads: number };
 
 export default function CeoDashboard() {
   const [company, setCompany] = useState<CompanyData | null>(null);
   const [portals, setPortals] = useState<PortalsData | null>(null);
   const [paid, setPaid] = useState<PaidSummary | null>(null);
+  const [seo, setSeo] = useState<SeoData | null>(null);
+  const [extra, setExtra] = useState<SummaryData | null>(null);
   const [failed, setFailed] = useState<string[]>([]);
 
   const fail = useCallback((what: string) => setFailed((f) => (f.includes(what) ? f : [...f, what])), []);
@@ -87,6 +91,14 @@ export default function CeoDashboard() {
         });
       })
       .catch(() => live && fail("Digital"));
+    fetch("/api/seo", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((j) => { if (live && j?.traffic) setSeo(j); else if (live) fail("SEO"); })
+      .catch(() => live && fail("SEO"));
+    fetch("/api/summary", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((j) => { if (live && j?.pr) setExtra(j); else if (live) fail("PR & social"); })
+      .catch(() => live && fail("PR & social"));
     return () => { live = false; };
   }, [fail]);
 
@@ -165,6 +177,43 @@ export default function CeoDashboard() {
           label="Paid cost / lead · 90d"
           value={paid && paid.leads > 0 ? fmtAED(paid.spend / paid.leads) : "—"}
           loading={!paid}
+        />
+      </div>
+
+      <div className="kpi-strip" style={{ gridTemplateColumns: "repeat(4,1fr)", marginBottom: 18 }}>
+        <Kpi
+          href="/seo"
+          label="Organic clicks · 30d"
+          value={fmtInt(seo?.gsc.totals?.clicks ?? 0)}
+          sub={seo?.gsc.totals ? `${fmtInt(seo.gsc.totals.impressions)} impressions` : undefined}
+          loading={!seo}
+        />
+        <Kpi
+          href="/website"
+          label="Sessions · 30d"
+          value={fmtInt(seo?.traffic.totalSessions ?? 0)}
+          sub={seo ? `${fmtInt(seo.traffic.organicPageviews)} organic views` : undefined}
+          loading={!seo}
+        />
+        <Kpi
+          href="/pr"
+          label="Press mentions · 12m"
+          value={fmtInt(extra?.pr.mentions ?? 0)}
+          sub={extra?.pr.sov != null ? `${fmtPct(extra.pr.sov)} share of voice` : undefined}
+          loading={!extra}
+        />
+        <Kpi
+          href="/people"
+          label="Social followers"
+          value={fmtInt(extra?.social.followers ?? 0)}
+          sub={
+            extra?.social.share != null
+              ? `${fmtPct(extra.social.share)} of benchmarked set`
+              : extra?.social.engagement != null
+                ? `${fmtPct(extra.social.engagement, 2)} engagement`
+                : undefined
+          }
+          loading={!extra}
         />
       </div>
 
