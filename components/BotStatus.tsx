@@ -12,12 +12,30 @@ function ago(iso: string): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
+/**
+ * The schedule in vercel.json, stated here so the UI can't drift from it. The
+ * cron is "0 4 * * *" UTC; Dubai is UTC+4, so 08:00 local.
+ */
+const SCHEDULE_LABEL = "daily at 08:00 Dubai";
+
+/**
+ * A run older than this marks the bot overdue. 30h gives the daily schedule a
+ * 6h grace window for retries and drift.
+ *
+ * Deliberately just a marker on the title — no banner. An always-visible warning
+ * block became wallpaper, and it can't diagnose the cause anyway: the cron has
+ * failed before both with the config missing AND with it present.
+ */
+const STALE_AFTER_H = 30;
+const hoursSince = (iso: string) => (Date.now() - new Date(iso).getTime()) / 3.6e6;
+
 export default function BotStatus({ runs }: { runs: IngestRun[] }) {
   const [running, setRunning] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const logRef = useRef<HTMLDivElement>(null);
   const router = useRouter();
   const last = runs[0];
+  const stale = !!last && hoursSince(last.ran_at) > STALE_AFTER_H;
 
   async function run() {
     setRunning(true);
@@ -69,11 +87,14 @@ export default function BotStatus({ runs }: { runs: IngestRun[] }) {
         <div className="bot-left">
           <span className="pulse-dot" />
           <div>
-            <div className="bot-title">News bot {last && !last.ok ? "⚠️" : ""}</div>
+            <div className="bot-title">
+              News bot {last && !last.ok ? "⚠️" : ""}
+              {stale ? <span title={`Overdue — no run in over ${STALE_AFTER_H}h.`}> ⏰</span> : null}
+            </div>
             <div className="bot-sub">
               {last
-                ? `Last run ${ago(last.ran_at)} · +${last.inserted} new · ${last.updated} dated · runs on demand`
-                : "Hasn't run yet · click Run now"}
+                ? `Last run ${ago(last.ran_at)} · +${last.inserted} new · ${last.updated} dated · ${SCHEDULE_LABEL}`
+                : `Hasn't run yet · scheduled ${SCHEDULE_LABEL} · or click Run now`}
             </div>
           </div>
         </div>

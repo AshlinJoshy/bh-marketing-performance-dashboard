@@ -1,4 +1,5 @@
-// News ingestion. Runs on demand ("Run now"); no daily cron.
+// News ingestion. Runs daily on a Vercel cron (see vercel.json) and on demand
+// via the "Run now" button; the `trigger` column records which.
 //
 // Pipeline (per the agreed design):
 //   1. Google News RSS — find candidate article LINKS for every keyword

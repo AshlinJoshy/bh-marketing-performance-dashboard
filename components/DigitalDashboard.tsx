@@ -465,6 +465,65 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     });
   }
 
+  /** utm_campaigns living under ANY selected campaign_code (from Engage). */
+  /**
+   * campaign name (and Meta campaign id) → the platform it actually ran on,
+   * taken from the ad-platform data itself.
+   *
+   * This replaces matching leads by utm_source spelling, which was wrong in a
+   * way that mattered: a lead that arrived from a Google ad and then converted
+   * on a website pop-up carries utm_source=google, so a pop-up campaign appeared
+   * under the Google Ads filter. A campaign's platform is a property of the
+   * campaign, not of a lead's last touch — so it comes from the platform that
+   * actually reports the campaign.
+   */
+  const campaignPlatform = useMemo(() => {
+    const m = new Map<string, PaidPlatform>();
+    for (const r of data?.rows ?? []) {
+      m.set(norm(r.campaign), r.platform);
+      if (r.campaignId) m.set(norm(r.campaignId), r.platform);
+    }
+    return m;
+  }, [data?.rows]);
+
+  const campaignsUnderCode = useMemo(() => {
+    if (!codes.length) return null;
+    const chosen = new Set(codes);
+    const set = new Set<string>();
+    for (const r of crm?.codeRows ?? []) if (chosen.has(norm(r.code))) set.add(norm(r.campaign));
+    return set;
+  }, [crm?.codeRows, codes]);
+
+  /**
+   * Which campaigns the media side is narrowed to — null means no narrowing.
+   *
+   * Only the campaign-IDENTIFYING facets move spend: a campaign_code names a set
+   * of campaigns, and utm_campaign names them directly. utm_source, utm_medium,
+   * utm_content and the lead stage describe LEADS, not which campaign ran, so
+   * they deliberately leave spend alone. That is what makes cost-per-stage
+   * meaningful — campaign spend ÷ leads at that stage — instead of a numerator
+   * that shrinks alongside its own denominator.
+   *
+   * Before this, spend ignored the filters entirely: selecting one campaign_code
+   * left Spend at the full account total while Leads narrowed, so Cost / lead was
+   * total spend divided by one code's leads.
+   */
+  const mediaCampaignFilter = useMemo(() => {
+    let set: Set<string> | null = campaignsUnderCode ? new Set(campaignsUnderCode) : null;
+    if (utmCamps.length) {
+      set = set ? new Set(utmCamps.filter((c) => set!.has(c))) : new Set(utmCamps);
+    }
+    return set;
+  }, [campaignsUnderCode, utmCamps]);
+
+  /** Does a media row belong to the selected campaigns? Name or Meta id. */
+  const inCampaignFilter = useCallback(
+    (r: { campaign: string; campaignId: string | null }) =>
+      !mediaCampaignFilter || mediaCampaignFilter.has(norm(r.campaign)) || (!!r.campaignId && mediaCampaignFilter.has(norm(r.campaignId))),
+    [mediaCampaignFilter],
+  );
+
+
   // ── Media regrouping (ad-level rows → any view level) ──────────────────────
   const regroup = useCallback((rows: CampaignRow[], level: PaidLevel): CampaignRow[] => {
     const acc = new Map<string, CampaignRow>();
@@ -501,13 +560,14 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     return (data?.rows ?? []).filter(
       (r) =>
         (platformFilter === "all" || r.platform === platformFilter) &&
+        inCampaignFilter(r) &&
         (!needle ||
           norm(r.campaign).includes(needle) ||
           norm(r.adset ?? "").includes(needle) ||
           norm(r.ad ?? "").includes(needle) ||
           norm(r.accountName).includes(needle)),
     );
-  }, [data?.rows, platformFilter, q]);
+  }, [data?.rows, platformFilter, q, inCampaignFilter]);
 
   const mediaRows = useMemo(() => regroup(mediaFiltered, viewLevel), [mediaFiltered, viewLevel, regroup]);
 
@@ -530,35 +590,6 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   }, [mediaFiltered, regroup]);
 
   // ── CRM facets: five interlinked, searchable filters ───────────────────────
-  /** utm_campaigns living under ANY selected campaign_code (from Engage). */
-  /**
-   * campaign name (and Meta campaign id) → the platform it actually ran on,
-   * taken from the ad-platform data itself.
-   *
-   * This replaces matching leads by utm_source spelling, which was wrong in a
-   * way that mattered: a lead that arrived from a Google ad and then converted
-   * on a website pop-up carries utm_source=google, so a pop-up campaign appeared
-   * under the Google Ads filter. A campaign's platform is a property of the
-   * campaign, not of a lead's last touch — so it comes from the platform that
-   * actually reports the campaign.
-   */
-  const campaignPlatform = useMemo(() => {
-    const m = new Map<string, PaidPlatform>();
-    for (const r of data?.rows ?? []) {
-      m.set(norm(r.campaign), r.platform);
-      if (r.campaignId) m.set(norm(r.campaignId), r.platform);
-    }
-    return m;
-  }, [data?.rows]);
-
-  const campaignsUnderCode = useMemo(() => {
-    if (!codes.length) return null;
-    const chosen = new Set(codes);
-    const set = new Set<string>();
-    for (const r of crm?.codeRows ?? []) if (chosen.has(norm(r.code))) set.add(norm(r.campaign));
-    return set;
-  }, [crm?.codeRows, codes]);
-
   const crmBase = useCallback(
     (skip: "campaign" | "source" | "medium" | "content" | "code" | null) => {
       const rows = crm?.rows ?? [];
@@ -597,35 +628,68 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
   const medOptions = useMemo(() => facetOf(crmBase("medium"), "medium"), [crmBase]);
   const contentOptions = useMemo(() => facetOf(crmBase("content"), "content"), [crmBase]);
 
-  /** Code options, narrowed by the campaign facet when one is chosen. */
   /**
-   * Campaigns still visible under every filter except the code selection —
-   * used to narrow the code facet without it narrowing itself.
+   * Campaign-tagged leads whose campaign appears in NO platform's data, so a
+   * platform filter cannot place them. Counted so the exclusion is visible.
    */
-  const campaignsForCodes = useMemo(() => new Set(crmBase("code").map((r) => norm(r.campaign))), [crmBase]);
-  /**
-   * True when something other than the code selection is narrowing campaigns.
-   *
-   * The guard matters: the utm query only returns leads that HAVE a
-   * utm_campaign, so a code whose leads are all untagged (the WhatsApp/email
-   * button leads) has no campaign in that set. Intersecting unconditionally
-   * would erase those codes from the list even with no filters on.
-   */
-  const narrowingCampaigns =
-    platformFilter !== "all" || utmCamps.length > 0 || utmSrcs.length > 0 || utmMeds.length > 0 || utmContents.length > 0 || !!q.trim();
+  const unattributableLeads = useMemo(() => {
+    if (platformFilter === "all") return 0;
+    let n = 0;
+    for (const r of crm?.rows ?? []) if (!campaignPlatform.has(norm(r.campaign))) n += r.n;
+    return n;
+  }, [crm?.rows, campaignPlatform, platformFilter]);
 
+  /**
+   * Nothing but the code selection is narrowing anything.
+   *
+   * Reads the raw selections rather than the pruned ones so it can be computed
+   * before the facet options exist — and because "did the user pick something"
+   * is the question, same as campaignsUnderCode and the media allowlist.
+   */
+  const utmFiltersIdle =
+    !utmCamps.length && !utmSrcs.length && !utmMeds.length && !utmContents.length && platformFilter === "all" && !q.trim();
+
+  /** utm_campaign → the campaign_codes it belongs to, from Engage membership. */
+  const campaignToCodes = useMemo(() => {
+    const m = new Map<string, Set<string>>();
+    for (const r of crm?.codeRows ?? []) {
+      const code = norm(r.code);
+      if (code === "(unlinked)") continue;
+      const k = norm(r.campaign);
+      const set = m.get(k) ?? new Set<string>();
+      set.add(code);
+      m.set(k, set);
+    }
+    return m;
+  }, [crm?.codeRows]);
+
+  /**
+   * Code facet counts, sourced the SAME way the funnel is so the two agree.
+   *
+   * The funnel reads membership rows when nothing but codes is selected (which
+   * is what includes a code's untagged WhatsApp/email leads) and per-lead utm
+   * rows otherwise. The facet used to always read membership rows while the
+   * funnel had switched to utm rows, so a code could offer "7" and then show 27
+   * once picked. Mirroring the switch makes the number on the chip a promise.
+   */
   const codeOptions = useMemo(() => {
     const acc = new Map<string, number>();
-    for (const r of crm?.codeRows ?? []) {
-      if (stageFilter !== "all" && bucketOf(r.stage, r.state) !== stageFilter) continue;
-      if (utmCamps.length && !utmCamps.includes(norm(r.campaign))) continue;
-      if (narrowingCampaigns && !campaignsForCodes.has(norm(r.campaign))) continue;
-      const v = norm(r.code);
-      if (v === "(unlinked)") continue;
-      acc.set(v, (acc.get(v) ?? 0) + r.n);
+    if (utmFiltersIdle) {
+      for (const r of crm?.codeRows ?? []) {
+        if (stageFilter !== "all" && bucketOf(r.stage, r.state) !== stageFilter) continue;
+        const v = norm(r.code);
+        if (v === "(unlinked)") continue;
+        acc.set(v, (acc.get(v) ?? 0) + r.n);
+      }
+    } else {
+      // Every other filter already applied; "code" is skipped so the facet does
+      // not narrow itself.
+      for (const r of crmBase("code")) {
+        for (const c of campaignToCodes.get(norm(r.campaign)) ?? []) acc.set(c, (acc.get(c) ?? 0) + r.n);
+      }
     }
     return [...acc].sort((a, b) => b[1] - a[1]);
-  }, [crm?.codeRows, utmCamps, stageFilter, narrowingCampaigns, campaignsForCodes]);
+  }, [crm?.codeRows, crmBase, campaignToCodes, stageFilter, utmFiltersIdle]);
 
   // A value that an upstream filter has made impossible is pruned rather than
   // left in place to zero the page. Prune to empty = back to "all".
@@ -654,26 +718,6 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     [crmBase, campsKey, srcsKey, medsKey, contentsKey],
   );
 
-  /**
-   * Campaign-tagged leads whose campaign appears in NO platform's data, so a
-   * platform filter cannot place them. Counted so the exclusion is visible.
-   */
-  const unattributableLeads = useMemo(() => {
-    if (platformFilter === "all") return 0;
-    let n = 0;
-    for (const r of crm?.rows ?? []) if (!campaignPlatform.has(norm(r.campaign))) n += r.n;
-    return n;
-  }, [crm?.rows, campaignPlatform, platformFilter]);
-
-  const utmFiltersIdle =
-    !activeCamps.length && !activeSrcs.length && !activeMeds.length && !activeContents.length && platformFilter === "all" && !q.trim();
-
-  /**
-   * Funnel aggregation. With ONLY a campaign code selected, the stage counts
-   * come from the code's membership rows so its untagged leads (WhatsApp/email
-   * button leads carrying no utm) are included; any UTM filter narrows to
-   * utm-tagged leads by construction.
-   */
   /**
    * The rows the funnel and its hover breakdown are both built from — so the
    * tooltip can never disagree with the bar it belongs to.
@@ -833,13 +877,14 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     const acc = new Map(bucketKeys.map((k) => [k, { cost: 0, leads: 0 }]));
     for (const d of data?.byDateFine ?? []) {
       if (platformFilter !== "all" && d.platform !== platformFilter) continue;
+      if (!inCampaignFilter(d)) continue;
       const cur = acc.get(bucketKey(d.date, bucket));
       if (!cur) continue; // outside the requested range
       cur.cost += d.cost;
       cur.leads += d.leads;
     }
     return bucketKeys.map((k) => acc.get(k)!);
-  }, [data?.byDateFine, platformFilter, bucketKeys, bucket]);
+  }, [data?.byDateFine, platformFilter, bucketKeys, bucket, inCampaignFilter]);
 
   const platformTrend = useMemo(() => {
     const series = PLATFORM_ORDER.map((p) => {
@@ -847,6 +892,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
       let any = false;
       for (const d of data?.byDateFine ?? []) {
         if (d.platform !== p) continue;
+        if (!inCampaignFilter(d)) continue;
         const k = bucketKey(d.date, bucket);
         if (!acc.has(k)) continue;
         acc.set(k, acc.get(k)! + d.cost);
@@ -855,7 +901,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
       return { platform: p, points: bucketKeys.map((k) => acc.get(k)!), any };
     }).filter((s) => s.any);
     return series;
-  }, [data?.byDateFine, bucketKeys, bucket]);
+  }, [data?.byDateFine, bucketKeys, bucket, inCampaignFilter]);
 
   const byGoal = useMemo(() => {
     const acc = new Map<CampaignGoal, number>();
@@ -872,7 +918,9 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
     const needle = norm(q);
     const rows = regroup(
       (data?.rows ?? []).filter(
-        (r) => !needle || norm(r.campaign).includes(needle) || norm(r.adset ?? "").includes(needle) || norm(r.ad ?? "").includes(needle) || norm(r.accountName).includes(needle),
+        (r) =>
+          inCampaignFilter(r) &&
+          (!needle || norm(r.campaign).includes(needle) || norm(r.adset ?? "").includes(needle) || norm(r.ad ?? "").includes(needle) || norm(r.accountName).includes(needle)),
       ),
       "campaign",
     );
@@ -896,7 +944,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
       mixed: allCurs.size > 1,
     };
     return { list, total };
-  }, [data?.rows, data?.accountsUsed, data?.emptyAccounts, data?.failures, q, regroup]);
+  }, [data?.rows, data?.accountsUsed, data?.emptyAccounts, data?.failures, q, regroup, inCampaignFilter]);
 
   // ── Campaign tree: code → utm_campaign → ad set → ad ───────────────────────
   const mediaIndex = useMemo(() => {
@@ -1150,6 +1198,15 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
               <FilterSelect label="utm_content" selected={activeContents} options={contentOptions} onToggle={toggleIn(setUtmContents)} onClear={() => setUtmContents([])} />
               <input className="search-box" placeholder="Search everything…" value={q} onChange={(e) => setQ(e.target.value)} />
             </div>
+            <div className="chart-sub" style={{ marginTop: 8 }}>
+              Every figure on the page is faceted. <strong>Spend and the ad metrics</strong> follow platform, campaign_code and
+              utm_campaign — the filters that identify a campaign. <strong>utm_source, utm_medium, utm_content and lead stage</strong>{" "}
+              describe leads rather than campaigns, so they narrow the lead figures and leave spend whole: that is what makes
+              cost per stage read as campaign spend ÷ leads at that stage.
+              {mediaCampaignFilter && mediaRows.length === 0 && (
+                <span style={{ color: C.coral }}> No ad spend is recorded against the selected campaign(s) in this range.</span>
+              )}
+            </div>
           </div>
 
           {/* ── KPIs ─────────────────────────────────────────────────────────── */}
@@ -1231,7 +1288,7 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
             </div>
             {platformFilter !== "all" && unattributableLeads > 0 && (
               <div className="chart-sub" style={{ marginTop: 8 }}>
-                {fmt(unattributableLeads)} campaign-tagged lead{unattributableLeads === 1 ? "" : "s"} excluded: their utm_campaign matches
+                {fmt(unattributableLeads)}{" "}campaign-tagged lead{unattributableLeads === 1 ? "" : "s"}{" "}excluded: their utm_campaign matches
                 no campaign in any selected ad account, so no platform can be attributed to them. Clear the platform filter to include
                 them, or check the naming — the Explorer&apos;s dashes show the same mismatch from the ads side.
               </div>

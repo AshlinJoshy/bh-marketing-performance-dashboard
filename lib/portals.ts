@@ -1,0 +1,379 @@
+// Portals — the listing-portal channel (Property Finder, Bayut, Dubizzle) read
+// from the Engage CRM via Metabase. Spend comes from lib/portalSpend.ts.
+//
+// Every join and column below was READ off the live schema, not inferred:
+//
+//   listing_portals(listing_id, portal_id, status)   publication, status='Published'
+//   listings.listable_id → properties (listable_type='Property')
+//   properties.community_id → communities.id          building / sub-development
+//   communities.location_id → locations.id            THE AREA — "Dubai Marina"
+//
+// `communities.name` is a building ("Al Meraikhi Tower", "Golf Promenade 4B"),
+// so area grouping uses locations.name one level up. Grouping by community would
+// have produced a list of towers, not areas.
+//
+// PORTAL IDs. There is no `portals` lookup table in this database, so portal_id
+// is mapped by evidence:
+//   1 → Property Finder. Its external_id is a 26-char ULID
+//       ("001WTV3FZGYCD3KGPGP6EWG22R"), a format no other portal_id uses, and it
+//       shares external_ids with no other portal.
+//   2 → Bayut, 3 → Dubizzle. These two carry 8-digit numeric external_ids from
+//       the same range and share the SAME external_id on 2,576 listings — the
+//       signature of Bayut and dubizzle being one platform (Dubizzle Group).
+//       Which of the pair is which is NOT derivable from the data. 2 has more
+//       published listings than 3 (3,541 vs 2,523), matching Bayut's 9.5x larger
+//       spend, so 2 is taken as Bayut. ASSUMPTION — override with
+//       PORTAL_ID_OVERRIDE below if it's the wrong way round.
+//   4, 6, 7 → other portals, no external_id ever returned. Left unmapped rather
+//       than guessed, and reported so they aren't silently dropped.
+//
+// Definitions inherited from lib/company.ts so the tabs can't disagree:
+//   • Deal    — status Reserved/Closed/Completed, state <> 'Withdrawn', by reserved_at.
+//   • Revenue — final_gross_commission_amount, AED.
+//   • Channel — enquiry_source of the deal's ORIGINATING lead.
+import { mbQuery, mbQueryEx } from "@/lib/metabase";
+
+export const PORTALS = ["Property Finder", "Bayut", "Dubizzle"] as const;
+export type Portal = (typeof PORTALS)[number];
+
+/** portal_id → portal name. Env override: "1=Property Finder,2=Dubizzle,3=Bayut". */
+const PORTAL_ID_OVERRIDE = process.env.ENGAGE_PORTAL_IDS;
+
+function portalIdMap(): Record<number, string> {
+  if (PORTAL_ID_OVERRIDE) {
+    const out: Record<number, string> = {};
+    for (const pair of PORTAL_ID_OVERRIDE.split(",")) {
+      const [k, v] = pair.split("=");
+      const id = Number(k?.trim());
+      if (Number.isFinite(id) && v?.trim()) out[id] = v.trim();
+    }
+    if (Object.keys(out).length) return out;
+  }
+  return { 1: "Property Finder", 2: "Bayut", 3: "Dubizzle" };
+}
+
+/** Which half of the business. Leasing = rentals; Sale = everything else. */
+export type Side = "all" | "leasing" | "sale";
+
+export interface PortalRow {
+  portal: string;
+  leads: number;
+  deals: number;
+  commission: number;
+  /** Listings currently published to this portal. */
+  listings: number | null;
+}
+
+export interface AreaRow {
+  area: string;
+  /** Listings published to any mapped portal, in this area. */
+  listings: number;
+  deals: number;
+  commission: number;
+}
+
+export interface PortalsData {
+  connected: boolean;
+  from: string;
+  to: string;
+  label: string;
+  months: string[];
+  portals: string[];
+  brands: { key: string; label: string }[];
+  brand: string;
+  side: Side;
+  generatedAt: string;
+
+  rows: PortalRow[];
+  leadsByMonth: Record<string, number[]>;
+  dealsByMonth: Record<string, number[]>;
+  commByMonth: Record<string, number[]>;
+
+  /** Areas ordered by deals, biggest first — "which area got the most deals". */
+  areas: AreaRow[];
+  /** How the area grouping was reached, so the number can be audited. */
+  areaSource: string;
+  /** portal_id values present in listing_portals that we haven't mapped to a name. */
+  unmappedPortalIds: { id: number; published: number }[];
+  /** True when the Bayut/Dubizzle assignment is the inferred default. */
+  portalIdsAssumed: boolean;
+
+  error?: string;
+  warnings: string[];
+}
+
+const isDate = (s?: string): string | null => (s && /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null);
+const ymd = (d: Date) => d.toISOString().slice(0, 10);
+const sqlStr = (s: string) => `'${s.replace(/'/g, "''")}'`;
+
+function monthList(from: string, to: string): string[] {
+  const out: string[] = [];
+  let y = Number(from.slice(0, 4));
+  let m = Number(from.slice(5, 7));
+  const endY = Number(to.slice(0, 4));
+  const endM = Number(to.slice(5, 7));
+  while (y < endY || (y === endY && m <= endM)) {
+    out.push(`${y}-${String(m).padStart(2, "0")}`);
+    m += 1;
+    if (m > 12) { m = 1; y += 1; }
+  }
+  return out;
+}
+
+/** enquiry_source → portal name. Anything else is NULL and excluded. */
+function portalSql(col: string): string {
+  const s = `LOWER(TRIM(${col}))`;
+  return `CASE
+    WHEN ${s} IN ('pf','property finder','propertyfinder','property-finder') THEN 'Property Finder'
+    WHEN ${s} IN ('bayut','bayut.com') THEN 'Bayut'
+    WHEN ${s} IN ('dubizzle','dubizzle.com') THEN 'Dubizzle'
+    END`;
+}
+
+const DEAL_VALID = `d.status IN ('Reserved','Closed','Completed') AND d.state <> 'Withdrawn'`;
+
+/** Deals: rentals are Leasing. Matches lib/company.ts. */
+const dealSide = (side: Side) =>
+  side === "leasing" ? ` AND d.type = 'Rent'` : side === "sale" ? ` AND d.type <> 'Rent'` : "";
+
+/** Leads: Tenant/Landlord are Leasing, Buyer/Seller are Sale. */
+const leadSide = (side: Side) =>
+  side === "leasing"
+    ? ` AND l.type IN ('Tenant','Landlord')`
+    : side === "sale"
+      ? ` AND l.type IN ('Buyer','Seller')`
+      : ` AND l.type IN ('Buyer','Seller','Tenant','Landlord')`;
+
+/** Listings: `listings.type` is exactly 'Rent' or 'Sale' — no other value exists. */
+const listingSide = (side: Side) =>
+  side === "leasing" ? ` AND li.type = 'Rent'` : side === "sale" ? ` AND li.type = 'Sale'` : "";
+
+const BRAND_GROUPS: Record<string, string[]> = {
+  betterhomes: ["Betterhomes", "Local", "BH Elite", "BH Exclusive"],
+  prime: ["Prime"],
+};
+
+function brandNames(brand: string): string[] {
+  if (BRAND_GROUPS[brand]) return BRAND_GROUPS[brand];
+  if (brand.startsWith("entity:")) return [brand.slice("entity:".length)];
+  return [];
+}
+
+function brandFilter(names: string[], col: string): string {
+  if (!names.length) return "";
+  return ` AND ${col} IN (SELECT id FROM divisions WHERE name IN (${names.map(sqlStr).join(",")}))`;
+}
+
+export function portalsRange(fromRaw?: string, toRaw?: string): { from: string; to: string } {
+  const floor = "2025-01-01";
+  let to = isDate(toRaw) ?? ymd(new Date());
+  let from = isDate(fromRaw) ?? floor;
+  if (from < floor) from = floor;
+  if (to < from) [from, to] = [to, from];
+  return { from, to };
+}
+
+/** The area of a deal or listing: property → community → location. */
+const AREA_JOIN = `
+  JOIN listings li ON li.id = d.listing_id AND li.listable_type = 'Property'
+  JOIN properties p ON p.id = li.listable_id
+  JOIN communities c ON c.id = p.community_id
+  JOIN locations loc ON loc.id = c.location_id`;
+
+export const AREA_SOURCE = "locations.name (properties → communities → locations)";
+
+export async function getPortalsData(
+  fromRaw?: string,
+  toRaw?: string,
+  brandRaw?: string,
+  sideRaw?: string,
+): Promise<PortalsData> {
+  const { from, to } = portalsRange(fromRaw, toRaw);
+  const months = monthList(from, to);
+  const idx = new Map(months.map((m, i) => [m, i]));
+  const brand = brandRaw && brandNames(brandRaw).length ? String(brandRaw) : "";
+  const names = brandNames(brand);
+  const side: Side = sideRaw === "leasing" || sideRaw === "sale" ? sideRaw : "all";
+
+  const connected = !!(
+    process.env.METABASE_URL &&
+    (process.env.METABASE_API_KEY || (process.env.METABASE_USERNAME && process.env.METABASE_PASSWORD))
+  );
+
+  const zero = () => Object.fromEntries(PORTALS.map((p) => [p, new Array(months.length).fill(0)])) as Record<string, number[]>;
+  const ids = portalIdMap();
+
+  const base: PortalsData = {
+    connected,
+    from,
+    to,
+    label: `${from} → ${to}`,
+    months,
+    portals: [...PORTALS],
+    brands: [
+      { key: "", label: "All brands" },
+      { key: "betterhomes", label: "Betterhomes" },
+      { key: "prime", label: "Prime" },
+    ],
+    brand,
+    side,
+    generatedAt: new Date().toISOString(),
+    rows: PORTALS.map((p) => ({ portal: p, leads: 0, deals: 0, commission: 0, listings: null })),
+    leadsByMonth: zero(),
+    dealsByMonth: zero(),
+    commByMonth: zero(),
+    areas: [],
+    areaSource: AREA_SOURCE,
+    unmappedPortalIds: [],
+    portalIdsAssumed: !PORTAL_ID_OVERRIDE,
+    warnings: [],
+  };
+  if (!connected) return base;
+
+  const until = `DATE_ADD('${to}', INTERVAL 1 DAY)`;
+  const P_LEAD = portalSql("l.enquiry_source");
+
+  const leadsSql = `
+    SELECT DATE_FORMAT(l.created_at,'%Y-%m') AS mth, ${P_LEAD} AS portal, COUNT(*) AS n
+    FROM leads l
+    WHERE l.created_at >= '${from}' AND l.created_at < ${until}
+      AND ${P_LEAD} IS NOT NULL${leadSide(side)}${brandFilter(names, "l.division_id")}
+    GROUP BY 1,2`;
+
+  const dealsSql = `
+    SELECT DATE_FORMAT(d.reserved_at,'%Y-%m') AS mth, ${P_LEAD} AS portal,
+           COUNT(*) AS n, SUM(COALESCE(d.final_gross_commission_amount,0)) AS comm
+    FROM deals d
+    LEFT JOIN leads l ON l.id = d.lead_id
+    WHERE d.reserved_at >= '${from}' AND d.reserved_at < ${until}
+      AND ${DEAL_VALID} AND ${P_LEAD} IS NOT NULL${dealSide(side)}${brandFilter(names, "d.division_id")}
+    GROUP BY 1,2`;
+
+  // Which area produced the most deals. Only deals reachable through a property
+  // appear — a deal with no linked listing has no area, and is reported below
+  // rather than being quietly dropped from the ranking.
+  const areaDealsSql = `
+    SELECT loc.name AS area, COUNT(*) AS deals, SUM(COALESCE(d.final_gross_commission_amount,0)) AS comm
+    FROM deals d
+    JOIN leads l ON l.id = d.lead_id
+    ${AREA_JOIN}
+    WHERE d.reserved_at >= '${from}' AND d.reserved_at < ${until}
+      AND ${DEAL_VALID} AND ${P_LEAD} IS NOT NULL${dealSide(side)}${brandFilter(names, "d.division_id")}
+    GROUP BY 1 ORDER BY deals DESC LIMIT 60`;
+
+  // Deals in range that have a portal lead but no reachable area — the gap
+  // between the area table's total and the headline deal count.
+  const areaMissSql = `
+    SELECT COUNT(*) FROM deals d
+    JOIN leads l ON l.id = d.lead_id
+    LEFT JOIN listings li ON li.id = d.listing_id AND li.listable_type = 'Property'
+    LEFT JOIN properties p ON p.id = li.listable_id
+    LEFT JOIN communities c ON c.id = p.community_id
+    WHERE d.reserved_at >= '${from}' AND d.reserved_at < ${until}
+      AND ${DEAL_VALID} AND ${P_LEAD} IS NOT NULL${dealSide(side)}${brandFilter(names, "d.division_id")}
+      AND c.location_id IS NULL`;
+
+  // Live published listings per portal. A snapshot of now: listing_portals has no
+  // historical state, so this can't be filtered by the selected period.
+  const idList = Object.keys(ids).join(",");
+  const portalCase = `CASE ${Object.entries(ids).map(([id, nm]) => `WHEN lp.portal_id = ${Number(id)} THEN ${sqlStr(nm)}`).join(" ")} END`;
+  const listingsSql = `
+    SELECT ${portalCase} AS portal, COUNT(DISTINCT lp.listing_id) AS n
+    FROM listing_portals lp
+    JOIN listings li ON li.id = lp.listing_id AND li.listable_type = 'Property'
+    WHERE lp.status = 'Published' AND lp.portal_id IN (${idList})${listingSide(side)}
+    GROUP BY 1`;
+
+  const areaListingsSql = `
+    SELECT loc.name AS area, COUNT(DISTINCT lp.listing_id) AS n
+    FROM listing_portals lp
+    JOIN listings li ON li.id = lp.listing_id AND li.listable_type = 'Property'
+    JOIN properties p ON p.id = li.listable_id
+    JOIN communities c ON c.id = p.community_id
+    JOIN locations loc ON loc.id = c.location_id
+    WHERE lp.status = 'Published' AND lp.portal_id IN (${idList})${listingSide(side)}
+    GROUP BY 1 ORDER BY n DESC LIMIT 200`;
+
+  const unmappedIdsSql = `
+    SELECT lp.portal_id, COUNT(DISTINCT lp.listing_id) AS n
+    FROM listing_portals lp
+    WHERE lp.status = 'Published' AND lp.portal_id NOT IN (${idList})
+    GROUP BY 1 ORDER BY 2 DESC`;
+
+  const [leadsRes, dealsRes, areaDealRows, areaMissRows, listingRows, areaListRows, unmappedIdRows] = await Promise.all([
+    mbQueryEx(leadsSql, true, 30000),
+    mbQueryEx(dealsSql, true, 30000),
+    mbQuery(areaDealsSql, true, 30000),
+    mbQuery(areaMissSql, true, 25000),
+    mbQuery(listingsSql, true, 25000),
+    mbQuery(areaListingsSql, true, 30000),
+    mbQuery(unmappedIdsSql, true, 15000),
+  ]);
+
+  const leadRows = "rows" in leadsRes ? leadsRes.rows : null;
+  const dealRows = "rows" in dealsRes ? dealsRes.rows : null;
+
+  if (!leadRows && !dealRows) {
+    return { ...base, error: `Metabase didn't return portal figures — ${"error" in leadsRes ? leadsRes.error : "unknown"}` };
+  }
+  if (!leadRows) base.warnings.push(`Lead counts unavailable (${"error" in leadsRes ? leadsRes.error : "failed"}) — deals and commission are still live.`);
+  if (!dealRows) base.warnings.push(`Deal and commission figures unavailable (${"error" in dealsRes ? dealsRes.error : "failed"}) — lead counts are still live.`);
+
+  const totals = new Map<string, PortalRow>(base.rows.map((r) => [r.portal, { ...r }]));
+
+  for (const r of leadRows ?? []) {
+    const i = idx.get(String(r[0] ?? ""));
+    const p = String(r[1] ?? "");
+    if (i === undefined || !base.leadsByMonth[p]) continue;
+    const n = Number(r[2] ?? 0);
+    base.leadsByMonth[p][i] += n;
+    totals.get(p)!.leads += n;
+  }
+  for (const r of dealRows ?? []) {
+    const i = idx.get(String(r[0] ?? ""));
+    const p = String(r[1] ?? "");
+    if (i === undefined || !base.dealsByMonth[p]) continue;
+    base.dealsByMonth[p][i] += Number(r[2] ?? 0);
+    base.commByMonth[p][i] += Number(r[3] ?? 0);
+    totals.get(p)!.deals += Number(r[2] ?? 0);
+    totals.get(p)!.commission += Number(r[3] ?? 0);
+  }
+
+  if (listingRows) {
+    for (const r of listingRows) {
+      const p = String(r[0] ?? "");
+      const row = totals.get(p);
+      if (row) row.listings = (row.listings ?? 0) + Number(r[1] ?? 0);
+    }
+  } else {
+    base.warnings.push("Published-listing counts unavailable — the listing_portals query failed or timed out.");
+  }
+
+  base.rows = [...totals.values()];
+
+  // Merge deals-by-area with listings-by-area, ordered by deals.
+  const areaMap = new Map<string, AreaRow>();
+  for (const r of areaDealRows ?? []) {
+    const a = String(r[0] ?? "").trim() || "(no area)";
+    areaMap.set(a, { area: a, listings: 0, deals: Number(r[1] ?? 0), commission: Number(r[2] ?? 0) });
+  }
+  for (const r of areaListRows ?? []) {
+    const a = String(r[0] ?? "").trim() || "(no area)";
+    const cur = areaMap.get(a) ?? { area: a, listings: 0, deals: 0, commission: 0 };
+    cur.listings = Number(r[1] ?? 0);
+    areaMap.set(a, cur);
+  }
+  base.areas = [...areaMap.values()].sort((a, b) => b.deals - a.deals || b.listings - a.listings);
+  if (!areaDealRows) base.warnings.push("Deals by area unavailable — the area query failed or timed out.");
+
+  const missed = Number(areaMissRows?.[0]?.[0] ?? 0);
+  if (missed > 0) {
+    base.warnings.push(
+      `${missed.toLocaleString()} portal deal${missed === 1 ? "" : "s"} in this period have no linked property, so they carry no area and are absent from the area table (they ARE in the totals above).`,
+    );
+  }
+
+  base.unmappedPortalIds = (unmappedIdRows ?? []).map((r) => ({ id: Number(r[0] ?? 0), published: Number(r[1] ?? 0) }));
+
+  return base;
+}

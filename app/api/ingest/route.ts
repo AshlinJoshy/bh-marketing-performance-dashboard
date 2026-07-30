@@ -1,4 +1,9 @@
-// News ingestion endpoint (manual / on-demand — no daily cron).
+// News ingestion endpoint.
+// - Vercel cron → daily, per the `crons` entry in vercel.json. Vercel sends
+//   "Authorization: Bearer $CRON_SECRET", which is what isCron below matches.
+//   NOTE: with CRON_SECRET unset this returns 401 and the scheduled run fails
+//   silently — the bot just looks idle. BotStatus flags an overdue run for that
+//   reason.
 // - "Run now" button → server action → runIngest('manual')
 // - Direct call: GET /api/ingest?secret=$CRON_SECRET (or Bearer header)
 import { NextResponse } from "next/server";

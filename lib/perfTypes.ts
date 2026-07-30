@@ -104,21 +104,30 @@ export interface PerfRun {
   error: string | null;
 }
 
-// Instagram handles are the four confirmed in the shared report; other-platform
-// handles start blank and are filled in the Advanced editor (a blank handle just
-// means that account is skipped for that platform until it's set).
+// Every handle below was confirmed against the live public profile — the four
+// Instagram accounts from the shared report, plus the TikTok / Facebook /
+// LinkedIn accounts each agency actually posts from. A blank handle means that
+// account is skipped for that platform, so a wrong one is worse than none:
+// the scraper would report a rival's numbers as ours. Re-verify before editing.
+//
+// LinkedIn is stored as the canonical www.linkedin.com/company/<slug> URL —
+// see toLinkedInQuery() in lib/socialPerf.ts for how it becomes a search term.
 export const DEFAULT_PERF_CONFIG: PerfConfig = {
   brands: [
-    { name: "betterhomes",        isUs: true,  handles: { instagram: "betterhomesuae",   facebook: "https://www.facebook.com/betterhomesuae" } },
-    { name: "Allsopp & Allsopp",  isUs: false, handles: { instagram: "allsoppandallsopp" } },
-    { name: "haus & haus",        isUs: false, handles: { instagram: "hausandhaus" } },
-    { name: "White & Co",         isUs: false, handles: { instagram: "whiteandcodxb" } },
+    { name: "betterhomes",        isUs: true,  handles: { instagram: "betterhomesuae",      tiktok: "betterhomesdubai",     facebook: "https://www.facebook.com/betterhomesuae",     linkedin: "https://www.linkedin.com/company/better-homes-llc" } },
+    { name: "Allsopp & Allsopp",  isUs: false, handles: { instagram: "allsoppandallsopp",   tiktok: "allsoppandallsopp",    facebook: "https://www.facebook.com/AllsoppAndAllsopp",  linkedin: "https://www.linkedin.com/company/allsopp-&-allsopp" } },
+    // LinkedIn slug is "hausandhaus", NOT "haus-&-haus" — the latter is indexed by
+    // search engines but isn't the page's universal name, and returns nothing.
+    { name: "haus & haus",        isUs: false, handles: { instagram: "hausandhaus",         tiktok: "hausandhaus",          facebook: "https://www.facebook.com/hausandhaus",        linkedin: "https://www.linkedin.com/company/hausandhaus" } },
+    { name: "White & Co",         isUs: false, handles: { instagram: "whiteandcodxb",       tiktok: "whiteandcorealestate", facebook: "https://www.facebook.com/whiteandcodxb",      linkedin: "https://www.linkedin.com/company/white-co-real-estate-llc" } },
   ],
   actors: {
     instagram: "apify/instagram-profile-scraper",
     tiktok: "clockworks/tiktok-scraper",
     facebook: "apify/facebook-posts-scraper",
-    linkedin: "harvestapi/linkedin-post-search",
+    // A COMPANY-posts actor, not the post-SEARCH one: search returns anyone's
+    // posts that mention the brand, which is not what a brand benchmark measures.
+    linkedin: "harvestapi/linkedin-company-posts",
   },
   defaults: { window: "month", maxItems: 24 },
 };
