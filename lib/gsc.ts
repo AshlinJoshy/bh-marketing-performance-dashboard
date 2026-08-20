@@ -116,39 +116,13 @@ async function gscQuery(body: Record<string, unknown>): Promise<any | null> {
 }
 
 /**
- * Organic totals + per-keyword rankings, from whichever backend can answer.
- *
- * Supermetrics is tried first when its key is set, because it needs no Google
- * Cloud setup. It FALLS BACK to the Google service account, which talks to
- * Search Console directly and has no Supermetrics row quota.
- *
- * The fallback exists because preferring Supermetrics unconditionally meant a
- * spent row quota (HTTP 429 API_ROW_QUOTA_EXCEEDED) took the whole tab down for
- * the rest of the quota period, while a perfectly good second backend sat
- * implemented and unreachable. Either source alone is enough to render the tab.
+ * Organic totals + per-keyword rankings. Two interchangeable backends:
+ *   • Supermetrics Data Fetching API — used when SUPERMETRICS_API_KEY is set
+ *     (no Google Cloud setup; GSC is already authorized inside Supermetrics).
+ *   • Google service account — used otherwise (GSC_CLIENT_EMAIL/PRIVATE_KEY).
  */
 export async function getGscMetrics(from: string, to: string, targetKeywords: string[] = []): Promise<GscData> {
-  const hasServiceAccount = !!(process.env.GSC_CLIENT_EMAIL && process.env.GSC_PRIVATE_KEY);
-
-  if (process.env.SUPERMETRICS_API_KEY) {
-    const sm = await getGscViaSupermetrics(from, to, targetKeywords);
-    // A usable answer: no error AND a figure that isn't a placeholder zero.
-    const usable = !sm.error && !!sm.totals && (sm.totals.impressions > 0 || sm.totals.clicks > 0);
-    if (usable || !hasServiceAccount) {
-      // Nothing to fall back to — say why the tab is empty rather than implying
-      // Supermetrics is the only way to read Search Console.
-      if (!usable && !hasServiceAccount && sm.error) {
-        sm.error = `${sm.error} — no GSC_CLIENT_EMAIL / GSC_PRIVATE_KEY set, so there is no direct Search Console fallback.`;
-      }
-      return sm;
-    }
-    const direct = await getGscViaServiceAccount(from, to, targetKeywords);
-    // Only prefer the fallback if it actually produced something; otherwise keep
-    // the Supermetrics message, which is the more specific of the two.
-    if (!direct.error) return { ...direct, error: undefined };
-    return { ...direct, error: `Supermetrics: ${sm.error} · Direct: ${direct.error}` };
-  }
-
+  if (process.env.SUPERMETRICS_API_KEY) return getGscViaSupermetrics(from, to, targetKeywords);
   return getGscViaServiceAccount(from, to, targetKeywords);
 }
 
@@ -160,22 +134,7 @@ async function getGscViaServiceAccount(from: string, to: string, targetKeywords:
   const [totalsRes, kwRes] = await Promise.all([
     gscQuery({ startDate: from, endDate: to, dimensions: [], dataState: "all" }),
     targetKeywords.length
-      // Filtered server-side to the tracked terms, same reasoning as the
-      // Supermetrics path: fetching every query to keep twenty is wasteful, and
-      // Search Console caps rowLimit anyway.
-      ? gscQuery({
-          startDate: from,
-          endDate: to,
-          dimensions: ["query"],
-          rowLimit: Math.max(25, targetKeywords.length * 3),
-          dataState: "all",
-          dimensionFilterGroups: [
-            {
-              groupType: "or",
-              filters: targetKeywords.map((k) => ({ dimension: "query", operator: "equals", expression: k })),
-            },
-          ],
-        })
+      ? gscQuery({ startDate: from, endDate: to, dimensions: ["query"], rowLimit: 5000, dataState: "all" })
       : Promise.resolve(null),
   ]);
 
@@ -206,13 +165,8 @@ async function getGscViaServiceAccount(from: string, to: string, targetKeywords:
 // Uses your Supermetrics API key so GSC is pulled through Supermetrics (which
 // already has the property authorized) instead of a Google service account.
 //   SUPERMETRICS_API_KEY   the Data Fetching API key (hub.supermetrics.com)
-//   SUPERMETRICS_DS_USER   optional. The Supermetrics login that authorised GSC.
-//                          OMITTED when unset rather than defaulted: this key's
-//                          own account is already authorised for GSC (proven by
-//                          a bare query returning data), and sending a ds_user
-//                          the API key doesn't own answers 403
-//                          QUERY_AUTH_UNAVAILABLE. lib/paid.ts hit exactly this
-//                          and omits it for the same reason.
+//   SUPERMETRICS_DS_USER   the Supermetrics login that authorized GSC
+//                          (defaults to zahra.firouzi@bhomes.com)
 //   GSC_SITE_URL           the GSC account/site (defaults to sc-domain:bhomes.com)
 //   SUPERMETRICS_API_URL   override the endpoint if your plan differs
 const SM_ENDPOINT = process.env.SUPERMETRICS_API_URL || "https://api.supermetrics.com/enterprise/v2/query/data/json";
@@ -243,44 +197,24 @@ function smIdx(header: string[]): Record<string, number> {
   return idx;
 }
 
-/** Last failure from smQuery, so the UI can show the reason instead of a guess. */
+/** Last failure from smQuery, so the card can show the reason instead of a guess. */
 let smLastError: string | null = null;
 
-/**
- * Short lived cache of successful GSC reads, keyed by range and keyword set.
- *
- * Row quota is consumed per request, so a page reload used to cost as much as
- * the first load. GSC data is daily and lags two to three days, so serving a
- * result up to 30 minutes old costs nothing in accuracy and takes repeat views
- * to zero rows.
- *
- * In process, so it is per serverless instance rather than global. That is fine
- * for the purpose: it removes the reload-and-refresh pattern that drains the
- * quota, without pretending to be shared state.
- */
-const GSC_TTL_MS = Number(process.env.GSC_CACHE_MS || 30 * 60 * 1000);
-const gscCache = new Map<string, { at: number; data: GscData }>();
-
-async function smQuery(fields: string[], from: string, to: string, maxRows: number, filters?: string): Promise<any[][] | null> {
+async function smQuery(fields: string[], from: string, to: string, maxRows: number): Promise<any[][] | null> {
   const key = process.env.SUPERMETRICS_API_KEY;
-  if (!key) {
-    smLastError = "SUPERMETRICS_API_KEY is not set";
-    return null;
-  }
+  if (!key) return null;
   // Documented v2 method: POST JSON with `Authorization: Bearer <key>`, fields as
   // a comma-separated string. (The api_key is NOT put in the body.)
   const payload: Record<string, unknown> = {
     ds_id: "GW",
     ds_accounts: [process.env.GSC_SITE_URL || "sc-domain:bhomes.com"],
+    ds_user: process.env.SUPERMETRICS_DS_USER || "zahra.firouzi@bhomes.com",
     date_range_type: "custom",
     start_date: from,
     end_date: to,
     fields: fields.join(","),
     max_rows: maxRows,
   };
-  const dsUser = process.env.SUPERMETRICS_DS_USER;
-  if (dsUser) payload.ds_user = dsUser;
-  if (filters) payload.filters = filters;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 20000);
   try {
@@ -293,8 +227,8 @@ async function smQuery(fields: string[], from: string, to: string, maxRows: numb
     });
     const text = await res.text().catch(() => "");
     if (!res.ok) {
-      // 500, not 200: Supermetrics states the actual row-quota numbers in the
-      // `description` field, and 200 chars cut the message off just before them.
+      // 500 chars: Supermetrics states the actual row-quota numbers in the
+      // description, and a shorter slice cuts the message off just before them.
       smLastError = `HTTP ${res.status}: ${text.slice(0, 500)}`;
       console.error(`[gsc/supermetrics] ${smLastError}`);
       return null;
@@ -309,7 +243,7 @@ async function smQuery(fields: string[], from: string, to: string, maxRows: numb
     }
     if (j?.error) {
       const m = typeof j.error === "string" ? j.error : j.error?.message || JSON.stringify(j.error);
-      smLastError = String(m).slice(0, 240);
+      smLastError = String(m).slice(0, 400);
       console.error(`[gsc/supermetrics] API error: ${smLastError}`);
       return null;
     }
@@ -319,7 +253,7 @@ async function smQuery(fields: string[], from: string, to: string, maxRows: numb
     return Array.isArray(rows) ? rows : null;
   } catch (e) {
     const m = e instanceof Error ? e.message : String(e);
-    smLastError = m.includes("abort") ? `timed out after ${Math.round(20000 / 1000)}s` : m;
+    smLastError = m;
     console.error(`[gsc/supermetrics] error: ${smLastError}`);
     return null;
   } finally {
@@ -329,43 +263,15 @@ async function smQuery(fields: string[], from: string, to: string, maxRows: numb
 
 async function getGscViaSupermetrics(from: string, to: string, targetKeywords: string[] = []): Promise<GscData> {
   const base: GscData = { connected: true, totals: null, keywords: [], label: `${from} → ${to}` };
-
-  const cacheKey = `${from}|${to}|${targetKeywords.join("~")}`;
-  const hit = gscCache.get(cacheKey);
-  if (hit && Date.now() - hit.at < GSC_TTL_MS) return hit.data;
-
-  /**
-   * Filter to the tracked keywords AT THE SOURCE.
-   *
-   * This used to request 5,000 rows of every search query and then keep only the
-   * handful in targetKeywords — roughly a 250x overfetch, repeated on every page
-   * load, which is what exhausted the row quota (HTTP 429
-   * API_ROW_QUOTA_EXCEEDED). The `[]` in-list operator returns one row per
-   * keyword instead, verified against the live API.
-   *
-   * Keywords containing a comma are left out of the filter: the list operator is
-   * comma-delimited with no documented escape, so including one would silently
-   * split it into two wrong terms. They are reported as having no data rather
-   * than corrupting the whole query.
-   */
-  const filterable = targetKeywords.filter((k) => !k.includes(","));
-  const kwFilter = filterable.length ? `query [] ${filterable.join(",")}` : undefined;
-  // A small multiple, not the exact count: GSC can return case or spacing
-  // variants of the same term, and truncating those would undercount a keyword.
-  const kwRowCap = Math.max(10, filterable.length * 3);
-
   const [totRows, kwRows] = await Promise.all([
     smQuery(["clicks", "impressions", "ctr", "position"], from, to, 1),
-    kwFilter ? smQuery(["query", "clicks", "impressions", "ctr", "position"], from, to, kwRowCap, kwFilter) : Promise.resolve(null),
+    targetKeywords.length ? smQuery(["query", "clicks", "impressions", "ctr", "position"], from, to, 5000) : Promise.resolve(null),
   ]);
 
-  // Say what actually failed. The old text guessed at three causes and led with
-  // the API key, which sent readers to check a key that was fine.
-  if (!totRows) {
-    base.error = smLastError
-      ? `GSC via Supermetrics failed: ${smLastError}`
-      : `Supermetrics returned no rows for ${process.env.GSC_SITE_URL || "sc-domain:bhomes.com"} in this range.`;
-  }
+  // Report what actually failed. The previous text guessed at three causes and
+  // led with the API key, which sent readers to check a key that was fine — the
+  // real answer was a row quota, and only the raw message said so.
+  if (!totRows) base.error = smLastError ? `GSC via Supermetrics failed: ${smLastError}` : "Supermetrics returned no GSC data.";
   const tot = smSplit(totRows);
   if (tot.data.length) {
     const i = tot.header.length ? smIdx(tot.header) : { clicks: 0, impressions: 1, ctr: 2, position: 3 };
@@ -405,8 +311,5 @@ async function getGscViaSupermetrics(from: string, to: string, targetKeywords: s
       };
     });
   }
-  // Only cache a good read. Caching a failure would pin the error in place for
-  // the whole TTL, including after quota resets.
-  if (!base.error) gscCache.set(cacheKey, { at: Date.now(), data: base });
   return base;
 }
