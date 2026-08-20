@@ -116,13 +116,39 @@ async function gscQuery(body: Record<string, unknown>): Promise<any | null> {
 }
 
 /**
- * Organic totals + per-keyword rankings. Two interchangeable backends:
- *   • Supermetrics Data Fetching API — used when SUPERMETRICS_API_KEY is set
- *     (no Google Cloud setup; GSC is already authorized inside Supermetrics).
- *   • Google service account — used otherwise (GSC_CLIENT_EMAIL/PRIVATE_KEY).
+ * Organic totals + per-keyword rankings, from whichever backend can answer.
+ *
+ * Supermetrics is tried first when its key is set, because it needs no Google
+ * Cloud setup. It FALLS BACK to the Google service account, which talks to
+ * Search Console directly and has no Supermetrics row quota.
+ *
+ * The fallback exists because preferring Supermetrics unconditionally meant a
+ * spent row quota (HTTP 429 API_ROW_QUOTA_EXCEEDED) took the whole tab down for
+ * the rest of the quota period, while a perfectly good second backend sat
+ * implemented and unreachable. Either source alone is enough to render the tab.
  */
 export async function getGscMetrics(from: string, to: string, targetKeywords: string[] = []): Promise<GscData> {
-  if (process.env.SUPERMETRICS_API_KEY) return getGscViaSupermetrics(from, to, targetKeywords);
+  const hasServiceAccount = !!(process.env.GSC_CLIENT_EMAIL && process.env.GSC_PRIVATE_KEY);
+
+  if (process.env.SUPERMETRICS_API_KEY) {
+    const sm = await getGscViaSupermetrics(from, to, targetKeywords);
+    // A usable answer: no error AND a figure that isn't a placeholder zero.
+    const usable = !sm.error && !!sm.totals && (sm.totals.impressions > 0 || sm.totals.clicks > 0);
+    if (usable || !hasServiceAccount) {
+      // Nothing to fall back to — say why the tab is empty rather than implying
+      // Supermetrics is the only way to read Search Console.
+      if (!usable && !hasServiceAccount && sm.error) {
+        sm.error = `${sm.error} — no GSC_CLIENT_EMAIL / GSC_PRIVATE_KEY set, so there is no direct Search Console fallback.`;
+      }
+      return sm;
+    }
+    const direct = await getGscViaServiceAccount(from, to, targetKeywords);
+    // Only prefer the fallback if it actually produced something; otherwise keep
+    // the Supermetrics message, which is the more specific of the two.
+    if (!direct.error) return { ...direct, error: undefined };
+    return { ...direct, error: `Supermetrics: ${sm.error} · Direct: ${direct.error}` };
+  }
+
   return getGscViaServiceAccount(from, to, targetKeywords);
 }
 
@@ -134,7 +160,22 @@ async function getGscViaServiceAccount(from: string, to: string, targetKeywords:
   const [totalsRes, kwRes] = await Promise.all([
     gscQuery({ startDate: from, endDate: to, dimensions: [], dataState: "all" }),
     targetKeywords.length
-      ? gscQuery({ startDate: from, endDate: to, dimensions: ["query"], rowLimit: 5000, dataState: "all" })
+      // Filtered server-side to the tracked terms, same reasoning as the
+      // Supermetrics path: fetching every query to keep twenty is wasteful, and
+      // Search Console caps rowLimit anyway.
+      ? gscQuery({
+          startDate: from,
+          endDate: to,
+          dimensions: ["query"],
+          rowLimit: Math.max(25, targetKeywords.length * 3),
+          dataState: "all",
+          dimensionFilterGroups: [
+            {
+              groupType: "or",
+              filters: targetKeywords.map((k) => ({ dimension: "query", operator: "equals", expression: k })),
+            },
+          ],
+        })
       : Promise.resolve(null),
   ]);
 
