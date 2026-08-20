@@ -3,7 +3,7 @@
 import { getSeoLeads } from "@/lib/seo";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 45;
+export const maxDuration = 90; // must exceed the 60s Metabase leads timeout
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);

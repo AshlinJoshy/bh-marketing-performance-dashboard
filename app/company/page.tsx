@@ -7,7 +7,7 @@ export const metadata: Metadata = {
 };
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 45;
+export const maxDuration = 90; // must exceed the 60s Metabase leads timeout
 
 export default async function CompanyPage() {
   const initial = await getCompanyData();
