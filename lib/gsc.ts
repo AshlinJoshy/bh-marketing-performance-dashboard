@@ -197,6 +197,9 @@ function smIdx(header: string[]): Record<string, number> {
   return idx;
 }
 
+/** Last failure from smQuery, so the card can show the reason instead of a guess. */
+let smLastError: string | null = null;
+
 async function smQuery(fields: string[], from: string, to: string, maxRows: number): Promise<any[][] | null> {
   const key = process.env.SUPERMETRICS_API_KEY;
   if (!key) return null;
@@ -224,18 +227,24 @@ async function smQuery(fields: string[], from: string, to: string, maxRows: numb
     });
     const text = await res.text().catch(() => "");
     if (!res.ok) {
-      console.error(`[gsc/supermetrics] HTTP ${res.status}: ${text.slice(0, 300)}`);
+      // 500 chars: Supermetrics states the actual row-quota numbers in the
+      // description, and a shorter slice cuts the message off just before them.
+      smLastError = `HTTP ${res.status}: ${text.slice(0, 500)}`;
+      console.error(`[gsc/supermetrics] ${smLastError}`);
       return null;
     }
     let j: any;
     try {
       j = JSON.parse(text);
     } catch {
-      console.error(`[gsc/supermetrics] non-JSON response: ${text.slice(0, 200)}`);
+      smLastError = `non-JSON response: ${text.slice(0, 160)}`;
+      console.error(`[gsc/supermetrics] ${smLastError}`);
       return null;
     }
     if (j?.error) {
-      console.error(`[gsc/supermetrics] API error: ${JSON.stringify(j.error).slice(0, 300)}`);
+      const m = typeof j.error === "string" ? j.error : j.error?.message || JSON.stringify(j.error);
+      smLastError = String(m).slice(0, 400);
+      console.error(`[gsc/supermetrics] API error: ${smLastError}`);
       return null;
     }
     // Envelope is usually { data: [[header],[row]…] }; tolerate { data: { data: [...] } }.
@@ -243,7 +252,9 @@ async function smQuery(fields: string[], from: string, to: string, maxRows: numb
     if (rows && !Array.isArray(rows) && Array.isArray(rows.data)) rows = rows.data;
     return Array.isArray(rows) ? rows : null;
   } catch (e) {
-    console.error(`[gsc/supermetrics] error: ${e instanceof Error ? e.message : String(e)}`);
+    const m = e instanceof Error ? e.message : String(e);
+    smLastError = m;
+    console.error(`[gsc/supermetrics] error: ${smLastError}`);
     return null;
   } finally {
     clearTimeout(t);
@@ -257,7 +268,10 @@ async function getGscViaSupermetrics(from: string, to: string, targetKeywords: s
     targetKeywords.length ? smQuery(["query", "clicks", "impressions", "ctr", "position"], from, to, 5000) : Promise.resolve(null),
   ]);
 
-  if (!totRows) base.error = "Supermetrics returned no GSC data — check SUPERMETRICS_API_KEY, the DS user, and that GSC is authorized.";
+  // Report what actually failed. The previous text guessed at three causes and
+  // led with the API key, which sent readers to check a key that was fine — the
+  // real answer was a row quota, and only the raw message said so.
+  if (!totRows) base.error = smLastError ? `GSC via Supermetrics failed: ${smLastError}` : "Supermetrics returned no GSC data.";
   const tot = smSplit(totRows);
   if (tot.data.length) {
     const i = tot.header.length ? smIdx(tot.header) : { clicks: 0, impressions: 1, ctr: 2, position: 3 };
