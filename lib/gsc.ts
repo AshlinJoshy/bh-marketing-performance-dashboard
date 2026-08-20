@@ -205,7 +205,22 @@ function smIdx(header: string[]): Record<string, number> {
 /** Last failure from smQuery, so the UI can show the reason instead of a guess. */
 let smLastError: string | null = null;
 
-async function smQuery(fields: string[], from: string, to: string, maxRows: number): Promise<any[][] | null> {
+/**
+ * Short lived cache of successful GSC reads, keyed by range and keyword set.
+ *
+ * Row quota is consumed per request, so a page reload used to cost as much as
+ * the first load. GSC data is daily and lags two to three days, so serving a
+ * result up to 30 minutes old costs nothing in accuracy and takes repeat views
+ * to zero rows.
+ *
+ * In process, so it is per serverless instance rather than global. That is fine
+ * for the purpose: it removes the reload-and-refresh pattern that drains the
+ * quota, without pretending to be shared state.
+ */
+const GSC_TTL_MS = Number(process.env.GSC_CACHE_MS || 30 * 60 * 1000);
+const gscCache = new Map<string, { at: number; data: GscData }>();
+
+async function smQuery(fields: string[], from: string, to: string, maxRows: number, filters?: string): Promise<any[][] | null> {
   const key = process.env.SUPERMETRICS_API_KEY;
   if (!key) {
     smLastError = "SUPERMETRICS_API_KEY is not set";
@@ -224,6 +239,7 @@ async function smQuery(fields: string[], from: string, to: string, maxRows: numb
   };
   const dsUser = process.env.SUPERMETRICS_DS_USER;
   if (dsUser) payload.ds_user = dsUser;
+  if (filters) payload.filters = filters;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 20000);
   try {
@@ -270,9 +286,34 @@ async function smQuery(fields: string[], from: string, to: string, maxRows: numb
 
 async function getGscViaSupermetrics(from: string, to: string, targetKeywords: string[] = []): Promise<GscData> {
   const base: GscData = { connected: true, totals: null, keywords: [], label: `${from} → ${to}` };
+
+  const cacheKey = `${from}|${to}|${targetKeywords.join("~")}`;
+  const hit = gscCache.get(cacheKey);
+  if (hit && Date.now() - hit.at < GSC_TTL_MS) return hit.data;
+
+  /**
+   * Filter to the tracked keywords AT THE SOURCE.
+   *
+   * This used to request 5,000 rows of every search query and then keep only the
+   * handful in targetKeywords — roughly a 250x overfetch, repeated on every page
+   * load, which is what exhausted the row quota (HTTP 429
+   * API_ROW_QUOTA_EXCEEDED). The `[]` in-list operator returns one row per
+   * keyword instead, verified against the live API.
+   *
+   * Keywords containing a comma are left out of the filter: the list operator is
+   * comma-delimited with no documented escape, so including one would silently
+   * split it into two wrong terms. They are reported as having no data rather
+   * than corrupting the whole query.
+   */
+  const filterable = targetKeywords.filter((k) => !k.includes(","));
+  const kwFilter = filterable.length ? `query [] ${filterable.join(",")}` : undefined;
+  // A small multiple, not the exact count: GSC can return case or spacing
+  // variants of the same term, and truncating those would undercount a keyword.
+  const kwRowCap = Math.max(10, filterable.length * 3);
+
   const [totRows, kwRows] = await Promise.all([
     smQuery(["clicks", "impressions", "ctr", "position"], from, to, 1),
-    targetKeywords.length ? smQuery(["query", "clicks", "impressions", "ctr", "position"], from, to, 5000) : Promise.resolve(null),
+    kwFilter ? smQuery(["query", "clicks", "impressions", "ctr", "position"], from, to, kwRowCap, kwFilter) : Promise.resolve(null),
   ]);
 
   // Say what actually failed. The old text guessed at three causes and led with
@@ -321,5 +362,8 @@ async function getGscViaSupermetrics(from: string, to: string, targetKeywords: s
       };
     });
   }
+  // Only cache a good read. Caching a failure would pin the error in place for
+  // the whole TTL, including after quota resets.
+  if (!base.error) gscCache.set(cacheKey, { at: Date.now(), data: base });
   return base;
 }
