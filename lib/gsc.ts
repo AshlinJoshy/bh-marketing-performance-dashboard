@@ -165,8 +165,13 @@ async function getGscViaServiceAccount(from: string, to: string, targetKeywords:
 // Uses your Supermetrics API key so GSC is pulled through Supermetrics (which
 // already has the property authorized) instead of a Google service account.
 //   SUPERMETRICS_API_KEY   the Data Fetching API key (hub.supermetrics.com)
-//   SUPERMETRICS_DS_USER   the Supermetrics login that authorized GSC
-//                          (defaults to zahra.firouzi@bhomes.com)
+//   SUPERMETRICS_DS_USER   optional. The Supermetrics login that authorised GSC.
+//                          OMITTED when unset rather than defaulted: this key's
+//                          own account is already authorised for GSC (proven by
+//                          a bare query returning data), and sending a ds_user
+//                          the API key doesn't own answers 403
+//                          QUERY_AUTH_UNAVAILABLE. lib/paid.ts hit exactly this
+//                          and omits it for the same reason.
 //   GSC_SITE_URL           the GSC account/site (defaults to sc-domain:bhomes.com)
 //   SUPERMETRICS_API_URL   override the endpoint if your plan differs
 const SM_ENDPOINT = process.env.SUPERMETRICS_API_URL || "https://api.supermetrics.com/enterprise/v2/query/data/json";
@@ -197,21 +202,28 @@ function smIdx(header: string[]): Record<string, number> {
   return idx;
 }
 
+/** Last failure from smQuery, so the UI can show the reason instead of a guess. */
+let smLastError: string | null = null;
+
 async function smQuery(fields: string[], from: string, to: string, maxRows: number): Promise<any[][] | null> {
   const key = process.env.SUPERMETRICS_API_KEY;
-  if (!key) return null;
+  if (!key) {
+    smLastError = "SUPERMETRICS_API_KEY is not set";
+    return null;
+  }
   // Documented v2 method: POST JSON with `Authorization: Bearer <key>`, fields as
   // a comma-separated string. (The api_key is NOT put in the body.)
   const payload: Record<string, unknown> = {
     ds_id: "GW",
     ds_accounts: [process.env.GSC_SITE_URL || "sc-domain:bhomes.com"],
-    ds_user: process.env.SUPERMETRICS_DS_USER || "zahra.firouzi@bhomes.com",
     date_range_type: "custom",
     start_date: from,
     end_date: to,
     fields: fields.join(","),
     max_rows: maxRows,
   };
+  const dsUser = process.env.SUPERMETRICS_DS_USER;
+  if (dsUser) payload.ds_user = dsUser;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 20000);
   try {
@@ -224,18 +236,22 @@ async function smQuery(fields: string[], from: string, to: string, maxRows: numb
     });
     const text = await res.text().catch(() => "");
     if (!res.ok) {
-      console.error(`[gsc/supermetrics] HTTP ${res.status}: ${text.slice(0, 300)}`);
+      smLastError = `HTTP ${res.status}: ${text.slice(0, 200)}`;
+      console.error(`[gsc/supermetrics] ${smLastError}`);
       return null;
     }
     let j: any;
     try {
       j = JSON.parse(text);
     } catch {
-      console.error(`[gsc/supermetrics] non-JSON response: ${text.slice(0, 200)}`);
+      smLastError = `non-JSON response: ${text.slice(0, 160)}`;
+      console.error(`[gsc/supermetrics] ${smLastError}`);
       return null;
     }
     if (j?.error) {
-      console.error(`[gsc/supermetrics] API error: ${JSON.stringify(j.error).slice(0, 300)}`);
+      const m = typeof j.error === "string" ? j.error : j.error?.message || JSON.stringify(j.error);
+      smLastError = String(m).slice(0, 240);
+      console.error(`[gsc/supermetrics] API error: ${smLastError}`);
       return null;
     }
     // Envelope is usually { data: [[header],[row]…] }; tolerate { data: { data: [...] } }.
@@ -243,7 +259,9 @@ async function smQuery(fields: string[], from: string, to: string, maxRows: numb
     if (rows && !Array.isArray(rows) && Array.isArray(rows.data)) rows = rows.data;
     return Array.isArray(rows) ? rows : null;
   } catch (e) {
-    console.error(`[gsc/supermetrics] error: ${e instanceof Error ? e.message : String(e)}`);
+    const m = e instanceof Error ? e.message : String(e);
+    smLastError = m.includes("abort") ? `timed out after ${Math.round(20000 / 1000)}s` : m;
+    console.error(`[gsc/supermetrics] error: ${smLastError}`);
     return null;
   } finally {
     clearTimeout(t);
@@ -257,7 +275,13 @@ async function getGscViaSupermetrics(from: string, to: string, targetKeywords: s
     targetKeywords.length ? smQuery(["query", "clicks", "impressions", "ctr", "position"], from, to, 5000) : Promise.resolve(null),
   ]);
 
-  if (!totRows) base.error = "Supermetrics returned no GSC data — check SUPERMETRICS_API_KEY, the DS user, and that GSC is authorized.";
+  // Say what actually failed. The old text guessed at three causes and led with
+  // the API key, which sent readers to check a key that was fine.
+  if (!totRows) {
+    base.error = smLastError
+      ? `GSC via Supermetrics failed: ${smLastError}`
+      : `Supermetrics returned no rows for ${process.env.GSC_SITE_URL || "sc-domain:bhomes.com"} in this range.`;
+  }
   const tot = smSplit(totRows);
   if (tot.data.length) {
     const i = tot.header.length ? smIdx(tot.header) : { clicks: 0, impressions: 1, ctr: 2, position: 3 };
