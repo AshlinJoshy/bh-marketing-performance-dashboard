@@ -18,6 +18,7 @@
 // and naming (Google `Campaignname`, LinkedIn `campaignName`, Meta
 // `adcampaign_name`), so guessing them yields a silent empty card.
 import { getPaidConfig } from "@/lib/data";
+import { getAppSettings } from "@/lib/appSettings";
 import { VERIFIED_BLOCKED as VERIFIED_UNPRIORITISED } from "@/lib/paidAccounts";
 
 const SM_ENDPOINT = process.env.SUPERMETRICS_API_URL || "https://api.supermetrics.com/enterprise/v2/query/data/json";
@@ -96,6 +97,16 @@ export interface AccountFailure {
 
 export interface PaidData {
   connected: boolean;
+  /**
+   * True when an admin has switched Supermetrics off in Settings.
+   *
+   * Distinct from `connected` and `unconfigured`: those mean "no key" and "no
+   * accounts chosen". This one means deliberately paused, and the tab says so
+   * rather than showing an empty state that looks like breakage.
+   */
+  paused?: boolean;
+  /** The admin's reason, if they left one. */
+  pausedNote?: string;
   label: string;
   from: string;
   to: string;
@@ -520,6 +531,14 @@ export async function getPaidData(fromRaw?: string, toRaw?: string, days = 30, l
     accountsUsed: [], emptyAccounts: [], failures: [], unconfigured: false,
   };
   if (!connected) return base;
+
+  // The global switch is checked BEFORE anything else, so an admin turning
+  // Supermetrics off costs exactly zero rows — no account queries are issued at
+  // all. This does not change how rows are pulled when it is on.
+  const settings = await getAppSettings();
+  if (!settings.supermetricsEnabled) {
+    return { ...base, paused: true, pausedNote: settings.note };
+  }
 
   const cfg = await getPaidConfig();
   const selected: PaidAccount[] = [];

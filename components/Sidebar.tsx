@@ -15,6 +15,8 @@ const NAV: NavItem[] = [
   { href: "/seo", label: "SEO", icon: "🔍" },
   { href: "/digital", label: "Digital Performance", icon: "📈" },
   { href: "/portals", label: "Portals", icon: "🏠" },
+  // Admin. Behind its own PIN in proxy.ts, so a stray click just asks for it.
+  { href: "/settings", label: "Settings", icon: "⚙️" },
 ];
 
 export default function Sidebar() {
