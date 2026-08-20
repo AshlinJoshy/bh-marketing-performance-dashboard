@@ -35,7 +35,7 @@ export default function SettingsPanel({ info, settings }: { info: SettingsInfo; 
     { label: "Ad accounts (Google, Meta, LinkedIn)", href: "/digital", what: "Which accounts the Digital tab queries. The main quota lever.", count: `${info.counts.paidAccounts} selected` },
     { label: "SEO keywords", href: "/seo", what: "Terms tracked for rankings.", count: `${info.counts.seoKeywords} tracked` },
     { label: "News and competitor keywords", href: "/bot", what: "What the news bot searches for.", count: `${info.counts.prKeywords} news · ${info.counts.competitorKeywords} competitor` },
-    { label: "Benchmark brands and handles", href: "/people", what: "Competitors compared on social, and their Apify actors.", count: `${info.counts.benchmarkBrands} brands` },
+    { label: "Benchmark brands and handles", href: "/socials", what: "Competitors compared on social, and their Apify actors.", count: `${info.counts.benchmarkBrands} brands` },
   ];
 
   return (

@@ -11,13 +11,21 @@ const NAV: NavItem[] = [
   { href: "/company", label: "Company Performance", icon: "🏢" },
   { href: "/pr", label: "PR & Media", icon: "📰" },
   { href: "/people", label: "People Sentiment", icon: "💬" },
+  { href: "/socials", label: "Socials Performance", icon: "📈" },
   { href: "/website", label: "Website", icon: "🌐" },
   { href: "/seo", label: "SEO", icon: "🔍" },
-  { href: "/digital", label: "Digital Performance", icon: "📈" },
+  { href: "/digital", label: "Digital Performance", icon: "💸" },
   { href: "/portals", label: "Portals", icon: "🏠" },
-  // Admin. Behind its own PIN in proxy.ts, so a stray click just asks for it.
-  { href: "/settings", label: "Settings", icon: "⚙️" },
 ];
+
+/**
+ * Rendered at the BOTTOM, separated from the reporting tabs.
+ *
+ * Settings is administrative, not something to read day to day, and it is behind
+ * its own PIN — grouping it with the tabs invited a click that just asks for a
+ * PIN. Bottom-of-sidebar is also where people expect it.
+ */
+const ADMIN_NAV: NavItem[] = [{ href: "/settings", label: "Settings", icon: "⚙️" }];
 
 export default function Sidebar() {
   const pathname = usePathname();
@@ -46,6 +54,32 @@ export default function Sidebar() {
     [router, pathname, warmed],
   );
 
+  const renderItem = (item: NavItem) => {
+    const active = pathname === item.href || (item.href !== "/" && pathname.startsWith(item.href));
+    if (item.soon) {
+      return (
+        <span key={item.href} className="nav-item soon" title="Coming soon">
+          {item.icon} <span>{item.label}</span>
+          <span className="soon-tag">soon</span>
+        </span>
+      );
+    }
+    return (
+      <Link
+        key={item.href}
+        href={item.href}
+        className={`nav-item${active ? " active" : ""}`}
+        // false until intent, then null restores Next's default prefetch.
+        prefetch={warmed.has(item.href) ? null : false}
+        onMouseEnter={() => warm(item.href)}
+        onFocus={() => warm(item.href)}
+        onTouchStart={() => warm(item.href)}
+      >
+        {item.icon} <span>{item.label}</span>
+      </Link>
+    );
+  };
+
   return (
     <div id="sidebar">
       <div className="sidebar-brand">
@@ -53,31 +87,8 @@ export default function Sidebar() {
         <div className="brand-sub">Marketing Hub</div>
       </div>
       <nav>
-        {NAV.map((item) => {
-          const active = pathname === item.href || (item.href !== "/" && pathname.startsWith(item.href));
-          if (item.soon) {
-            return (
-              <span key={item.href} className="nav-item soon" title="Coming soon">
-                {item.icon} <span>{item.label}</span>
-                <span className="soon-tag">soon</span>
-              </span>
-            );
-          }
-          return (
-            <Link
-              key={item.href}
-              href={item.href}
-              className={`nav-item${active ? " active" : ""}`}
-              // false until intent, then null restores Next's default prefetch.
-              prefetch={warmed.has(item.href) ? null : false}
-              onMouseEnter={() => warm(item.href)}
-              onFocus={() => warm(item.href)}
-              onTouchStart={() => warm(item.href)}
-            >
-              {item.icon} <span>{item.label}</span>
-            </Link>
-          );
-        })}
+        {NAV.map(renderItem)}
+        <div className="nav-admin">{ADMIN_NAV.map(renderItem)}</div>
       </nav>
       <div className="sidebar-footer">
         <div className="pulse-dot" />
