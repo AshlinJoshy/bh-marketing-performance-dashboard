@@ -7,10 +7,12 @@ import { useSearchParams } from "next/navigation";
 import { C } from "@/lib/theme";
 
 export default function PinGate() {
+  // "settings" asks for the second PIN. Anything else is the app gate.
   const [pin, setPin] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const params = useSearchParams();
+  const scope = params.get("scope") === "settings" ? "settings" : "app";
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -21,7 +23,7 @@ export default function PinGate() {
       const res = await fetch("/api/unlock", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ pin }),
+        body: JSON.stringify({ pin, scope }),
       });
       if (!res.ok) {
         setErr("Incorrect PIN.");
@@ -31,7 +33,8 @@ export default function PinGate() {
       // A full navigation, not router.push: the gate cookie was just set and the
       // pages are server rendered, so they need a fresh request to see it.
       const next = params.get("next");
-      window.location.href = next && next.startsWith("/") ? next : "/";
+      const fallback = scope === "settings" ? "/settings" : "/";
+      window.location.href = next && next.startsWith("/") ? next : fallback;
     } catch {
       setErr("Couldn't reach the server. Try again.");
     } finally {
@@ -46,7 +49,7 @@ export default function PinGate() {
         <div style={{ fontSize: 12, color: C.mid, marginBottom: 18 }}>Marketing Hub</div>
 
         <label htmlFor="pin" style={{ display: "block", fontSize: 11, textTransform: "uppercase", letterSpacing: ".5px", color: C.mid, marginBottom: 6 }}>
-          Enter PIN
+          {scope === "settings" ? "Settings PIN" : "Enter PIN"}
         </label>
         <input
           id="pin"
@@ -72,7 +75,9 @@ export default function PinGate() {
         </button>
         {err && <div style={{ color: C.red, fontSize: 12, marginTop: 10 }}>{err}</div>}
         <div style={{ fontSize: 11, color: C.mid, marginTop: 14, lineHeight: 1.5 }}>
-          Data is only fetched after unlocking, so an idle tab costs no API quota.
+          {scope === "settings"
+            ? "Settings changes affect every tab's figures, so it takes a separate PIN."
+            : "Data is only fetched after unlocking, so an idle tab costs no API quota."}
         </div>
       </form>
     </div>

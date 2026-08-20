@@ -6,7 +6,6 @@ import { saveSocialConfigAction } from "@/app/actions";
 import { PlatformIcon, SubjectIcon } from "@/components/PlatformIcon";
 import HelpTip from "@/components/HelpTip";
 import ChartBox from "@/components/Chart";
-import SocialPerformance from "@/components/SocialPerformance";
 import { C } from "@/lib/theme";
 import {
   CHANNELS,
@@ -17,7 +16,6 @@ import {
   type SocialRun,
   type TimeWindow,
 } from "@/lib/socialTypes";
-import type { PerfConfig, PerfMetrics, PerfPost, PerfRun } from "@/lib/perfTypes";
 
 const CHANNEL_META = Object.fromEntries(CHANNELS.map((c) => [c.key, c])) as Record<
   SocialChannel,
@@ -94,24 +92,13 @@ export default function PeopleSentiment({
   config,
   mentions,
   runs,
-  perfConfig,
-  perfMetrics,
-  perfPosts,
-  perfRuns,
 }: {
   config: SocialConfig;
   mentions: SocialMention[];
   runs: SocialRun[];
-  perfConfig: PerfConfig;
-  perfMetrics: PerfMetrics[];
-  perfPosts: PerfPost[];
-  perfRuns: PerfRun[];
 }) {
   const router = useRouter();
   const last = runs[0];
-
-  // sentiment (what people say) vs performance benchmark (how our channels compare)
-  const [view, setView] = useState<"sentiment" | "performance">("sentiment");
 
   // ── editable config (subjects + per-platform sources) ──────────
   const [cfg, setCfg] = useState<SocialConfig>(config);
@@ -282,36 +269,17 @@ export default function PeopleSentiment({
     <>
       <div className="section-header">
         <div>
-          <div className="page-title">{view === "performance" ? "Social Performance" : "People & Brand Sentiment"}</div>
+          <div className="page-title">People &amp; Brand Sentiment</div>
           <div className="page-sub">
-            {view === "performance"
-              ? "How betterhomes' social channels compare to rival agencies — Instagram · TikTok · Facebook · LinkedIn, via Apify."
-              : "What the internet says about betterhomes and its people — Instagram · LinkedIn · Reddit · Glassdoor · Facebook, scored by AI."}
+            What the internet says about betterhomes and its people — Instagram · LinkedIn · Reddit · Glassdoor ·
+            Facebook, scored by AI.
           </div>
         </div>
-        {view === "sentiment" && (
-          <span className={mentions.length ? "verified-badge" : "pending-badge"}>
-            {mentions.length ? `🤖 ${mentions.length} mentions stored` : "⏳ No data yet — run the bot"}
-          </span>
-        )}
+        <span className={mentions.length ? "verified-badge" : "pending-badge"}>
+          {mentions.length ? `🤖 ${mentions.length} mentions stored` : "⏳ No data yet — run the bot"}
+        </span>
       </div>
 
-      {/* view switch: what people SAY (sentiment) vs how we PERFORM (benchmark) */}
-      <div className="ps-view-toggle">
-        <button className={`ps-view-btn${view === "sentiment" ? " active" : ""}`} onClick={() => setView("sentiment")}>
-          💬 Sentiment
-        </button>
-        <button className={`ps-view-btn${view === "performance" ? " active" : ""}`} onClick={() => setView("performance")}>
-          📈 Performance benchmark
-        </button>
-      </div>
-
-      {view === "performance" && (
-        <SocialPerformance config={perfConfig} metrics={perfMetrics} posts={perfPosts} runs={perfRuns} />
-      )}
-
-      {view === "sentiment" && (
-      <>
       {/* CONFIG + RUN — collapsible */}
       <div className="chart-card" style={{ marginBottom: 18 }}>
         <button className="ps-collapse-head" onClick={() => setCfgOpen((v) => !v)} aria-expanded={cfgOpen}>
@@ -707,8 +675,6 @@ export default function PeopleSentiment({
             )}
           </div>
         </>
-      )}
-      </>
       )}
     </>
   );

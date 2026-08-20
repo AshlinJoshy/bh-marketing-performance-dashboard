@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import ChartBox from "@/components/Chart";
 import HelpTip from "@/components/HelpTip";
+import PausedNotice from "@/components/PausedNotice";
 import DateRangePicker, { rangeFor } from "@/components/DateRangePicker";
 import { savePaidConfigAction } from "@/app/actions";
 import { C } from "@/lib/theme";
@@ -1137,6 +1138,10 @@ export default function DigitalDashboard({ initial, config }: { initial: PaidDat
             </div>
           </div>
         </div>
+      ) : data.paused ? (
+        // An admin switched Supermetrics off. Say so, rather than showing an
+        // empty tab that reads as a fault.
+        <PausedNotice note={data.pausedNote} what="Paid media figures are paused." />
       ) : data.unconfigured ? (
         <div className="chart-card">
           <div className="empty-state" style={{ height: "auto", padding: "26px 20px", display: "block", textAlign: "center" }}>

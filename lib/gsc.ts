@@ -9,6 +9,7 @@
 //   GSC_PRIVATE_KEY  the service account private key ("\n" escapes are handled)
 // The service account must be added as a user on the GSC property.
 import crypto from "node:crypto";
+import { getAppSettings } from "@/lib/appSettings";
 
 const SITE = process.env.GSC_SITE_URL || "sc-domain:bhomes.com";
 
@@ -122,7 +123,12 @@ async function gscQuery(body: Record<string, unknown>): Promise<any | null> {
  *   • Google service account — used otherwise (GSC_CLIENT_EMAIL/PRIVATE_KEY).
  */
 export async function getGscMetrics(from: string, to: string, targetKeywords: string[] = []): Promise<GscData> {
-  if (process.env.SUPERMETRICS_API_KEY) return getGscViaSupermetrics(from, to, targetKeywords);
+  // When an admin switches Supermetrics off, take the branch this function
+  // always had for deployments without a Supermetrics key: the direct Search
+  // Console client. No new fallback logic, just the existing else.
+  if (process.env.SUPERMETRICS_API_KEY && (await getAppSettings()).supermetricsEnabled) {
+    return getGscViaSupermetrics(from, to, targetKeywords);
+  }
   return getGscViaServiceAccount(from, to, targetKeywords);
 }
 

@@ -274,7 +274,7 @@ export async function getCampaignLeads(fromRaw: string, toRaw: string): Promise<
         `FROM leads l WHERE ${range} AND ${j("campaign")} IS NOT NULL AND TRIM(${j("campaign")}) <> '' ` +
         `GROUP BY 1,2,3,4,5,6 ORDER BY n DESC LIMIT 6000`,
       true,
-      35000,
+      60000,
     ),
     mbQueryEx(
       `SELECT COALESCE(NULLIF(TRIM(LOWER(c.reference)), ''), '(unlinked)') code, ${clean(j("campaign"))} camp, ` +
@@ -285,7 +285,7 @@ export async function getCampaignLeads(fromRaw: string, toRaw: string): Promise<
         `WHERE ${range} AND (lc.lead_id IS NOT NULL OR ${j("campaign")} IS NOT NULL) ` +
         `GROUP BY 1,2,3,4 ORDER BY n DESC LIMIT 6000`,
       true,
-      35000,
+      60000,
     ),
   ]);
   if ("error" in utmRes) return { ...base, error: `Metabase reachable, but the campaign-leads query failed: ${utmRes.error}` };
@@ -360,7 +360,7 @@ export async function getLeadsData(fromRaw: string, toRaw: string, opts?: { audi
       `FROM leads WHERE ${range}` +
       `) t GROUP BY 1,2,3,4`,
     true,
-    35000, // the main scan; the route allows 45s
+    60000, // the main scan over the `leads` VIEW; the route allows 90s
   );
   if ("error" in scanRes) {
     return { ...base, error: `Metabase reachable, but the leads query failed: ${scanRes.error}` };
@@ -404,7 +404,7 @@ export async function getLeadsData(fromRaw: string, toRaw: string, opts?: { audi
           `FROM leads WHERE ${range}` +
           `) t GROUP BY 1,2,3,4 ORDER BY n DESC LIMIT 60`,
         true,
-        35000,
+        60000,
       )
     : null;
   base.sourceAudit = (auditRows ?? []).map((r) => ({

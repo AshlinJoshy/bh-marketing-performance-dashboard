@@ -1,14 +1,17 @@
-// Verifies the PIN and issues the gate cookie. The PIN is compared here, on the
-// server, so it never reaches the browser bundle.
+// Verifies a PIN and issues the matching gate cookie. Both PINs are compared
+// here, on the server, so neither reaches the browser bundle.
 import { NextResponse } from "next/server";
-import { GATE_COOKIE, PIN, expectedToken, safeEqual } from "@/lib/gate";
+import { COOKIES, PINS, expectedToken, isScope, safeEqual } from "@/lib/gate";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
   let pin = "";
+  let scope: "app" | "settings" = "app";
   try {
-    pin = String(((await req.json()) as { pin?: unknown })?.pin ?? "");
+    const body = (await req.json()) as { pin?: unknown; scope?: unknown };
+    pin = String(body?.pin ?? "");
+    if (isScope(body?.scope)) scope = body.scope;
   } catch {
     /* empty body → treated as a wrong PIN */
   }
@@ -18,19 +21,21 @@ export async function POST(req: Request) {
   // It does not make the PIN strong; it makes brute forcing it slow.
   await new Promise((r) => setTimeout(r, 400));
 
-  if (!safeEqual(pin.trim(), PIN)) {
+  if (!safeEqual(pin.trim(), PINS[scope])) {
     return NextResponse.json({ ok: false }, { status: 401 });
   }
 
-  const res = NextResponse.json({ ok: true });
+  const res = NextResponse.json({ ok: true, scope });
   res.cookies.set({
-    name: GATE_COOKIE,
-    value: await expectedToken(),
+    name: COOKIES[scope],
+    value: await expectedToken(scope),
     httpOnly: true, // unreadable from JavaScript
     sameSite: "lax",
     secure: process.env.NODE_ENV === "production",
     path: "/",
-    maxAge: 60 * 60 * 12, // a working day, then re-enter it
+    // Settings expires sooner: it is an occasional administrative act, and a
+    // long lived cookie on a shared machine is the likelier way it leaks.
+    maxAge: scope === "settings" ? 60 * 60 : 60 * 60 * 12,
   });
   return res;
 }

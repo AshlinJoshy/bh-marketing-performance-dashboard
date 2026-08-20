@@ -426,3 +426,40 @@ export async function savePaidConfigAction(accounts: unknown) {
     return { ok: false as const, error: e instanceof Error ? e.message : String(e) };
   }
 }
+
+/**
+ * Flip the global Supermetrics switch. Admin only.
+ *
+ * Reached exclusively from /settings, which proxy.ts puts behind the settings
+ * PIN — the action itself is not a second gate, so it must never be linked from
+ * anywhere ungated. Every viewer is affected, which is the point: the quota is
+ * shared, so pausing it has to be a deployment-wide decision, not a per-browser
+ * preference.
+ */
+export async function setSupermetricsEnabledAction(enabled: boolean, note = "") {
+  const db = adminClient();
+  if (!db) return { ok: false as const, error: "SUPABASE_SERVICE_ROLE_KEY not set" };
+  try {
+    const { data } = await db.from("app_settings").select("payload").eq("id", 1).maybeSingle();
+    // Merge, so a future switch added alongside this one is not wiped by a save.
+    const payload = {
+      ...((data?.payload as Record<string, unknown>) ?? {}),
+      supermetricsEnabled: !!enabled,
+      note: String(note ?? "").slice(0, 200),
+    };
+    const { error } = await db
+      .from("app_settings")
+      .upsert({ id: 1, payload, updated_at: new Date().toISOString() }, { onConflict: "id" });
+    if (error) {
+      const hint = /relation .*app_settings.* does not exist/i.test(error.message)
+        ? "The app_settings table isn't created yet — apply migration 0013."
+        : error.message;
+      return { ok: false as const, error: hint };
+    }
+    // Every tab reads this, so revalidate the lot rather than guessing which.
+    for (const p of ["/", "/digital", "/seo", "/settings", "/company", "/portals", "/website"]) revalidatePath(p);
+    return { ok: true as const };
+  } catch (e) {
+    return { ok: false as const, error: e instanceof Error ? e.message : String(e) };
+  }
+}

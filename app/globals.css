@@ -44,7 +44,9 @@ body {
 .sidebar-brand { padding: 24px 20px 12px; border-bottom: 1px solid rgba(255,255,255,.1); }
 .sidebar-brand .brand-name { font-family: Georgia, serif; font-style: italic; font-size: 20px; color: #fff; font-weight: 700; }
 .sidebar-brand .brand-sub { font-size: 11px; color: var(--sand); letter-spacing: 1.5px; text-transform: uppercase; margin-top: 3px; }
-#sidebar nav { flex: 1; padding: 12px 0; }
+/* Column so .nav-admin can push itself to the bottom with margin-top:auto. */
+#sidebar nav { flex: 1; padding: 12px 0; display: flex; flex-direction: column; }
+.nav-admin { margin-top: auto; padding-top: 12px; border-top: 1px solid rgba(255,255,255,.1); }
 .nav-item {
   display: flex; align-items: center; gap: 10px;
   padding: 11px 20px; color: rgba(255,255,255,.65); font-size: 13px;
@@ -251,10 +253,6 @@ body {
 @media (max-width: 600px) { .sankey-open-row { grid-template-columns: 120px 1fr 74px; } }
 
 /* SOCIAL PERFORMANCE (benchmark) */
-.ps-view-toggle { display: inline-flex; gap: 4px; background: #fff; border: 1px solid var(--border); border-radius: 24px; padding: 4px; margin-bottom: 22px; }
-.ps-view-btn { border: none; background: transparent; border-radius: 20px; padding: 7px 16px; font-size: 13px; cursor: pointer; color: var(--mid); font-weight: 600; transition: all .2s; }
-.ps-view-btn:hover:not(.active) { color: var(--coral); }
-.ps-view-btn.active { background: var(--dark); color: #fff; }
 
 .perf-seed-tag { display: inline-block; margin-left: 8px; font-size: 10px; text-transform: uppercase; letter-spacing: .5px; background: rgba(201,136,42,.14); color: var(--amber); border-radius: 10px; padding: 1px 7px; font-weight: 600; vertical-align: middle; cursor: help; }
 

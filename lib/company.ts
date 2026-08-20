@@ -233,11 +233,14 @@ export async function getCompanyData(fromRaw?: string, toRaw?: string, brandRaw?
 
   const brandsSql = `SELECT id, name FROM divisions ORDER BY name`;
 
-  // The leads aggregate is the slow one (~6-7s over 400k rows); give it room but
-  // stay well inside the route's 45s ceiling.
+  // The leads aggregate is the slow one. Measured at ~40s against the live view
+  // on 2026-08-20, which is why 30s was failing reliably rather than
+  // occasionally — `leads` is a VIEW, so every run re-derives it and no index
+  // can be applied. 60s per the operator's call; the routes allow 90s so the
+  // function is not killed before the query returns.
   const [leadRows, dealRows, brandRows] = await Promise.all([
-    mbQuery(leadsSql, true, 30000),
-    mbQuery(dealsSql, true, 30000),
+    mbQuery(leadsSql, true, 60000),
+    mbQuery(dealsSql, true, 45000),
     mbQuery(brandsSql, true, 10000),
   ]);
 
