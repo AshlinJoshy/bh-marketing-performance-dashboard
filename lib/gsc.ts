@@ -293,7 +293,9 @@ async function smQuery(fields: string[], from: string, to: string, maxRows: numb
     });
     const text = await res.text().catch(() => "");
     if (!res.ok) {
-      smLastError = `HTTP ${res.status}: ${text.slice(0, 200)}`;
+      // 500, not 200: Supermetrics states the actual row-quota numbers in the
+      // `description` field, and 200 chars cut the message off just before them.
+      smLastError = `HTTP ${res.status}: ${text.slice(0, 500)}`;
       console.error(`[gsc/supermetrics] ${smLastError}`);
       return null;
     }
